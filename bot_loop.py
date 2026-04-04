@@ -208,6 +208,15 @@ class BotLoop:
         self._state_lock = threading.Lock()
         self._probe_lock = threading.Lock()   # Protects _probe_state multi-key updates
 
+    def _set_state(self, **updates):
+        """Update _bot_state under the state lock (GUI-visible state).
+
+        All bot_state writes must go through this method so the read side
+        in get_state() sees a consistent snapshot.
+        """
+        with self._state_lock:
+            self._bot_state.update(updates)
+
         # ---- Event bus (set by api_server after creation) ----
         self._event_bus = None
 
@@ -462,7 +471,7 @@ class BotLoop:
             state["reason"] = reason
             state["buy_deficit"] = int(buy_deficit)
             state["sell_deficit"] = int(sell_deficit)
-            self._bot_state["status"] = "recovering"
+            self._set_state(status="recovering")
             return
 
         now = time.time()
@@ -477,7 +486,7 @@ class BotLoop:
             "buy_deficit": int(buy_deficit),
             "sell_deficit": int(sell_deficit),
         })
-        self._bot_state["status"] = "recovering"
+        self._set_state(status="recovering")
         log_event(
             "warning",
             "recovery_mode_enter",
@@ -523,7 +532,7 @@ class BotLoop:
             "cycle_create_stalled": False,
         })
         if self._running:
-            self._bot_state["status"] = "running"
+            self._set_state(status="running")
         self._clear_alert("bot_recovery")
 
     def _evaluate_recovery_mode(self, mid_price: Decimal,
@@ -611,7 +620,7 @@ class BotLoop:
                     self._exit_recovery_mode()
             else:
                 state["healthy_streak"] = 0
-                self._bot_state["status"] = "recovering"
+                self._set_state(status="recovering")
                 self._emit_alert(
                     "bot_recovery",
                     "warning",
@@ -1030,8 +1039,7 @@ class BotLoop:
             self.offer_manager.clean_visible_recently_created(all_open_ids)
             self.sniper.prune_active_snipes(all_open_ids)
             self.boost_manager.prune_active_boosts(all_open_ids)
-            self._bot_state["open_buys"] = len(current_buy_ids)
-            self._bot_state["open_sells"] = len(current_sell_ids)
+            self._set_state(open_buys=len(current_buy_ids), open_sells=len(current_sell_ids))
         except Exception as e:
             log_event("debug", "probe_wallet_poll_failed",
                       f"Fast probe wallet poll failed: {e}")
@@ -1207,7 +1215,7 @@ class BotLoop:
                 probe["confirmed_at"] = now_ts
                 probe["active"] = False
                 self._current_mid_price = probe["tibet_price"]
-                self._bot_state["mid_price"] = str(probe["tibet_price"])
+                self._set_state(mid_price=str(probe["tibet_price"]))
                 linger_secs = int(getattr(cfg, "SNIPER_LINGER_SECS", 600) or 0)
                 log_event("info", "probe_confirmed",
                           f"Both probes survived - price confirmed at Tibet "
@@ -1501,9 +1509,7 @@ class BotLoop:
                     action="run_doctor",
                     action_label="View Report",
                 )
-                self._bot_state["running"] = False
-                self._bot_state["status"] = "blocked"
-                self._bot_state["preflight"] = preflight.to_dict()
+                self._set_state(running=False, status="blocked", preflight=preflight.to_dict())
                 return False
         except Exception as e:
             # Preflight failure should not block startup — fall through
@@ -1534,8 +1540,7 @@ class BotLoop:
                         action="open_wallet_picker",
                         action_label="Change Wallet",
                     )
-                    self._bot_state["running"] = False
-                    self._bot_state["status"] = "blocked"
+                    self._set_state(running=False, status="blocked")
                     return False
         except Exception as e:
             log_event(
@@ -1546,8 +1551,7 @@ class BotLoop:
 
         self._running = True
         self._start_time = time.time()
-        self._bot_state["running"] = True
-        self._bot_state["status"] = "starting"
+        self._set_state(running=True, status="starting")
         self._circuit_breaker_offer_safed = False
         self._clear_alert("circuit_breaker")
 
@@ -1668,8 +1672,7 @@ class BotLoop:
             return False
 
         self._running = False
-        self._bot_state["running"] = False
-        self._bot_state["status"] = "stopping"
+        self._set_state(running=False, status="stopping")
 
         # Signal offer_manager to interrupt any in-progress ladder creation.
         # Without this, a 50-offer create_ladder loop keeps running for
@@ -1728,7 +1731,7 @@ class BotLoop:
                 log_event("debug", "splash_node_stop_failed",
                           f"Splash node stop raised during shutdown: {e}")
 
-        self._bot_state["status"] = "stopped"
+        self._set_state(status="stopped")
         log_event("info", "bot_stopped", "Bot loop stopped")
         return True
 
@@ -1899,7 +1902,7 @@ class BotLoop:
         slog("STARTUP", "========== _startup_sync COMPLETE — releasing thread gates ==========")
         self._startup_complete.set()  # Ungate background threads
 
-        self._bot_state["status"] = "running"
+        self._set_state(status="running")
 
         while self._running:
             loop_start = time.time()
@@ -1922,7 +1925,7 @@ class BotLoop:
                           f"Normal cycles should complete in < {cfg.LOOP_SECONDS}s.")
             self._last_loop_time = time.time()
             self._loop_count += 1
-            self._bot_state["loop_count"] = self._loop_count
+            self._set_state(loop_count=self._loop_count)
 
             # Sleep until next cycle — OR wake early if price watcher detects a swap
             sleep_time = max(1, cfg.LOOP_SECONDS - self._last_loop_duration)
@@ -2032,8 +2035,7 @@ class BotLoop:
                         log_event("error", "cat_mapping_mismatch", msg)
                         slog("STARTUP", msg)
                         self._running = False
-                        self._bot_state["status"] = "error"
-                        self._bot_state["error"] = "CAT asset_id mismatch — wrong token detected"
+                        self._set_state(status="error", error="CAT asset_id mismatch — wrong token detected")
                         return
                     else:
                         slog("STARTUP", f"✅ CAT mapping verified: wallet_id {cfg.CAT_WALLET_ID} "
@@ -2881,7 +2883,7 @@ class BotLoop:
             return
 
         self._current_mid_price = mid_price
-        self._bot_state["mid_price"] = str(mid_price)
+        self._set_state(mid_price=str(mid_price))
 
         # Pricing strategy is logged but not emitted as an alert (not actionable)
 
@@ -2901,7 +2903,7 @@ class BotLoop:
         # Pass arb gap to risk manager (if available from price engine)
         arb_gap = Decimal(str(price_data.get("arb_gap_bps", 0)))
         self.risk_manager.update_arb_gap(arb_gap)
-        self._bot_state["arb_gap_bps"] = str(arb_gap)
+        self._set_state(arb_gap_bps=str(arb_gap))
 
         # Store main book spread for GUI (used by Close the Gap modal)
         # get_adjusted_spread returns a fraction (e.g. 0.08), multiply by 10000 for BPS
@@ -2909,14 +2911,14 @@ class BotLoop:
             buy_spread = self.risk_manager.get_adjusted_spread("buy")
             sell_spread = self.risk_manager.get_adjusted_spread("sell")
             avg_spread_bps = (buy_spread + sell_spread) / 2 * Decimal("10000")
-            self._bot_state["spread_bps"] = str(int(avg_spread_bps))
+            self._set_state(spread_bps=str(int(avg_spread_bps)))
         except Exception as e:
             print(f"   ⚠️ Spread calc failed: {e}", flush=True)
             # Fallback: use config base spread so modal isn't stuck on zero
             try:
                 fallback = int(getattr(cfg, "BASE_SPREAD_BPS", 0) or getattr(cfg, "SPREAD_BPS", 0))
                 if fallback > 0:
-                    self._bot_state["spread_bps"] = str(fallback)
+                    self._set_state(spread_bps=str(fallback))
             except Exception as e2:
                 log_event("debug", "spread_fallback_failed",
                           f"Spread fallback also failed: {e2}")
@@ -2996,7 +2998,7 @@ class BotLoop:
         # ---- Step 2: Check circuit breakers ----
         print(f"   [2] Circuit breakers...", end="", flush=True)
         if self.risk_manager.check_circuit_breakers(mid_price):
-            self._bot_state["status"] = "circuit_breaker"
+            self._set_state(status="circuit_breaker")
             reason = (
                 getattr(self.risk_manager, "_circuit_breaker_reason", "")
                 or "Trading halted by circuit breaker"
@@ -3033,7 +3035,7 @@ class BotLoop:
         else:
             print(" OK", flush=True)
             log_event("debug", "step2_breakers", "Circuit breakers OK")
-            self._bot_state["status"] = "running"
+            self._set_state(status="running")
             self._clear_alert("circuit_breaker")
             self._circuit_breaker_offer_safed = False
 
@@ -3055,8 +3057,7 @@ class BotLoop:
         self.sniper.prune_active_snipes(all_open_ids)
         self.boost_manager.prune_active_boosts(all_open_ids)
 
-        self._bot_state["open_buys"] = len(current_buy_ids)
-        self._bot_state["open_sells"] = len(current_sell_ids)
+        self._set_state(open_buys=len(current_buy_ids), open_sells=len(current_sell_ids))
 
         # ---- Update mempool watcher with current offer coin IDs ----
         # The watcher scans Coinset mempool every 5s for these specific coins.
@@ -3349,8 +3350,7 @@ class BotLoop:
             if cancelled:
                 current_buy_ids.difference_update(cancelled)
                 current_sell_ids.difference_update(cancelled)
-                self._bot_state["open_buys"] = len(current_buy_ids)
-                self._bot_state["open_sells"] = len(current_sell_ids)
+                self._set_state(open_buys=len(current_buy_ids), open_sells=len(current_sell_ids))
                 with self.sniper._snipe_lock:
                     self.sniper._active_snipe_ids = [
                         tid for tid in self.sniper._active_snipe_ids
@@ -3436,7 +3436,7 @@ class BotLoop:
                     probe["active"] = False
                     mid_price = probe["tibet_price"]
                     self._current_mid_price = mid_price
-                    self._bot_state["mid_price"] = str(mid_price)
+                    self._set_state(mid_price=str(mid_price))
                     linger_secs = int(getattr(cfg, "SNIPER_LINGER_SECS", 600) or 0)
                     log_event("info", "probe_confirmed",
                               f"Both probes survived — price confirmed at Tibet "
@@ -3691,7 +3691,7 @@ class BotLoop:
                 old_mid = mid_price
                 mid_price = fresh_mid
                 self._current_mid_price = mid_price
-                self._bot_state["mid_price"] = str(mid_price)
+                self._set_state(mid_price=str(mid_price))
 
                 # Update arb gap with fresh data
                 arb_gap = Decimal(str(fresh_price.get("arb_gap_bps", 0)))
@@ -4653,7 +4653,7 @@ class BotLoop:
             if fresh and fresh.get("mid_price"):
                 fresh_mid = fresh["mid_price"]
                 self._current_mid_price = fresh_mid
-                self._bot_state["mid_price"] = str(fresh_mid)
+                self._set_state(mid_price=str(fresh_mid))
                 log_event("info", "post_create_market_observed",
                           f"Observed market after creation: {fresh_mid:.8f} "
                           f"(keeping deployed quote baselines)")
