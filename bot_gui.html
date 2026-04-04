@@ -13987,7 +13987,7 @@
 
                     // Quality colour
                     const qColour = qualityScore >= 75 ? '#22c55e' : qualityScore >= 50 ? '#f59e0b' : '#f87171';
-                    const qBadge = `<span style="background:${qColour}22;color:${qColour};border:1px solid ${qColour}55;border-radius:4px;padding:1px 7px;font-size:0.82em;font-weight:600;">${qualityScore}% ${qualityLabel}</span>`;
+                    const qBadge = `<span style="background:${qColour}22;color:${qColour};border:1px solid ${qColour}55;border-radius:4px;padding:1px 7px;font-size:0.82em;font-weight:600;">${qualityScore}% ${escapeHtml(qualityLabel)}</span>`;
 
                     // Data source badges
                     const badge = (ok, label) => `<span style="background:${ok?'rgba(34,197,94,0.12)':'rgba(255,255,255,0.06)'};color:${ok?'#86efac':'#6b7280'};border-radius:3px;padding:1px 6px;font-size:0.78em;margin-right:3px;">${ok?'✓':'–'} ${label}</span>`;
@@ -14059,7 +14059,7 @@
                         // baseline only. max_active_buy is what actually gets written to settings.
                         const n = data.max_active_buy || cp.n_final;
                         const tiers = cp.max_tiers || 2;
-                        const style = cp.tier_label || '';
+                        const style = escapeHtml(cp.tier_label || '');
                         const innerN = data.inner_tier_count || 0;
                         const midN = data.mid_tier_count || 0;
                         const outerN = data.outer_tier_count || 0;
@@ -14098,7 +14098,7 @@
                     const appliedProfile = (src.risk_profile || getSelectedRiskProfile());
                     const profileColours = { conservative: '#60a5fa', balanced: '#a78bfa', aggressive: '#fb923c' };
                     const profileColour = profileColours[appliedProfile] || '#a78bfa';
-                    const profileLabel = appliedProfile.charAt(0).toUpperCase() + appliedProfile.slice(1);
+                    const profileLabel = escapeHtml(appliedProfile.charAt(0).toUpperCase() + appliedProfile.slice(1));
                     const profileBadge = `<span style="background:${profileColour}22;color:${profileColour};border:1px solid ${profileColour}55;border-radius:4px;padding:1px 7px;font-size:0.82em;font-weight:600;">${profileLabel}</span>`;
 
                     resultTitle.innerHTML = `\u2713 Smart Defaults applied &nbsp;${qBadge}&nbsp;${profileBadge}`;
@@ -17613,7 +17613,7 @@
                 fees: 'Fees',
                 reserve: 'Reserve',
             };
-            return labels[name] || name;
+            return labels[name] || escapeHtml(name);
         }
 
         function renderCoinTierGroups(tierData) {
