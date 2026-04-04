@@ -1,0 +1,503 @@
+"""
+Mempool Watcher — Pre-emptive Price Intelligence
+
+Monitors two sources in parallel to detect price movements faster than the
+main 30-second bot loop:
+
+  1. Tibet reserve polling (every 5s): detects CONFIRMED swaps the moment the
+     block lands, giving ~5s response vs 30s. Calculates exact direction and
+     magnitude from reserve deltas.
+
+  2. Coinset mempool polling (every 5s): scans pending transactions for
+     spends of the known Tibet pool coin. Fires an "imminent_swap" warning
+     BEFORE the block confirms (up to 18-54s early).
+
+Signals emitted:
+    {
+        "type":          "price_move" | "imminent_swap",
+        "direction":     "up" | "down" | "unknown",
+        "magnitude_pct": float,      # % change vs current mid
+        "source":        "confirmed_reserves" | "mempool_detected",
+        "timestamp":     float,
+        "new_xch_reserve":  int,     # (price_move only)
+        "new_tok_reserve":  int,
+        "old_xch_reserve":  int,
+        "old_tok_reserve":  int,
+        "delta_xch":     int,        # (price_move only) signed, mojos
+        "delta_tok":     int,        # signed, raw tokens
+    }
+
+Usage:
+    from mempool_watcher import MempoolWatcher
+    watcher = MempoolWatcher(pair_id, asset_id, cat_decimals)
+    watcher.start()
+    signals = watcher.get_pending_signals()   # call from bot loop
+    watcher.stop()
+"""
+
+from __future__ import annotations
+
+import hashlib
+import threading
+import time
+from decimal import Decimal
+from typing import Dict, List, Optional, Tuple
+
+from database import log_event
+
+# ---------------------------------------------------------------------------
+# Coin-ID computation (Chia CLVM encoding)
+# ---------------------------------------------------------------------------
+
+def _encode_amount(amount: int) -> bytes:
+    """Encode a Chia coin amount to bytes (big-endian, minimal, unsigned)."""
+    if amount == 0:
+        return b"\x00"
+    n = amount
+    result = []
+    while n:
+        result.append(n & 0xFF)
+        n >>= 8
+    result.reverse()
+    # Ensure unsigned (no high bit set) by prepending 0x00 if needed
+    if result[0] & 0x80:
+        result = [0x00] + result
+    return bytes(result)
+
+
+def compute_coin_id(parent_coin_info: str, puzzle_hash: str, amount: int) -> str:
+    """Compute a Chia coin ID from its three components.
+
+    coin_id = sha256(parent_coin_info_bytes + puzzle_hash_bytes + amount_bytes)
+    """
+    try:
+        parent_bytes = bytes.fromhex(parent_coin_info.lstrip("0x"))
+        puzzle_bytes = bytes.fromhex(puzzle_hash.lstrip("0x"))
+        amount_bytes = _encode_amount(amount)
+        return hashlib.sha256(parent_bytes + puzzle_bytes + amount_bytes).hexdigest()
+    except Exception:
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Main class
+# ---------------------------------------------------------------------------
+
+class MempoolWatcher:
+    """Background watcher for TibetSwap pool reserve changes.
+
+    Thread-safe. Designed to be started once at bot startup and queried
+    each bot cycle via get_pending_signals().
+    """
+
+    TIBET_POLL_INTERVAL = 5      # seconds between Tibet reserve checks
+    MEMPOOL_POLL_INTERVAL = 5    # seconds between Coinset mempool checks
+    SIGNAL_MAX_AGE = 120         # drop stale signals older than 2 minutes
+    MIN_SIGNAL_MAGNITUDE = 0.05  # ignore moves < 0.05% to suppress noise
+
+    def __init__(
+        self,
+        pair_id: str,
+        asset_id: str,
+        cat_decimals: int = 3,
+        coinset_url: str = "https://api.coinset.org",
+        coinset_timeout: int = 5,
+        tibet_url: str = "https://api.v2.tibetswap.io",
+    ):
+        self._pair_id = pair_id
+        self._asset_id = asset_id
+        self._cat_decimals = cat_decimals
+        self._coinset_url = coinset_url.rstrip("/")
+        self._coinset_timeout = coinset_timeout
+        self._tibet_url = tibet_url.rstrip("/")
+
+        self._lock = threading.Lock()
+        self._signals: List[Dict] = []
+        self._stop_event = threading.Event()
+
+        # Known state of the Tibet pool
+        self._pool_coin_id: Optional[str] = None   # last_coin_id_on_chain
+        self._xch_reserve: Optional[int] = None
+        self._tok_reserve: Optional[int] = None
+
+        # Debounce: don't emit repeated mempool signals for same pool coin
+        self._mempool_warned_coin_id: Optional[str] = None
+
+        # Offer coin watching — set of normalised coin IDs (no 0x prefix, lowercase)
+        # Updated by bot_loop after every offer state change.
+        # When any of these appear in mempool removals a fill_imminent signal fires.
+        self._watched_offer_coins: set = set()
+        # Debounce: track which offer coins have already fired this session
+        # so we don't spam signals while the tx is pending confirmation.
+        self._fill_warned_coin_ids: set = set()
+
+        # Background threads
+        self._reserve_thread: Optional[threading.Thread] = None
+        self._mempool_thread: Optional[threading.Thread] = None
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def start(self) -> None:
+        """Start background polling threads."""
+        if self._reserve_thread and self._reserve_thread.is_alive():
+            return  # already running
+
+        self._stop_event.clear()
+        self._reserve_thread = threading.Thread(
+            target=self._reserve_poll_loop,
+            name="MempoolWatcher-reserves",
+            daemon=True,
+        )
+        self._mempool_thread = threading.Thread(
+            target=self._mempool_poll_loop,
+            name="MempoolWatcher-mempool",
+            daemon=True,
+        )
+        self._reserve_thread.start()
+        self._mempool_thread.start()
+        log_event("info", "mempool_watcher_started",
+                  f"MempoolWatcher started for pair {self._pair_id[:16]}...")
+
+    def stop(self) -> None:
+        """Signal background threads to stop."""
+        self._stop_event.set()
+
+    def is_running(self) -> bool:
+        return bool(self._reserve_thread and self._reserve_thread.is_alive())
+
+    def get_pending_signals(self) -> List[Dict]:
+        """Return and clear accumulated price-movement signals.
+
+        Call this once per bot cycle. Signals older than SIGNAL_MAX_AGE
+        are automatically discarded.
+        """
+        now = time.time()
+        with self._lock:
+            fresh = [
+                s for s in self._signals
+                if (now - s["timestamp"]) < self.SIGNAL_MAX_AGE
+            ]
+            self._signals = []
+            return fresh
+
+    def get_current_reserves(self) -> Optional[Tuple[int, int]]:
+        """Return the last known (xch_reserve, tok_reserve), or None."""
+        with self._lock:
+            if self._xch_reserve is None or self._tok_reserve is None:
+                return None
+            return self._xch_reserve, self._tok_reserve
+
+    def set_watched_offer_coins(self, coin_ids: set) -> None:
+        """Register the set of coin IDs locked by currently open offers.
+
+        Call this after every offer state change (create, cancel, fill).
+        coin_ids may include '0x' prefixes — they are normalised internally.
+
+        When any of these coins appear as a removal in the Coinset mempool,
+        a 'fill_imminent' signal is emitted so the bot can wake early and
+        run fill detection before the 30-second cycle fires.
+
+        Coins that are no longer in the new set are removed from the debounce
+        cache so a fresh signal fires if they somehow reappear (shouldn't
+        happen in practice, but keeps state clean).
+        """
+        normalised = {c.lstrip("0x").lower() for c in coin_ids if c}
+        with self._lock:
+            self._watched_offer_coins = normalised
+            # Remove debounce entries for coins no longer being watched
+            self._fill_warned_coin_ids &= normalised
+
+    # ------------------------------------------------------------------
+    # Reserve polling thread
+    # ------------------------------------------------------------------
+
+    def _reserve_poll_loop(self) -> None:
+        """Poll Tibet for reserve changes. Fires 'price_move' signals."""
+        import requests as _req
+        session = _req.Session()
+
+        # First fetch to initialise baseline (no signal on first run)
+        self._fetch_and_update_reserves(session, emit_signal=False)
+
+        while not self._stop_event.wait(self.TIBET_POLL_INTERVAL):
+            self._fetch_and_update_reserves(session, emit_signal=True)
+
+    def _fetch_and_update_reserves(self, session, emit_signal: bool = True) -> None:
+        """Fetch current reserves from Tibet API and emit a signal if changed."""
+        try:
+            resp = session.get(
+                f"{self._tibet_url}/pairs",
+                params={"skip": 0, "limit": 200},
+                timeout=(3, 8),
+            )
+            if resp.status_code != 200:
+                return
+            pairs = resp.json()
+            if not isinstance(pairs, list):
+                return
+
+            for pair in pairs:
+                if pair.get("pair_id") != self._pair_id:
+                    continue
+                new_coin = str(pair.get("last_coin_id_on_chain") or "")
+                new_xch = int(pair.get("xch_reserve") or 0)
+                new_tok = int(pair.get("token_reserve") or 0)
+
+                with self._lock:
+                    old_xch = self._xch_reserve
+                    old_tok = self._tok_reserve
+                    old_coin = self._pool_coin_id
+
+                    # Always update known pool coin for mempool thread
+                    self._pool_coin_id = new_coin
+                    self._xch_reserve = new_xch
+                    self._tok_reserve = new_tok
+
+                # Emit a signal only when reserves actually changed
+                if emit_signal and old_xch is not None and (
+                    new_xch != old_xch or new_tok != old_tok
+                ):
+                    self._emit_price_move_signal(
+                        old_xch, old_tok, new_xch, new_tok,
+                        old_coin, new_coin,
+                    )
+                break
+
+        except Exception:
+            pass  # Network error — skip silently, next poll will retry
+
+    def _emit_price_move_signal(
+        self,
+        old_xch: int, old_tok: int,
+        new_xch: int, new_tok: int,
+        old_coin: str, new_coin: str,
+    ) -> None:
+        """Calculate price direction + magnitude and push a price_move signal."""
+        try:
+            factor = 10 ** self._cat_decimals
+            old_price = Decimal(old_xch) / Decimal(old_tok) / Decimal(factor)
+            new_price = Decimal(new_xch) / Decimal(new_tok) / Decimal(factor)
+
+            if old_price <= 0:
+                return
+
+            pct_change = float((new_price - old_price) / old_price * 100)
+            if abs(pct_change) < self.MIN_SIGNAL_MAGNITUDE:
+                return  # noise filter
+
+            direction = "up" if pct_change > 0 else "down"
+            signal = {
+                "type": "price_move",
+                "direction": direction,
+                "magnitude_pct": round(abs(pct_change), 4),
+                "signed_pct": round(pct_change, 4),
+                "source": "confirmed_reserves",
+                "timestamp": time.time(),
+                "old_xch_reserve": old_xch,
+                "old_tok_reserve": old_tok,
+                "new_xch_reserve": new_xch,
+                "new_tok_reserve": new_tok,
+                "delta_xch": new_xch - old_xch,
+                "delta_tok": new_tok - old_tok,
+                "old_price_xch": float(old_price),
+                "new_price_xch": float(new_price),
+                "pool_coin_changed": (old_coin != new_coin),
+            }
+            with self._lock:
+                self._signals.append(signal)
+
+            log_event("info", "mempool_price_move",
+                      f"Pool reserve change: {direction} {abs(pct_change):.3f}% "
+                      f"(XCH {old_xch}→{new_xch}, TOK {old_tok}→{new_tok})")
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Mempool polling thread
+    # ------------------------------------------------------------------
+
+    def _mempool_poll_loop(self) -> None:
+        """Poll Coinset mempool for pending spends of the pool coin."""
+        import requests as _req
+        session = _req.Session()
+
+        # Stagger slightly behind reserve thread
+        time.sleep(2)
+
+        while not self._stop_event.wait(self.MEMPOOL_POLL_INTERVAL):
+            self._check_mempool_for_pool_spend(session)
+
+    def _check_mempool_for_pool_spend(self, session) -> None:
+        """Scan Coinset mempool for pending spends of the Tibet pool coin
+        and any of the bot's currently open offer coins.
+
+        A single API call serves both checks — the full mempool is fetched
+        once and scanned for all watched IDs in the same pass.
+        """
+        with self._lock:
+            current_pool_coin = self._pool_coin_id
+            already_warned = self._mempool_warned_coin_id
+            watched_offers = set(self._watched_offer_coins)
+            already_warned_fills = set(self._fill_warned_coin_ids)
+
+        # Skip the fetch entirely if there's nothing new to watch
+        pool_check_needed = bool(
+            current_pool_coin and current_pool_coin != already_warned
+        )
+        offer_check_needed = bool(watched_offers - already_warned_fills)
+        if not pool_check_needed and not offer_check_needed:
+            return
+
+        try:
+            resp = session.post(
+                f"{self._coinset_url}/get_all_mempool_items",
+                json={},
+                headers={
+                    "content-type": "application/json",
+                    "User-Agent": "ChiaMarketMaker/2.0",
+                },
+                timeout=(3, self._coinset_timeout),
+            )
+            if resp.status_code != 200:
+                return
+            data = resp.json()
+            if not data.get("success"):
+                return
+
+            items = data.get("mempool_items") or {}
+            if isinstance(items, dict):
+                items = list(items.values())
+
+        except Exception:
+            return  # network error, retry next interval
+
+        # Single-pass scan: compute each removal's coin ID and check against
+        # the Tibet pool coin AND the set of watched offer coins.
+        pool_found = False
+        fill_hits: List[str] = []  # offer coin IDs found in mempool
+
+        unwatched_offers = watched_offers - already_warned_fills
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            removals = item.get("removals") or []
+            for removal in removals:
+                if not isinstance(removal, dict):
+                    continue
+                parent = str(removal.get("parent_coin_info") or "")
+                ph = str(removal.get("puzzle_hash") or "")
+                amount = int(removal.get("amount") or 0)
+                if not parent or not ph:
+                    continue
+                computed_id = compute_coin_id(parent, ph, amount)
+
+                if pool_check_needed and not pool_found:
+                    if computed_id == current_pool_coin:
+                        pool_found = True
+
+                if unwatched_offers and computed_id in unwatched_offers:
+                    fill_hits.append(computed_id)
+                    unwatched_offers.discard(computed_id)
+
+            # Early exit once all targets found
+            if (not pool_check_needed or pool_found) and not unwatched_offers:
+                break
+
+        # --- Emit Tibet swap signal ---
+        if pool_found:
+            with self._lock:
+                self._mempool_warned_coin_id = current_pool_coin
+                xch_res = self._xch_reserve
+                tok_res = self._tok_reserve
+
+            signal = {
+                "type": "imminent_swap",
+                "direction": "unknown",
+                "magnitude_pct": 0.0,
+                "source": "mempool_detected",
+                "timestamp": time.time(),
+                "pool_coin_id": current_pool_coin,
+                "current_xch_reserve": xch_res,
+                "current_tok_reserve": tok_res,
+            }
+            with self._lock:
+                self._signals.append(signal)
+
+            log_event("info", "mempool_swap_detected",
+                      f"PENDING swap detected in mempool for pool coin "
+                      f"{current_pool_coin[:16]}... — pre-emptive sniper window open.")
+
+        # --- Emit fill_imminent signals for our offer coins ---
+        if fill_hits:
+            with self._lock:
+                self._fill_warned_coin_ids.update(fill_hits)
+
+            for coin_id in fill_hits:
+                signal = {
+                    "type": "fill_imminent",
+                    "direction": "unknown",
+                    "magnitude_pct": 0.0,
+                    "source": "mempool_detected",
+                    "timestamp": time.time(),
+                    "coin_id": coin_id,
+                }
+                with self._lock:
+                    self._signals.append(signal)
+
+                log_event("info", "mempool_fill_detected",
+                          f"Offer coin {coin_id[:16]}... appears in mempool — "
+                          f"fill likely pending, waking bot early.")
+
+
+# ---------------------------------------------------------------------------
+# Singleton factory for bot_loop integration
+# ---------------------------------------------------------------------------
+
+_watcher_instance: Optional[MempoolWatcher] = None
+_watcher_lock = threading.Lock()
+
+
+def get_or_create_watcher(
+    pair_id: str,
+    asset_id: str,
+    cat_decimals: int = 3,
+) -> MempoolWatcher:
+    """Return the singleton MempoolWatcher, creating it if needed.
+
+    Called from bot_loop once the pair is known.
+    """
+    global _watcher_instance
+    with _watcher_lock:
+        if _watcher_instance is None:
+            from config import cfg
+            coinset_url = str(getattr(cfg, "COINSET_API_URL", "https://api.coinset.org") or "")
+            coinset_timeout = int(getattr(cfg, "COINSET_TIMEOUT", 5) or 5)
+            tibet_url = str(getattr(cfg, "TIBET_API_BASE", "https://api.v2.tibetswap.io") or "https://api.v2.tibetswap.io")
+            _watcher_instance = MempoolWatcher(
+                pair_id=pair_id,
+                asset_id=asset_id,
+                cat_decimals=cat_decimals,
+                coinset_url=coinset_url,
+                coinset_timeout=coinset_timeout,
+                tibet_url=tibet_url,
+            )
+        return _watcher_instance
+
+
+def start_watcher(pair_id: str, asset_id: str, cat_decimals: int = 3) -> MempoolWatcher:
+    """Convenience: get-or-create and start the watcher."""
+    w = get_or_create_watcher(pair_id, asset_id, cat_decimals)
+    if not w.is_running():
+        w.start()
+    return w
+
+
+def stop_watcher() -> None:
+    """Stop the singleton watcher (called on bot shutdown)."""
+    global _watcher_instance
+    with _watcher_lock:
+        if _watcher_instance:
+            _watcher_instance.stop()

@@ -1,0 +1,3711 @@
+"""
+Sage Wallet Module — Drop-in replacement for wallet_chia.py
+
+Sage is a high-performance light wallet for Chia built in Rust.
+It connects directly to Chia network peers (no full node required).
+
+Key differences from Chia wallet RPC:
+  - Port 9257 (vs Chia's 9256)
+  - Amounts as strings (e.g., "1000000000000" not 1000000000000)
+  - get_coins (with asset_id=null for XCH, asset_id=string for CATs) for coin queries
+  - No wallet_id system — CATs identified by asset_id directly
+  - Native split_xch / split_cat endpoints (coin_ids array)
+  - make_offer with offered_assets / requested_assets arrays
+  - get_offers (not get_all_offers)
+  - No full node — light wallet only
+
+All functions match the wallet_chia.py signatures exactly so the
+adapter layer (wallet.py) can swap implementations with zero changes
+to other modules.
+"""
+
+import os
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3 import Retry
+from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import hashlib
+from typing import List, Dict, Optional, Tuple, Any
+from decimal import Decimal, ROUND_DOWN
+from tx_fees import get_effective_transaction_fee_mojos
+
+# Silence warnings for localhost self-signed cert
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+load_dotenv()
+
+# Sage defaults to port 9257 — uses HTTPS with self-signed cert
+# IMPORTANT: use 127.0.0.1 (not localhost) to match Sage's actual bind address
+WALLET_URL = os.getenv("SAGE_RPC_URL", "https://127.0.0.1:9257").rstrip("/")
+CERT_PATH = os.getenv("SAGE_CERT_PATH", "")
+KEY_PATH = os.getenv("SAGE_KEY_PATH", "")
+
+# --- Auto-detect or generate client certificates ---
+# Sage RPC requires mutual TLS. Clients must present a self-signed cert.
+# Priority: SAGE_CERT_PATH env → auto-generated cert in bot directory.
+import pathlib
+
+def _generate_self_signed_cert(cert_path, key_path):
+    """Generate a self-signed certificate for Sage RPC client auth.
+
+    Uses Python's built-in ssl module if available, otherwise falls back
+    to creating a minimal self-signed cert via subprocess (openssl).
+    """
+    try:
+        # Try using cryptography library (may already be installed for Chia)
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        import datetime
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        subject = issuer = x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, "sage-bot-client"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "CAT Market Maker Bot"),
+        ])
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(issuer)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.datetime.utcnow())
+            .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=3650))
+            .sign(key, hashes.SHA256())
+        )
+
+        os.makedirs(os.path.dirname(cert_path), exist_ok=True)
+        with open(key_path, "wb") as f:
+            f.write(key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.TraditionalOpenSSL,
+                serialization.NoEncryption(),
+            ))
+        # Restrict private key to owner-only access
+        try:
+            import stat
+            os.chmod(key_path, stat.S_IRUSR | stat.S_IWUSR)  # 0o600
+        except OSError:
+            pass  # Windows may not support POSIX permissions fully
+        with open(cert_path, "wb") as f:
+            f.write(cert.public_bytes(serialization.Encoding.PEM))
+
+        print(f"✅ [Sage] Generated self-signed client cert: {cert_path}")
+        return True
+    except ImportError:
+        print("⚠️  [Sage] 'cryptography' package not installed — cannot generate client cert")
+        print("   Install it with: pip install cryptography --break-system-packages")
+        return False
+    except Exception as e:
+        print(f"⚠️  [Sage] Failed to generate client cert: {e}")
+        return False
+
+
+if not CERT_PATH or not KEY_PATH:
+    # Auto-generate a client cert in the bot's directory
+    _bot_dir = os.path.dirname(os.path.abspath(__file__))
+    _auto_cert = os.path.join(_bot_dir, "sage_client_ssl", "client.crt")
+    _auto_key = os.path.join(_bot_dir, "sage_client_ssl", "client.key")
+
+    if os.path.exists(_auto_cert) and os.path.exists(_auto_key):
+        # Already generated previously
+        CERT_PATH = _auto_cert
+        KEY_PATH = _auto_key
+    else:
+        # Generate fresh self-signed cert
+        if _generate_self_signed_cert(_auto_cert, _auto_key):
+            CERT_PATH = _auto_cert
+            KEY_PATH = _auto_key
+
+# Sage doesn't use wallet IDs — but we keep the constant for API compatibility.
+# Other modules import WALLET_ID_XCH for offer_dict keys.
+# For Sage, offers use asset_id strings instead of wallet IDs, but the
+# calling code passes this constant as a dict key. The create_offer()
+# function below translates wallet_id keys into Sage's make_offer format.
+WALLET_ID_XCH = int(os.getenv("CHIA_WALLET_ID_XCH", "1"))
+
+# CAT asset ID — Sage needs this to query CAT coins (instead of wallet_id)
+_CAT_ASSET_ID = os.getenv("CAT_ASSET_ID", "")
+
+# Mapping from synthetic wallet_id → asset_id for multi-CAT discovery.
+# Populated by get_wallets() when Sage's get_cats endpoint returns results.
+# Allows get_wallet_balance() etc. to resolve any CAT, not just the configured one.
+_wallet_id_to_asset_id: dict = {}
+
+HEADERS = {"Content-Type": "application/json"}
+
+WALLET_DEBUG = os.getenv("WALLET_DEBUG", "false").lower() == "true"
+
+# Sage has no full node — these stubs exist for adapter compatibility.
+# Modules that check FULL_NODE_URL will get None and skip full-node-only logic.
+FULL_NODE_URL = None
+FULL_NODE_CERT = None
+FULL_NODE_KEY = None
+
+# requests.Session stub — Sage uses raw http.client, not requests.
+# Some modules reference wallet.session for timeout config.
+session = None
+
+_TLS_VERIFY = False
+
+# --- Direct HTTPS connection (bypasses requests/urllib3 SSL quirks) ---
+import ssl
+import http.client
+import json as _json
+
+# Parse host/port once at module level
+_url_body = WALLET_URL.replace("https://", "").replace("http://", "")
+if ":" in _url_body:
+    _SAGE_HOST, _port_str = _url_body.split(":", 1)
+    _SAGE_PORT = int(_port_str)
+else:
+    _SAGE_HOST = _url_body
+    _SAGE_PORT = 9257
+
+
+class SageMempoolConflict(Exception):
+    """Raised when Sage reports a MEMPOOL_CONFLICT — two transactions tried to spend the same coin."""
+    pass
+
+
+class SageUnknownUnspent(Exception):
+    """Raised when Sage reports UNKNOWN_UNSPENT — the coin doesn't exist in the UTXO set.
+
+    Common causes:
+    - Coin hasn't confirmed on-chain yet (pool coin created but not spendable)
+    - Coin was already spent by another transaction
+    - Stale coin ID from a previous state
+    """
+    pass
+
+
+class SageTransactionError(Exception):
+    """Raised when Sage reports a transaction-level error (not just HTTP failure)."""
+    def __init__(self, message: str, error_type: str = "unknown"):
+        super().__init__(message)
+        self.error_type = error_type
+
+
+# Thread-local connection cache — reuses TLS connections within a thread.
+# Eliminates ~100-200ms TLS handshake overhead per RPC call.
+import threading as _thr
+_conn_local = _thr.local()
+
+
+def _get_sage_connection(timeout: int = 10):
+    """Get or create a thread-local HTTPS connection to Sage.
+
+    Reuses the existing connection if alive, creates a new one otherwise.
+    """
+    conn = getattr(_conn_local, 'conn', None)
+    if conn is not None:
+        # Check if the existing connection is still usable
+        try:
+            conn.sock  # will be None if closed
+            if conn.sock is not None:
+                conn.timeout = timeout
+                return conn
+        except Exception:
+            pass
+
+    # Build SSL context
+    ctx = ssl._create_unverified_context()
+    if CERT_PATH and KEY_PATH:
+        ctx.load_cert_chain(CERT_PATH, KEY_PATH)
+
+    conn = http.client.HTTPSConnection(
+        _SAGE_HOST, _SAGE_PORT, timeout=timeout, context=ctx
+    )
+    _conn_local.conn = conn
+    return conn
+
+
+def _sage_post(path: str, payload: dict, timeout: int = 10):
+    """Low-level HTTPS POST to Sage, bypassing requests library entirely.
+
+    Uses http.client + ssl for complete control over TLS negotiation.
+    Presents our self-signed client cert for mutual TLS authentication.
+    Reuses thread-local connections for performance.
+    """
+    body = _json.dumps(payload).encode("utf-8")
+    headers_dict = {"Content-Type": "application/json", "Connection": "keep-alive"}
+
+    conn = _get_sage_connection(timeout)
+    try:
+        conn.request("POST", "/" + path.lstrip("/"), body=body, headers=headers_dict)
+        resp = conn.getresponse()
+        data = resp.read().decode("utf-8")
+    except Exception:
+        # Connection was stale — recreate and retry once
+        _conn_local.conn = None
+        ctx = ssl._create_unverified_context()
+        if CERT_PATH and KEY_PATH:
+            ctx.load_cert_chain(CERT_PATH, KEY_PATH)
+        conn = http.client.HTTPSConnection(
+            _SAGE_HOST, _SAGE_PORT, timeout=timeout, context=ctx
+        )
+        _conn_local.conn = conn
+        conn.request("POST", "/" + path.lstrip("/"), body=body, headers=headers_dict)
+        resp = conn.getresponse()
+        data = resp.read().decode("utf-8")
+
+    if resp.status == 200:
+        parsed = _json.loads(data)
+        # Check for transaction errors in the response body
+        # Sage may return 200 but include error details in the JSON
+        if isinstance(parsed, dict):
+            error_msg = parsed.get("error") or parsed.get("error_message") or ""
+            status = parsed.get("status") or ""
+            combined = str(error_msg) + str(status)
+            if "MEMPOOL_CONFLICT" in combined:
+                raise SageMempoolConflict(
+                    f"MEMPOOL_CONFLICT on {path}: another transaction already spent one of these coins")
+            if "UNKNOWN_UNSPENT" in combined:
+                raise SageUnknownUnspent(
+                    f"UNKNOWN_UNSPENT on {path}: coin not in UTXO set (not confirmed or already spent)")
+        return parsed
+    else:
+        # Check for specific error types in non-200 responses
+        if "MEMPOOL_CONFLICT" in data:
+            raise SageMempoolConflict(
+                f"MEMPOOL_CONFLICT on {path}: {data[:200]}")
+        if "UNKNOWN_UNSPENT" in data:
+            raise SageUnknownUnspent(
+                f"UNKNOWN_UNSPENT on {path}: {data[:200]}")
+        raise ConnectionError(f"Sage HTTP {resp.status}: {data[:300]}")
+
+# Quiet mode: suppress RPC error logging
+_quiet_mode = False
+
+
+def set_quiet_mode(quiet: bool):
+    """Enable/disable RPC error suppression."""
+    global _quiet_mode
+    _quiet_mode = quiet
+
+
+def rpc(endpoint: str, payload: dict, timeout: int = 10):
+    """Make RPC call to Sage wallet on port 9257.
+
+    Uses direct http.client + ssl (bypasses requests/urllib3 SSL issues).
+    Client certs loaded from: SAGE_CERT_PATH → CHIA_WALLET_CERT → ~/.chia defaults.
+
+    Returns:
+        dict on success, None on error.
+        For MEMPOOL_CONFLICT, returns {"error": "MEMPOOL_CONFLICT", ...} so callers
+        can detect it without catching exceptions.
+    """
+    # Guard: never send get_coins with empty string asset_id (fresh install, no token)
+    if endpoint == "get_coins":
+        aid = payload.get("asset_id")
+        if aid is not None and (not aid or not str(aid).strip()):
+            return None
+
+    start = time.time()
+
+    try:
+        result = _sage_post(endpoint, payload, timeout=timeout)
+
+        if WALLET_DEBUG:
+            elapsed = time.time() - start
+            if elapsed > 1.0:
+                print(f"⏱️  [Sage] {endpoint} took {elapsed:.2f}s")
+
+        return result
+    except SageMempoolConflict as e:
+        elapsed = time.time() - start
+        print(f"⚠️  [Sage] MEMPOOL_CONFLICT on {endpoint} (after {elapsed:.2f}s): {e}")
+        # Return a structured error so callers can detect this specific failure
+        return {"error": "MEMPOOL_CONFLICT", "success": False,
+                "message": str(e), "endpoint": endpoint}
+    except SageUnknownUnspent as e:
+        elapsed = time.time() - start
+        print(f"⚠️  [Sage] UNKNOWN_UNSPENT on {endpoint} (after {elapsed:.2f}s): {e}")
+        # Return structured error — coin not confirmed on-chain yet or already spent
+        return {"error": "UNKNOWN_UNSPENT", "success": False,
+                "message": str(e), "endpoint": endpoint}
+    except ConnectionError as e:
+        elapsed = time.time() - start
+        err_str = str(e)
+        if not _quiet_mode:
+            print(f"❌ Sage RPC error calling {endpoint} (after {elapsed:.2f}s): {e}")
+        # Return structured error so callers can see the actual message
+        # (previously returned None which became "Unknown error" in logs)
+        return {"error": err_str[:300], "success": False, "endpoint": endpoint}
+    except Exception as e:
+        elapsed = time.time() - start
+        if not _quiet_mode:
+            print(f"❌ Sage RPC error calling {endpoint} (after {elapsed:.2f}s): {e}")
+        return None
+
+
+def full_node_rpc(endpoint: str, payload: dict, timeout: int = 5):
+    """Sage is a light wallet — no full node RPC available.
+
+    Returns None always. Modules that check full node health will
+    see 'not available' which is expected for Sage.
+    """
+    return None
+
+
+# ==================== KEY / FINGERPRINT MANAGEMENT ====================
+
+def get_sage_keys() -> list:
+    """Get all available keys/fingerprints from Sage wallet.
+
+    Returns:
+        List of dicts: [{name, fingerprint, public_key, kind, has_secrets, network_id}, ...]
+        Empty list on error.
+    """
+    try:
+        result = rpc("get_keys", {}, timeout=10)
+        if result and isinstance(result, dict):
+            return result.get("keys", [])
+        elif result and isinstance(result, list):
+            return result
+    except Exception as e:
+        print(f"  [Sage] get_sage_keys error: {e}")
+    return []
+
+
+def get_current_key() -> dict:
+    """Get the currently active (logged-in) key.
+
+    Returns:
+        Dict with key info {name, fingerprint, ...} or None if not logged in.
+    """
+    try:
+        result = rpc("get_key", {}, timeout=5)
+        if result and isinstance(result, dict):
+            key = result.get("key")
+            if key and isinstance(key, dict):
+                return key
+    except Exception as e:
+        print(f"  [Sage] get_current_key error: {e}")
+    return None
+
+
+def _require_signing_capability() -> bool:
+    """Check that the active wallet has signing capability (has secrets).
+
+    Watch-only wallets can query balances and offers but must NOT sign
+    transactions, create offers, or cancel offers. This guard should be
+    called at the top of any signing/submission path.
+
+    Returns True if signing is allowed, False if watch-only.
+    """
+    try:
+        key = get_current_key()
+        if key and isinstance(key, dict):
+            has_secrets = key.get("has_secrets", False)  # Default False — watch-only wallets must be blocked from signing by default
+            if not has_secrets:
+                print(f"  [Sage] BLOCKED: wallet is watch-only (no secrets) — cannot sign", flush=True)
+                return False
+            return True
+        print("  [Sage] BLOCKED: active key unavailable — refusing signing operation", flush=True)
+        return False
+    except Exception as e:
+        print(f"  [Sage] BLOCKED: signing capability check failed: {e}", flush=True)
+        return False
+
+
+def sage_login(fingerprint: int) -> bool:
+    """Log in to a specific fingerprint via readiness check + resync + login.
+
+    Sage requires:
+    0. Readiness check — verify Sage RPC is responding before attempting login
+    1. resync(fingerprint) — loads the wallet data for that key
+    2. login(fingerprint) — activates the key as the current session
+
+    Args:
+        fingerprint: Integer fingerprint to connect to.
+
+    Returns:
+        True if login succeeded and get_key confirms the right fingerprint.
+    """
+    fingerprint = int(fingerprint)
+    print(f"  [Sage] Logging in to fingerprint {fingerprint}...")
+
+    # Step 0: verify Sage is reachable before attempting login.
+    # This distinguishes "Sage not running" from "login failed" errors.
+    try:
+        version_result = rpc("get_version", {}, timeout=5)
+        if version_result is None:
+            print(f"  [Sage] INIT FAILED: Sage RPC not responding (get_version returned None)")
+            return False
+        version = version_result.get("version", "?") if isinstance(version_result, dict) else "?"
+        print(f"  [Sage] Sage v{version} is reachable — proceeding with login")
+    except Exception as e:
+        print(f"  [Sage] INIT FAILED: Cannot reach Sage RPC: {e}")
+        return False
+
+    time.sleep(1)
+
+    # Step 1: resync — loads wallet data
+    try:
+        result = rpc("resync", {"fingerprint": fingerprint}, timeout=30)
+        if result is None:
+            print(f"  [Sage] resync failed (no response)")
+            return False
+        print(f"  [Sage] resync OK")
+    except Exception as e:
+        print(f"  [Sage] resync error: {e}")
+        return False
+
+    time.sleep(1)
+
+    # Step 2: login — activates the key
+    try:
+        result = rpc("login", {"fingerprint": fingerprint}, timeout=30)
+        if result is None:
+            print(f"  [Sage] login failed (no response)")
+            return False
+        print(f"  [Sage] login OK")
+    except Exception as e:
+        print(f"  [Sage] login error: {e}")
+        return False
+
+    time.sleep(1)
+
+    # Step 3: verify
+    key = get_current_key()
+    if key and key.get("fingerprint") == fingerprint:
+        print(f"  [Sage] Confirmed: logged in as '{key.get('name', '?')}' ({fingerprint})")
+        return True
+    elif key:
+        actual_fp = key.get('fingerprint')
+        print(f"  [Sage] ERROR: fingerprint mismatch after login attempt — "
+              f"wanted {fingerprint}, got {actual_fp}. Refusing to start.", flush=True)
+        try:
+            from super_log import log_event
+            log_event("error", "wallet_fingerprint_mismatch",
+                      f"Sage fingerprint mismatch: wanted {fingerprint}, got {actual_fp}. "
+                      f"Bot will not trade from the wrong wallet.")
+        except Exception:
+            pass
+        return False
+    else:
+        print(f"  [Sage] Login appeared to succeed but get_key returned null")
+        return False
+
+
+def sage_logout() -> bool:
+    """Log out from the current key.
+
+    Returns:
+        True if logout succeeded.
+    """
+    try:
+        result = rpc("logout", {}, timeout=10)
+        print(f"  [Sage] Logout: {'OK' if result is not None else 'failed'}")
+        return result is not None
+    except Exception as e:
+        print(f"  [Sage] logout error: {e}")
+        return False
+
+
+# ==================== HEALTH MONITORING ====================
+
+def get_wallet_sync_status() -> dict:
+    """Check Sage wallet sync status via RPC.
+
+    Sage uses get_sync_status which returns:
+      { "balance": str, "unit": { ... }, "synced": bool }
+    """
+    try:
+        result = rpc("get_sync_status", {}, timeout=5)
+        if result and isinstance(result, dict):
+            # Sage returns synced status directly.
+            # IMPORTANT: some Sage versions return synced=None (not True/False).
+            # We must not promote that undocumented value into "synced=True".
+            # Report it as an explicit unknown state so callers can decide
+            # whether they need strict readiness or just service health.
+            raw_synced = result.get("synced")
+            synced_coins = result.get("synced_coins", 0)
+            total_coins = result.get("total_coins", 0)
+
+            if raw_synced is True:
+                sync_state = "synced"
+                synced = True
+                syncing = False
+            elif raw_synced is False:
+                sync_state = "not_synced"
+                synced = False
+                syncing = True
+            else:
+                # raw_synced is None — Sage did not return an explicit sync state.
+                # Per Sage review rules, do NOT promote this to "ready".
+                sync_state = "unknown"
+                synced = False
+                syncing = True
+
+            return {
+                "reachable": True,
+                "synced": synced,
+                "syncing": syncing,
+                "sync_state": sync_state,
+            }
+        return {"reachable": True, "synced": False, "syncing": False, "sync_state": "unknown"}
+    except Exception:
+        return {"reachable": False, "synced": False, "syncing": False, "sync_state": "offline"}
+
+
+def get_full_node_sync_status() -> dict:
+    """Sage has no full node — return a neutral status.
+
+    This lets the health monitor work without errors. The overall
+    health check will report 'no_full_node' status.
+    """
+    return {
+        "reachable": False,
+        "synced": False,
+        "syncing": False,
+        "peak_height": 0,
+        "note": "Sage is a light wallet — no full node"
+    }
+
+
+def get_chia_health() -> dict:
+    """Combined health check — adapted for Sage (no full node).
+
+    Sage is a light wallet — it doesn't have a full node sync state.
+    If the wallet RPC is reachable and responding, we treat service health as
+    healthy even when sync state is unknown. Startup/readiness logic remains
+    conservative by using the explicit sync_state field.
+    """
+    wallet = get_wallet_sync_status()
+    node = get_full_node_sync_status()
+
+    if not wallet["reachable"]:
+        status = "unreachable"
+        healthy = False
+    elif wallet.get("sync_state") == "not_synced":
+        status = "wallet_not_synced"
+        healthy = False
+    elif wallet.get("sync_state") == "unknown":
+        # Per Sage review rules: do not promote undocumented values into
+        # "ready".  Report honestly that sync state is unknown.  The bot
+        # loop has its own `sage_wallet_service_ok` heuristic that treats
+        # reachable+unknown as usable for Sage service monitoring, but this
+        # health function should not claim healthy when sync is unconfirmed.
+        status = "wallet_sync_unknown"
+        healthy = False
+    else:
+        status = "healthy"
+        healthy = True
+
+    return {
+        "status": status,
+        "wallet": wallet,
+        "node": node,
+        "healthy": healthy,
+        "timestamp": time.time(),
+        "wallet_type": "sage",
+    }
+
+
+# ============================================================================
+# COIN MANAGEMENT
+# ============================================================================
+
+def _get_cat_asset_id() -> Optional[str]:
+    """Get the active CAT asset ID. Always returns the most-recent value.
+
+    Callers: use notify_cat_asset_id_changed() when the active CAT changes
+    rather than relying on os.getenv(), because os.environ is only updated
+    when cfg.update() flushes to disk and load_dotenv() is re-run.
+    """
+    global _CAT_ASSET_ID
+    return _CAT_ASSET_ID or None
+
+
+def notify_cat_asset_id_changed(asset_id: str) -> None:
+    """Called by api_server when the user selects a new trading pair.
+
+    Keeps _CAT_ASSET_ID in sync so _resolve_asset_id() cross-checks work
+    correctly without reading stale values from os.environ.
+    Also clears any per-wallet-id mismatch-warned flags so the first access
+    after a switch gets a clean cross-check.
+    """
+    global _CAT_ASSET_ID
+    new_id = (asset_id or "").strip().lower().replace("0x", "")
+    old_id = (_CAT_ASSET_ID or "").strip().lower().replace("0x", "")
+    if new_id != old_id:
+        _CAT_ASSET_ID = (asset_id or "").strip() or None
+        # Clear stale mismatch-warned flags so the next resolve is a fresh check
+        for attr in [a for a in dir(_resolve_asset_id) if a.startswith("_mismatch_warned_")]:
+            try:
+                delattr(_resolve_asset_id, attr)
+            except AttributeError:
+                pass
+        print(f"[Sage] Active CAT updated: {new_id[:16] if new_id else 'none'}", flush=True)
+
+
+def _is_cat_wallet(wallet_id: int) -> bool:
+    """Determine if a wallet_id refers to a CAT wallet.
+
+    In the Chia wallet, wallet_id=1 is always XCH, and CAT wallets
+    have higher IDs. We use this heuristic for the Sage adapter since
+    Sage doesn't use wallet IDs at all.
+    """
+    return wallet_id != WALLET_ID_XCH
+
+
+def _get_coin_query_asset_id(wallet_id: int) -> Tuple[bool, Optional[str]]:
+    """Resolve the Sage asset_id for a wallet_id."""
+    if _is_cat_wallet(wallet_id):
+        asset_id = _resolve_asset_id(wallet_id)
+        if not asset_id or not asset_id.strip():
+            return False, None
+        return True, asset_id
+    return True, None
+
+
+def _extract_sage_coin_list(result: Optional[Dict]) -> List[Dict[str, Any]]:
+    """Extract Sage coin dicts from a get_coins-style response."""
+    if not result or not isinstance(result, dict):
+        return []
+
+    found = result.get("coins") or result.get("records") or result.get("data") or []
+    if not found:
+        for value in result.values():
+            if isinstance(value, list) and len(value) > 0:
+                found = value
+                break
+
+    return [coin for coin in found if isinstance(coin, dict)]
+
+
+def _normalize_sage_coin_records(coins: List[Dict[str, Any]],
+                                 min_amount_mojos: int = 0,
+                                 max_amount_mojos: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Convert raw Sage coin dicts into the Chia-compatible record shape."""
+    records = []
+    for coin in coins:
+        raw_amount = (coin.get("amount") or coin.get("amt")
+                      or coin.get("value") or "0")
+        amount = int(raw_amount)
+
+        if min_amount_mojos > 0 and amount < min_amount_mojos:
+            continue
+        if max_amount_mojos is not None and amount > max_amount_mojos:
+            continue
+
+        parent = (coin.get("parent_coin_info") or coin.get("parent_coin")
+                  or coin.get("parentCoin") or coin.get("parent") or "")
+        puzzle = (coin.get("puzzle_hash") or coin.get("puzzleHash")
+                  or coin.get("puzzle") or "")
+        coin_id = (coin.get("coin_id") or coin.get("id")
+                   or coin.get("coinId") or coin.get("name") or "")
+
+        records.append({
+            "coin": {
+                "parent_coin_info": parent,
+                "puzzle_hash": puzzle,
+                "amount": amount,
+            },
+            "spent_block_index": 0,
+            "coin_id": coin_id,
+        })
+
+    return records
+
+
+def _query_coin_records(wallet_id: int, filter_mode: str,
+                        min_amount_mojos: int = 0,
+                        max_amount_mojos: Optional[int] = None) -> Optional[Dict]:
+    """Query Sage get_coins for one filter mode and normalize the records."""
+    supported, asset_id = _get_coin_query_asset_id(wallet_id)
+    if not supported:
+        return None
+
+    result = rpc("get_coins", {
+        "asset_id": asset_id,
+        "offset": 0,
+        "limit": 500,
+        "sort_mode": "amount",
+        "filter_mode": filter_mode,
+        "ascending": False,
+    }, timeout=15)
+
+    if not result or not isinstance(result, dict):
+        return None
+
+    coins = _extract_sage_coin_list(result)
+    if not coins:
+        result_keys = [k for k in result.keys() if k not in ("success", "error")]
+        if result_keys:
+            total = result.get("total")
+            total_suffix = f", total={total}" if total is not None else ""
+            print(f"⚠️  [Sage] get_coins({filter_mode}) returned 0 coins "
+                  f"(keys: {result_keys}{total_suffix})", flush=True)
+
+    if WALLET_DEBUG and coins:
+        print(f"   🔍 [Sage] First {filter_mode} coin keys: "
+              f"{list(coins[0].keys()) if isinstance(coins[0], dict) else 'not a dict'}")
+
+    records = _normalize_sage_coin_records(
+        coins,
+        min_amount_mojos=min_amount_mojos,
+        max_amount_mojos=max_amount_mojos,
+    )
+    return {
+        "success": True,
+        "records": records,
+        "confirmed_records": records,
+    }
+
+
+def get_spendable_coins(wallet_id: int, min_amount_mojos: int = 0,
+                        max_amount_mojos: int = None) -> Optional[Dict]:
+    """Query Sage's strict selectable view within a size range."""
+    return _query_coin_records(
+        wallet_id,
+        "selectable",
+        min_amount_mojos=min_amount_mojos,
+        max_amount_mojos=max_amount_mojos,
+    )
+
+
+def get_spendable_coins_with_owned_fallback(wallet_id: int, min_amount_mojos: int = 0,
+                                            max_amount_mojos: int = None) -> Optional[Dict]:
+    """Compatibility helper that merges owned-only coins into the selectable set."""
+    if _is_cat_wallet(wallet_id):
+        asset_id = _resolve_asset_id(wallet_id)
+        if not asset_id or not asset_id.strip():
+            # No token configured yet (fresh install) — skip silently
+            return None
+    else:
+        asset_id = None  # XCH = null asset_id
+
+    # ── SAGE BUG WORKAROUND ──────────────────────────────────────────
+    # Sage's filter_mode="selectable" hides coins on BOTH sides of an
+    # offer — not just the offered side.  GitHub issue submitted to
+    # xch-dev/sage.  Workaround: fetch "owned" (all held coins) AND
+    # "selectable" (conservative set).  Return selectable first (known
+    # free), then append any owned-only coins that the bug wrongly hid.
+    # If a genuinely locked coin slips through, the wallet will reject
+    # the offer at creation time — safe fallback.
+    # ────────────────────────────────────────────────────────────────
+
+    # 1) Fetch ALL held coins (free + offer-locked, excludes spent)
+    owned_result = rpc("get_coins", {
+        "asset_id": asset_id,
+        "offset": 0,
+        "limit": 500,
+        "sort_mode": "amount",
+        "filter_mode": "owned",
+        "ascending": False,
+    }, timeout=15)
+
+    # 2) Fetch selectable coins (Sage's conservative set — may under-report)
+    selectable_result = rpc("get_coins", {
+        "asset_id": asset_id,
+        "offset": 0,
+        "limit": 500,
+        "sort_mode": "amount",
+        "filter_mode": "selectable",
+        "ascending": False,
+    }, timeout=15)
+
+    if not owned_result and not selectable_result:
+        return None
+
+    # ── DIAGNOSTIC: log raw coin counts from Sage ──────────────────
+    # Helps debug cases where Sage returns fewer coins than expected
+    # (e.g., auto-combine merging split coins back into one).
+    wtype = "CAT" if asset_id else "XCH"
+    _owned_raw = []
+    _sel_raw = []
+    if owned_result and isinstance(owned_result, dict):
+        _owned_raw = owned_result.get("coins") or owned_result.get("records") or owned_result.get("data") or []
+    if selectable_result and isinstance(selectable_result, dict):
+        _sel_raw = selectable_result.get("coins") or selectable_result.get("records") or selectable_result.get("data") or []
+    if len(_owned_raw) <= 3 or len(_sel_raw) <= 3:
+        # Only log when suspiciously few coins — helps catch auto-combine
+        print(f"🔍 [Sage] get_coins({wtype}) raw: "
+              f"owned={len(_owned_raw)} coins, selectable={len(_sel_raw)} coins",
+              flush=True)
+        if _owned_raw and isinstance(_owned_raw[0], dict):
+            for i, c in enumerate(_owned_raw[:3]):
+                amt = c.get("amount", "?")
+                cid = (c.get("coin_id") or c.get("id") or c.get("coinId")
+                       or c.get("name") or "?")
+                print(f"   owned[{i}]: id={str(cid)[:20]}... amount={amt}",
+                      flush=True)
+
+    # Extract coin lists from both responses
+    def _extract_coins(result):
+        if not result or not isinstance(result, dict):
+            return []
+        found = result.get("coins") or result.get("records") or result.get("data") or []
+        if not found:
+            for k in result.keys():
+                v = result.get(k)
+                if isinstance(v, list) and len(v) > 0:
+                    found = v
+                    break
+        return found
+
+    owned_coins = _extract_coins(owned_result)
+    selectable_coins = _extract_coins(selectable_result)
+
+    # Build set of selectable coin IDs for priority ordering
+    selectable_ids = set()
+    for c in selectable_coins:
+        if isinstance(c, dict):
+            cid = (c.get("coin_id") or c.get("id") or c.get("coinId")
+                   or c.get("name") or "")
+            if cid:
+                selectable_ids.add(cid.lower().replace("0x", ""))
+
+    # Merge: selectable coins first, then owned-only coins.
+    # NOTE: owned-only does not prove spendability. This compatibility
+    # path exists because some Sage builds have reported fewer selectable
+    # coins than expected in practice, but the difference may also reflect
+    # offer locks or other non-selectable states.
+    coins = list(selectable_coins)  # start with known-free
+    hidden_count = 0
+    for c in owned_coins:
+        if not isinstance(c, dict):
+            continue
+        cid = (c.get("coin_id") or c.get("id") or c.get("coinId")
+               or c.get("name") or "")
+        if cid and cid.lower().replace("0x", "") not in selectable_ids:
+            coins.append(c)
+            hidden_count += 1
+
+    if hidden_count > 0:
+        wtype = "CAT" if asset_id else "XCH"
+        # Only log when the hidden count changes — prevents 200+ duplicate messages
+        _cache_key = f"_hidden_{wtype}"
+        _prev = getattr(get_spendable_coins_with_owned_fallback, _cache_key, -1)
+        if hidden_count != _prev:
+            setattr(get_spendable_coins_with_owned_fallback, _cache_key, hidden_count)
+            print(f"🔧 [Sage workaround] {hidden_count} {wtype} owned-only coins "
+                  f"were added back from the owned set "
+                  f"(total: {len(coins)}, selectable: {len(selectable_coins)}, "
+                  f"owned: {len(owned_coins)})", flush=True)
+
+    if not coins and owned_result and isinstance(owned_result, dict):
+        result_keys = [k for k in owned_result.keys() if k not in ('success', 'error')]
+        if result_keys:
+            print(f"⚠️  [Sage] get_coins response keys: {result_keys} "
+                  f"(none matched coins/records/data)", flush=True)
+
+    if WALLET_DEBUG and coins:
+        print(f"   🔍 [Sage] First coin keys: {list(coins[0].keys()) if isinstance(coins[0], dict) else 'not a dict'}")
+
+    # Convert Sage coin format to Chia-compatible records.
+    # Defensive: try multiple possible field names since Sage RPC
+    # format may vary between versions.
+    records = []
+    for coin in coins:
+        if not isinstance(coin, dict):
+            continue
+
+        # Amount — try multiple field names, handle string or int
+        raw_amount = (coin.get("amount") or coin.get("amt")
+                      or coin.get("value") or "0")
+        amount = int(raw_amount)
+
+        # Apply filters
+        if min_amount_mojos > 0 and amount < min_amount_mojos:
+            continue
+        if max_amount_mojos is not None and amount > max_amount_mojos:
+            continue
+
+        # Parent coin info — try multiple field names
+        parent = (coin.get("parent_coin_info") or coin.get("parent_coin")
+                  or coin.get("parentCoin") or coin.get("parent") or "")
+
+        # Puzzle hash — try multiple field names
+        puzzle = (coin.get("puzzle_hash") or coin.get("puzzleHash")
+                  or coin.get("puzzle") or "")
+
+        # Coin ID — try multiple field names
+        coin_id = (coin.get("coin_id") or coin.get("id")
+                   or coin.get("coinId") or coin.get("name") or "")
+
+        records.append({
+            "coin": {
+                "parent_coin_info": parent,
+                "puzzle_hash": puzzle,
+                "amount": amount,
+            },
+            "spent_block_index": 0,  # Sage only returns spendable coins
+            "coin_id": coin_id,
+        })
+
+    return {
+        "success": True,
+        "records": records,
+        "confirmed_records": records,  # Alias used by some callers
+    }
+
+
+def count_suitable_coins(wallet_id: int, target_amount_mojos: int,
+                         tolerance: float = 0.25, is_cat: bool = False,
+                         decimals: int = 3) -> int:
+    """Count how many coins are suitable for a specific offer size."""
+    min_mojos = int(target_amount_mojos * (1 - tolerance))
+    max_mojos = int(target_amount_mojos * (1 + tolerance))
+
+    result = get_spendable_coins(wallet_id, min_mojos, max_mojos)
+
+    if not result or not result.get("success"):
+        return 0
+
+    records = result.get("records", [])
+    return len(records)
+
+
+def get_selectable_coins_only(wallet_id: int) -> Optional[Dict]:
+    """Get ONLY selectable (on-chain confirmed) coins — NO workaround.
+
+    This bypasses the Sage selectable bug workaround that merges owned+selectable.
+    Use this when you need to know what's actually confirmed on the blockchain,
+    e.g., during coin prep confirmation polling where we must NOT proceed
+    until coins are truly on-chain.
+
+    Returns same format as get_spendable_coins() for compatibility.
+    """
+    if _is_cat_wallet(wallet_id):
+        asset_id = _resolve_asset_id(wallet_id)
+        if not asset_id:
+            return None
+    else:
+        asset_id = None
+
+    result = rpc("get_coins", {
+        "asset_id": asset_id,
+        "offset": 0,
+        "limit": 500,
+        "sort_mode": "amount",
+        "filter_mode": "selectable",
+        "ascending": False,
+    }, timeout=15)
+
+    if not result or not isinstance(result, dict):
+        return None
+
+    # Extract coins from response
+    found = result.get("coins") or result.get("records") or result.get("data") or []
+    if not found:
+        for k in result.keys():
+            v = result.get(k)
+            if isinstance(v, list) and len(v) > 0:
+                found = v
+                break
+
+    # Convert to Chia-compatible format
+    records = []
+    for coin in found:
+        if not isinstance(coin, dict):
+            continue
+        raw_amount = (coin.get("amount") or coin.get("amt")
+                      or coin.get("value") or "0")
+        amount = int(raw_amount)
+        parent = (coin.get("parent_coin_info") or coin.get("parent_coin")
+                  or coin.get("parentCoin") or coin.get("parent") or "")
+        puzzle = (coin.get("puzzle_hash") or coin.get("puzzleHash")
+                  or coin.get("puzzle") or "")
+        coin_id = (coin.get("coin_id") or coin.get("id")
+                   or coin.get("coinId") or coin.get("name") or "")
+        records.append({
+            "coin": {
+                "parent_coin_info": parent,
+                "puzzle_hash": puzzle,
+                "amount": amount,
+            },
+            "spent_block_index": 0,
+            "coin_id": coin_id,
+        })
+
+    return {
+        "success": True,
+        "records": records,
+        "confirmed_records": records,
+    }
+
+
+def get_spendable_coin_count(wallet_id: int) -> int:
+    """Get the count of truly spendable coins using Sage's native endpoint.
+
+    This calls Sage's get_spendable_coin_count endpoint which returns ONLY
+    coins that are confirmed on-chain and not locked by offers or pending
+    transactions. It should match the strict selectable view returned by
+    get_spendable_coins() / get_selectable_coins_only().
+
+    Use this during coin prep confirmation polling to know when coins
+    are actually on-chain.
+
+    Sage API: get_spendable_coin_count { asset_id: Option<String> }
+    Returns: { count: u32 }
+    """
+    if _is_cat_wallet(wallet_id):
+        asset_id = _resolve_asset_id(wallet_id)
+        if not asset_id:
+            return 0
+    else:
+        asset_id = None  # XCH = null asset_id
+
+    result = rpc("get_spendable_coin_count", {
+        "asset_id": asset_id,
+    }, timeout=10)
+
+    if result and isinstance(result, dict):
+        count = result.get("count", 0)
+        if isinstance(count, int):
+            return count
+        # Try parsing from string
+        try:
+            return int(count)
+        except (ValueError, TypeError):
+            pass
+    return 0
+
+
+def get_pending_transactions() -> list:
+    """Get all pending (unconfirmed) transactions from Sage.
+
+    Returns a list of PendingTransactionRecord dicts, each with:
+      - transaction_id: str
+      - fee: str (amount in mojos)
+      - submitted_at: int or None (epoch seconds)
+
+    When this returns an empty list, all transactions are confirmed.
+    Use this to wait for a send/split to actually hit the blockchain
+    before proceeding to the next operation.
+
+    Sage API: get_pending_transactions {}
+    Returns: { pending_transactions: [...] }
+    """
+    result = rpc("get_pending_transactions", {}, timeout=10)
+
+    if result and isinstance(result, dict):
+        # Try multiple possible response keys
+        pending = (result.get("pending_transactions")
+                   or result.get("transactions")
+                   or result.get("data")
+                   or [])
+        if isinstance(pending, list):
+            return pending
+    return []
+
+
+def _are_coins_spendable_rpc(coin_ids: list) -> Optional[bool]:
+    """Call Sage's exact spendability endpoint for a set of coin ids."""
+    if not coin_ids:
+        return True
+
+    normalized = []
+    for cid in coin_ids:
+        if isinstance(cid, str):
+            clean = cid.lower()
+            if clean.startswith("0x"):
+                clean = clean[2:]
+            normalized.append(clean)
+
+    result = rpc("get_are_coins_spendable", {
+        "coin_ids": normalized,
+    }, timeout=10)
+
+    if result is None:
+        return None
+
+    return result.get("spendable", False) is True
+
+
+def get_spendable_coins_rpc(wallet_id: int) -> Optional[Dict]:
+    """Get the strict selectable-only spendable coins for a wallet."""
+    return get_spendable_coins(wallet_id, min_amount_mojos=0)
+
+
+def split_coins_rpc(wallet_id: int, target_coin_id: str, num_coins: int,
+                    amount_per_coin: int, fee_mojos: int = 0,
+                    is_cat: bool = False) -> Optional[Dict]:
+    """Split a coin into multiple smaller coins using Sage's native /split endpoint.
+
+    IMPORTANT: Sage uses a single generic /split endpoint (not split_xch/split_cat).
+    It works for both XCH and CAT coins — Sage determines the type from the coin IDs.
+
+    Source: sage-api/src/requests/transactions.rs (struct Split)
+    Parameters:
+      - coin_ids: Vec<String>   — which coin(s) to split
+      - output_count: u32       — how many output coins to create
+      - fee: Amount (string)    — transaction fee in mojos
+      - auto_submit: bool       — whether to submit immediately (default false)
+    """
+    if not _require_signing_capability():
+        return None
+
+    # Sage expects coin_ids as an array, strip 0x prefix
+    bare_coin_id = target_coin_id.replace("0x", "") if target_coin_id else ""
+    coin_ids = [bare_coin_id]
+
+    payload = {
+        "coin_ids": coin_ids,
+        "output_count": num_coins,
+        "fee": str(int(fee_mojos)),
+        "auto_submit": True,
+    }
+
+    print(f"   [Sage] Splitting coin {bare_coin_id[:16]}... into {num_coins} outputs via /split")
+    result = rpc("split", payload, timeout=60)
+    if WALLET_DEBUG:
+        print(f"  [Sage] split result: {result}")
+    return result
+
+
+def combine_coins(coin_ids: list, fee_mojos: int = 0) -> Optional[Dict]:
+    """Combine multiple coins into one using Sage's native /combine endpoint.
+
+    IMPORTANT: Sage uses a single generic /combine endpoint (not combine_xch/combine_cat).
+    It works for both XCH and CAT coins — Sage determines the type from the coin IDs.
+
+    Source: sage-api/src/requests/transactions.rs (struct Combine)
+    Parameters:
+      - coin_ids: Vec<String>   — which coins to combine
+      - fee: Amount (string)    — transaction fee in mojos
+
+    Returns None if wallet is watch-only (no signing capability).
+      - auto_submit: bool       — whether to submit immediately (default false)
+    """
+    if not _require_signing_capability():
+        return None
+
+    # Strip 0x prefixes
+    bare_ids = [cid.replace("0x", "") for cid in coin_ids]
+
+    payload = {
+        "coin_ids": bare_ids,
+        "fee": str(int(fee_mojos)),
+        "auto_submit": True,
+    }
+
+    print(f"   [Sage] Combining {len(bare_ids)} coins via /combine")
+    result = rpc("combine", payload, timeout=120)
+    if WALLET_DEBUG:
+        print(f"  [Sage] combine result: {result}")
+    return result
+
+
+def get_transaction(transaction_id: str, timeout: int = 10) -> Optional[Dict]:
+    """Get transaction status by ID.
+
+    Sage may not support get_transaction directly. Returns None
+    to signal that coin-count polling should be used as fallback.
+    """
+    result = rpc("get_transaction", {
+        "transaction_id": transaction_id,
+    }, timeout=timeout)
+
+    if result and result.get("success"):
+        return result.get("transaction") or result.get("transaction_record") or result
+    return None
+
+
+def split_coins_bulk(wallet_id: int, num_coins: int, coin_size_mojos: int,
+                     fee_mojos: int = 0, reserve_multiplier: float = 2.0,
+                     is_cat: bool = False, cat_decimals: int = 3) -> Optional[Dict]:
+    """Split wallet balance using Sage's native split endpoints.
+
+    Strategy matches wallet_chia.py:
+    1. Find largest spendable coin
+    2. Use Sage's split_xch or split_cat
+    3. Remainder stays as reserve
+    """
+    print(f"💰 [Sage] Smart coin splitting for wallet {wallet_id}...")
+
+    # Get spendable coins
+    coins_result = get_spendable_coins_rpc(wallet_id)
+
+    if not coins_result or not coins_result.get("success"):
+        return {"success": False, "error": "Failed to get spendable coins"}
+
+    coin_records = coins_result.get("confirmed_records", [])
+
+    if not coin_records:
+        return {"success": False, "error": "No spendable coins found"}
+
+    # Filter to unspent only
+    unspent_records = [r for r in coin_records if r.get("spent_block_index", 0) == 0]
+
+    if not unspent_records:
+        return {"success": False, "error": "All coins pending spend"}
+
+    print(f"   📊 Found {len(unspent_records)} unspent coins")
+
+    # Find largest coin
+    largest_coin = max(unspent_records, key=lambda c: c["coin"]["amount"])
+    coin_amount = largest_coin["coin"]["amount"]
+
+    # Get coin ID — Sage stores it directly in the record
+    coin_id = largest_coin.get("coin_id", "")
+
+    # If no coin_id in record, calculate it (same as Chia method)
+    if not coin_id:
+        parent = largest_coin["coin"]["parent_coin_info"]
+        puzzle = largest_coin["coin"]["puzzle_hash"]
+        amount = largest_coin["coin"]["amount"]
+
+        if not parent.startswith("0x"):
+            parent = "0x" + parent
+        if not puzzle.startswith("0x"):
+            puzzle = "0x" + puzzle
+
+        parent_bytes = bytes.fromhex(parent.replace("0x", ""))
+        puzzle_bytes = bytes.fromhex(puzzle.replace("0x", ""))
+        amount_bytes = amount.to_bytes(8, 'big')
+        coin_id = "0x" + hashlib.sha256(parent_bytes + puzzle_bytes + amount_bytes).hexdigest()
+
+    if is_cat:
+        token_amount = coin_size_mojos
+        coin_scale = 10 ** cat_decimals
+        coin_amount_tokens = coin_amount / coin_scale
+        needed = num_coins * token_amount
+
+        print(f"   📊 Largest CAT coin: {coin_amount_tokens:.2f} tokens")
+        print(f"   🎯 Target: {num_coins} coins × {token_amount:.2f} tokens")
+
+        if coin_amount_tokens < needed:
+            return {
+                "success": False,
+                "error": f"Insufficient balance: have {coin_amount_tokens:.2f}, need {needed:.2f}"
+            }
+    else:
+        coin_amount_xch = coin_amount / 1e12
+        total_needed_mojos = num_coins * coin_size_mojos
+        total_needed_xch = total_needed_mojos / 1e12
+
+        print(f"   📊 Largest XCH coin: {coin_amount_xch:.4f} XCH ({coin_amount} mojos)")
+        print(f"   🎯 Target: {num_coins} coins × {coin_size_mojos / 1e12:.4f} XCH")
+
+        if coin_amount < total_needed_mojos:
+            return {
+                "success": False,
+                "error": f"Insufficient balance: have {coin_amount_xch:.4f} XCH, need {total_needed_xch:.4f} XCH"
+            }
+
+    print(f"   🎲 [Sage] Splitting coin {coin_id[:18]}...")
+
+    result = split_coins_rpc(
+        wallet_id=wallet_id,
+        target_coin_id=coin_id,
+        num_coins=num_coins,
+        amount_per_coin=int(coin_size_mojos) if not is_cat else int(coin_size_mojos * (10 ** cat_decimals)),
+        fee_mojos=fee_mojos,
+        is_cat=is_cat
+    )
+
+    if result and result.get("success"):
+        print(f"   ✅ [Sage] Split transaction submitted!")
+        return {
+            "success": True,
+            "coins_created": num_coins,
+            "transaction_id": result.get("transaction_id"),
+        }
+    else:
+        error = result.get("error", "Unknown error") if result else "RPC call failed"
+        print(f"   ❌ [Sage] split failed: {error}")
+        return {"success": False, "error": error}
+
+
+def wait_for_coin_confirmations(wallet_id: int, target_coin_size_mojos: int,
+                                 target_count: int, tolerance: float = 0.25,
+                                 max_wait_seconds: int = 300,
+                                 poll_interval: int = 10,
+                                 progress_callback=None) -> bool:
+    """Wait for coins to confirm after splitting."""
+    start_time = time.time()
+
+    while (time.time() - start_time) < max_wait_seconds:
+        confirmed = count_suitable_coins(wallet_id, target_coin_size_mojos, tolerance)
+
+        if progress_callback:
+            progress_callback(confirmed, target_count)
+
+        if confirmed >= target_count:
+            return True
+
+        time.sleep(poll_interval)
+
+    return False
+
+
+# ============================================================================
+# BALANCE & ADDRESS
+# ============================================================================
+
+def get_wallet_balance(wallet_id: int):
+    """Get wallet balance — translated for Sage.
+
+    Sage doesn't have a direct get_wallet_balance endpoint.
+    We use get_sync_status for XCH (has balance + selectable_balance),
+    and get_coins for CATs (two calls: one for all coins, one for selectable).
+
+    Returns confirmed_wallet_balance = total (including locked in offers),
+    spendable_balance = only free/selectable coins.
+    """
+    if _is_cat_wallet(wallet_id):
+        asset_id = _resolve_asset_id(wallet_id)
+        if not asset_id:
+            return None
+
+        # CAT balance: "selectable" = spendable, "owned" = total (free + locked)
+        # Valid Sage filter_mode values: all, selectable, owned, spent, clawback
+        # "all" includes spent coins and hits 500-limit. "owned" = currently held only.
+        sel_result = rpc("get_coins", {
+            "asset_id": asset_id,
+            "offset": 0, "limit": 500,
+            "filter_mode": "selectable",
+        }, timeout=10)
+        sel_coins = (sel_result.get("coins") or sel_result.get("records")
+                     or sel_result.get("data") or []) if sel_result else []
+        spendable = sum(int(c.get("amount", "0")) for c in sel_coins)
+
+        owned_result = rpc("get_coins", {
+            "asset_id": asset_id,
+            "offset": 0, "limit": 500,
+            "filter_mode": "owned",
+        }, timeout=10)
+        owned_coins = (owned_result.get("coins") or owned_result.get("records")
+                       or owned_result.get("data") or []) if owned_result else []
+        total = sum(int(c.get("amount", "0")) for c in owned_coins)
+
+        if not hasattr(get_wallet_balance, '_cat_diag_logged'):
+            get_wallet_balance._cat_diag_logged = True
+            print(f"  [Sage] CAT balance for {asset_id[:12]}...: "
+                  f"selectable={spendable} ({len(sel_coins)} coins), "
+                  f"owned={total} ({len(owned_coins)} coins)", flush=True)
+
+        if total < spendable:
+            total = spendable
+
+        return {
+            "success": True,
+            "wallet_balance": {
+                "confirmed_wallet_balance": total,
+                "spendable_balance": spendable,
+                "unconfirmed_wallet_balance": total,
+                "pending_coin_removal_count": 0,
+                "wallet_id": wallet_id,
+            }
+        }
+    else:
+        # XCH balance: Sage's get_sync_status only has selectable_balance (no total).
+        # Valid Sage filter_mode values: all, selectable, owned, spent, clawback
+        # "owned" = currently held coins (free + offer-locked, not spent)
+        # "selectable" = spendable only (free, not locked in offers)
+        # Total = owned sum, Spendable = selectable sum (or selectable_balance from sync)
+
+        # Step 1: get selectable (spendable) from get_sync_status (fastest)
+        spendable = 0
+        sync = rpc("get_sync_status", {}, timeout=5)
+        if sync:
+            sel_val = sync.get("selectable_balance")
+            if sel_val is not None:
+                spendable = int(sel_val)
+
+        # Step 2: get ALL owned XCH coins (free + offer-locked) for total
+        owned_result = rpc("get_coins", {
+            "asset_id": None,
+            "offset": 0, "limit": 500,
+            "filter_mode": "owned",
+        }, timeout=10)
+        owned_coins = (owned_result.get("coins") or owned_result.get("records")
+                       or owned_result.get("data") or []) if owned_result else []
+        total = sum(int(c.get("amount", "0")) for c in owned_coins)
+
+        if not hasattr(get_wallet_balance, '_xch_diag_logged'):
+            get_wallet_balance._xch_diag_logged = True
+            print(f"  [Sage] XCH balance: selectable_balance={spendable/1e12:.4f}, "
+                  f"owned={total/1e12:.4f} ({len(owned_coins)} coins), "
+                  f"locked_est={(total - spendable)/1e12:.4f}", flush=True)
+
+        # V5 FIX: Removed the "inflated" warning that fired 1,776+ times.
+        # With filter_mode="owned", total CORRECTLY includes offer-locked coins.
+        # When you have 100 offers, owned (84.7) >> spendable (1.2) is normal.
+        # The old check replaced total with spendable, losing locked coin data.
+        # Now we keep total as-is (it's the true confirmed_wallet_balance).
+        # Only log a one-time diagnostic if the ratio is extreme.
+        if total > spendable * 50 and spendable > 0:
+            if not hasattr(get_wallet_balance, '_xch_inflated_warned'):
+                get_wallet_balance._xch_inflated_warned = True
+                print(f"  [Sage] XCH owned/spendable ratio high: "
+                      f"owned={total/1e12:.1f}, spendable={spendable/1e12:.1f} "
+                      f"(normal when most coins are locked by offers)", flush=True)
+
+        # Ensure total >= spendable
+        if total < spendable:
+            total = spendable
+
+        if total == 0 and spendable == 0:
+            return None
+
+        return {
+            "success": True,
+            "wallet_balance": {
+                "confirmed_wallet_balance": total,
+                "spendable_balance": spendable,
+                "unconfirmed_wallet_balance": total,
+                "pending_coin_removal_count": 0,
+                "wallet_id": wallet_id,
+            }
+        }
+
+
+def get_balances_parallel(wallet_ids: list = None):
+    """Fetch multiple wallet balances in parallel."""
+    if wallet_ids is None:
+        wallet_ids = [WALLET_ID_XCH]
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=len(wallet_ids)) as executor:
+        future_to_id = {
+            executor.submit(get_wallet_balance, wid): wid
+            for wid in wallet_ids
+        }
+        for future in as_completed(future_to_id):
+            wallet_id = future_to_id[future]
+            try:
+                results[wallet_id] = future.result()
+            except Exception as e:
+                print(f"❌ [Sage] Failed to get balance for wallet {wallet_id}: {e}")
+                results[wallet_id] = None
+    return results
+
+
+def _resolve_asset_id(wallet_id: int) -> Optional[str]:
+    """Resolve a wallet_id to a CAT asset_id using the discovery mapping.
+
+    Falls back to the configured CAT_ASSET_ID from .env if the mapping
+    hasn't been populated yet (get_wallets() not called).
+    """
+    global _wallet_id_to_asset_id
+    if wallet_id in _wallet_id_to_asset_id:
+        resolved = _wallet_id_to_asset_id[wallet_id]
+        # Cross-check: warn if resolved asset doesn't match configured
+        configured = _get_cat_asset_id()
+        if configured:
+            r_norm = (resolved or "").lower().replace("0x", "")
+            c_norm = configured.lower().replace("0x", "")
+            if r_norm != c_norm:
+                if not hasattr(_resolve_asset_id, f'_mismatch_warned_{wallet_id}'):
+                    setattr(_resolve_asset_id, f'_mismatch_warned_{wallet_id}', True)
+                    print(f"⚠️  [Sage] _resolve_asset_id({wallet_id}): "
+                          f"mapped={resolved[:16]}... vs configured={configured[:16]}... "
+                          f"— MISMATCH! Full mapping: {_wallet_id_to_asset_id}",
+                          flush=True)
+        return resolved
+    # Fallback: use configured asset_id (single-CAT mode)
+    return _get_cat_asset_id()
+
+
+def get_wallets():
+    """Discover ALL CAT tokens in the Sage wallet via get_cats RPC.
+
+    Sage's get_cats endpoint returns every CAT the wallet holds, with
+    asset_id, name, ticker, balance, etc. We convert these into
+    synthetic Chia-format wallet entries and populate the
+    _wallet_id_to_asset_id mapping so other functions (get_wallet_balance,
+    get_spendable_coins, etc.) can work with any CAT.
+
+    Synthetic wallet_id assignment:
+      - XCH is always WALLET_ID_XCH (typically 1)
+      - The configured CAT (from .env) gets CAT_WALLET_ID (typically 5)
+      - Other discovered CATs get IDs starting from 100, incrementing
+    """
+    global _wallet_id_to_asset_id
+
+    wallets = [
+        {"id": WALLET_ID_XCH, "name": "Chia Wallet", "type": 0},
+    ]
+
+    # Try Sage's get_cats RPC to discover all CATs in the wallet
+    try:
+        result = rpc("get_cats", {}, timeout=10)
+    except Exception as e:
+        print(f"⚠️  [Sage] get_cats RPC failed: {e} — falling back to .env config")
+        result = None
+
+    if result and isinstance(result, dict):
+        cats_list = result.get("cats") or result.get("data") or []
+
+        if cats_list:
+            configured_asset_id = _get_cat_asset_id()
+
+            # ── DYNAMIC WALLET_ID ASSIGNMENT ─────────────────────────
+            # Sage doesn't have wallet IDs — we assign them dynamically
+            # based on the configured CAT_ASSET_ID, NOT from .env.
+            #
+            # The configured CAT (matching CAT_ASSET_ID) ALWAYS gets
+            # CONFIGURED_CAT_WID (2). All other CATs get IDs starting
+            # at 1000+. This eliminates collision bugs entirely.
+            #
+            # We then update cfg.CAT_WALLET_ID to match, so all modules
+            # use the correct ID regardless of what .env says.
+            # ─────────────────────────────────────────────────────────
+            CONFIGURED_CAT_WID = 2   # Fixed ID for the active trading CAT
+            next_synthetic_id = 1000  # Other CATs — far away, no collision risk
+
+            new_mapping = {}
+
+            # Normalize configured asset_id for comparison
+            # Sage may return asset_ids with/without 0x prefix and varying case
+            configured_normalized = (configured_asset_id or "").lower().replace("0x", "").strip()
+            found_configured = False
+
+            for cat in cats_list:
+                asset_id = cat.get("asset_id", "")
+                if not asset_id:
+                    continue
+
+                name = cat.get("name") or cat.get("ticker") or f"CAT-{asset_id[:8]}"
+                ticker = cat.get("ticker") or ""
+
+                # Match by asset_id — the ONLY reliable identifier for Sage
+                cat_normalized = asset_id.lower().replace("0x", "").strip()
+                if configured_normalized and cat_normalized == configured_normalized:
+                    wid = CONFIGURED_CAT_WID
+                    found_configured = True
+                else:
+                    wid = next_synthetic_id
+                    next_synthetic_id += 1
+
+                new_mapping[wid] = asset_id
+
+                display_name = f"{name} ({ticker})" if ticker else f"{name} (CAT)"
+                wallets.append({
+                    "id": wid,
+                    "name": display_name,
+                    "type": 6,
+                    "data": asset_id,
+                })
+
+            # Update the global mapping
+            _wallet_id_to_asset_id = new_mapping
+
+            # ── CRITICAL: Update cfg.CAT_WALLET_ID dynamically ──────
+            # This ensures ALL modules use the correct wallet_id for
+            # the configured CAT, regardless of what .env says.
+            # This is the proper fix: asset_id drives wallet_id, not
+            # a static number in .env that can go stale or collide.
+            try:
+                from config import cfg as _cfg_instance
+                if _cfg_instance and found_configured:
+                    old_wid = getattr(_cfg_instance, 'CAT_WALLET_ID', '?')
+                    _cfg_instance.CAT_WALLET_ID = CONFIGURED_CAT_WID
+                    if old_wid != CONFIGURED_CAT_WID:
+                        print(f"  [Sage] CAT_WALLET_ID updated: {old_wid} → "
+                              f"{CONFIGURED_CAT_WID} (dynamic from asset_id match)",
+                              flush=True)
+            except Exception as e:
+                print(f"  [Sage] Could not update cfg.CAT_WALLET_ID: {e}",
+                      flush=True)
+
+            if not hasattr(get_wallets, '_discovery_logged'):
+                get_wallets._discovery_logged = True
+                print(f"  [Sage] Discovered {len(cats_list)} CAT(s) via get_cats RPC: "
+                      f"{[c.get('ticker') or c.get('name') or c.get('asset_id', '')[:8] for c in cats_list]}",
+                      flush=True)
+                # Log the full mapping for debugging wallet_id → asset_id issues
+                for wid, aid in new_mapping.items():
+                    tag = "✅ TRADING" if wid == CONFIGURED_CAT_WID else "   other"
+                    print(f"  [Sage]   wallet_id {wid} → {aid[:20]}... ({tag})",
+                          flush=True)
+                if not found_configured and configured_asset_id:
+                    print(f"  🚫 [Sage] CONFIGURED CAT NOT FOUND in wallet! "
+                          f"Configured asset: {str(configured_asset_id)[:20]}... "
+                          f"Sage has: {[c.get('asset_id','')[:20] for c in cats_list]}",
+                          flush=True)
+
+            return {"success": True, "wallets": wallets}
+
+    # Fallback: get_cats didn't work — use single CAT from .env config
+    asset_id = _get_cat_asset_id()
+    cat_wallet_id = 2  # Same fixed ID as dynamic path
+    cat_name = os.getenv("CAT_NAME", "MZ")
+
+    if asset_id:
+        _wallet_id_to_asset_id = {cat_wallet_id: asset_id}
+        wallets.append({
+            "id": cat_wallet_id,
+            "name": f"{cat_name} (CAT)",
+            "type": 6,
+            "data": asset_id,
+        })
+
+    return {"success": True, "wallets": wallets}
+
+
+def get_next_address(wallet_id: int = None, new_address: bool = True):
+    """Get next receive address from Sage."""
+    if wallet_id is None:
+        wallet_id = WALLET_ID_XCH
+    # Sage doesn't have a dedicated get_address endpoint.
+    # The receive_address comes from get_sync_status.
+    result = rpc("get_sync_status", {}, timeout=5)
+    if result and isinstance(result, dict):
+        address = result.get("receive_address", "")
+        if address:
+            return {"success": True, "address": address}
+    return None
+
+
+def _get_active_address_prefix() -> Optional[str]:
+    """Infer the active network prefix from the wallet's current receive address."""
+    try:
+        addr_result = get_next_address(new_address=False)
+        if addr_result and addr_result.get("success"):
+            address = str(addr_result.get("address", "")).strip()
+            if address.startswith("txch1"):
+                return "txch1"
+            if address.startswith("xch1"):
+                return "xch1"
+    except Exception:
+        pass
+    return None
+
+
+def _validate_address_for_active_network(address: str, *, context: str) -> Optional[str]:
+    """Validate address shape and, where possible, ensure it matches the active network."""
+    if not address or not isinstance(address, str):
+        print(f"  [Sage] {context}: invalid address (empty or not string)")
+        return None
+
+    address = address.strip()
+    if not address.startswith("xch1") and not address.startswith("txch1"):
+        print(f"  [Sage] {context}: address must start with xch1 or txch1, got: {address[:10]}...")
+        return None
+    if len(address) < 60:
+        print(f"  [Sage] {context}: address too short ({len(address)} chars)")
+        return None
+
+    expected_prefix = _get_active_address_prefix()
+    if expected_prefix and not address.startswith(expected_prefix):
+        print(f"  [Sage] {context}: address prefix does not match active wallet network "
+              f"({expected_prefix}), got {address[:4]}...", flush=True)
+        return None
+
+    return address
+
+
+def set_change_address(change_address: str, fingerprint: int = None) -> dict:
+    """Set Sage's persistent change address for the active fingerprint."""
+    address = _validate_address_for_active_network(
+        change_address, context="set_change_address"
+    )
+    if not address:
+        return {"success": False, "error": "invalid_change_address"}
+
+    try:
+        if fingerprint is None:
+            key = get_current_key()
+            if not key or not key.get("fingerprint"):
+                return {"success": False, "error": "no_active_fingerprint"}
+            fingerprint = int(key["fingerprint"])
+        else:
+            fingerprint = int(fingerprint)
+
+        result = rpc("set_change_address", {
+            "fingerprint": fingerprint,
+            "change_address": address,
+        }, timeout=10)
+        if result is None:
+            return {"success": False, "error": "rpc_failed"}
+
+        return {"success": True, "fingerprint": fingerprint, "address": address}
+    except Exception as e:
+        print(f"  [Sage] set_change_address error: {e}", flush=True)
+        return {"success": False, "error": str(e)}
+
+
+def send_transaction(wallet_id: int, amount_mojos: int, address: str, fee_mojos: int = 0,
+                     source_coin_ids: list = None):
+    """Send XCH or CAT transaction via Sage.
+
+    Args:
+        wallet_id: Wallet ID (1 = XCH, others = CAT)
+        amount_mojos: Amount to send in mojos
+        address: Destination address
+        fee_mojos: Transaction fee in mojos
+        source_coin_ids: Optional list of specific coin IDs to spend from.
+            CRITICAL for sequential sends — prevents Sage from consuming
+            previously-created coins that we need to keep (e.g. tier pool coins).
+            Coin IDs should be bare hex (no 0x prefix).
+    """
+    if not _require_signing_capability():
+        return None
+
+    address = _validate_address_for_active_network(address, context="send_transaction")
+    if not address:
+        return None
+
+    if _is_cat_wallet(wallet_id):
+        asset_id = _resolve_asset_id(wallet_id)
+        payload = {
+            "asset_id": asset_id,
+            "address": str(address),
+            "amount": str(int(amount_mojos)),
+            "fee": str(int(fee_mojos)),
+            "auto_submit": True,  # CRITICAL: without this, Sage plans but never sends
+        }
+        if source_coin_ids:
+            # Strip 0x prefix and pass specific coins to spend
+            payload["coin_ids"] = [cid.replace("0x", "") for cid in source_coin_ids]
+        return rpc("send_cat", payload, timeout=30)
+    else:
+        payload = {
+            "address": str(address),
+            "amount": str(int(amount_mojos)),
+            "fee": str(int(fee_mojos)),
+            "auto_submit": True,  # CRITICAL: without this, Sage plans but never sends
+        }
+        if source_coin_ids:
+            payload["coin_ids"] = [cid.replace("0x", "") for cid in source_coin_ids]
+        return rpc("send_xch", payload, timeout=30)
+
+
+def send_transaction_multi(payments: list, fee_mojos: int = 0):
+    """Send multiple payments — Sage uses multi_send."""
+    if not _require_signing_capability():
+        return None
+    # Convert payments to Sage's bulk format
+    sage_payments = []
+    for p in payments:
+        address = _validate_address_for_active_network(
+            p.get("address", p.get("puzzle_hash", "")),
+            context="send_transaction_multi"
+        )
+        if not address:
+            return None
+        sage_payments.append({
+            "address": address,
+            "amount": str(p.get("amount", 0)),
+        })
+
+    payload = {
+        "payments": sage_payments,
+        "fee": str(int(fee_mojos)),
+        "auto_submit": True,  # CRITICAL: without this, Sage plans but never sends
+    }
+    return rpc("multi_send", payload, timeout=30)
+
+
+def send_cat_multi(payments: list, fee_mojos: int = 0):
+    """Send CAT to multiple addresses in ONE transaction via Sage's multi_send.
+
+    Uses the SAME multi_send endpoint as XCH, but with asset_id added to each
+    payment item. Confirmed working via test_bulk_cat.py (Test 3).
+    Creates all output coins atomically — no sequential coin consumption risk.
+
+    Args:
+        payments: List of {"address": "xch1...", "amount": <mojos_int>}
+        fee_mojos: Transaction fee in mojos
+    """
+    if not _require_signing_capability():
+        return None
+
+    asset_id = _get_cat_asset_id()
+    if not asset_id:
+        print("  [Sage] CAT_ASSET_ID not configured — cannot multi send CAT")
+        return None
+
+    sage_payments = []
+    for p in payments:
+        address = _validate_address_for_active_network(
+            p.get("address", p.get("puzzle_hash", "")),
+            context="send_cat_multi"
+        )
+        if not address:
+            return None
+        sage_payments.append({
+            "address": address,
+            "amount": str(p.get("amount", 0)),
+            "asset_id": asset_id,  # Per-payment asset_id makes multi_send work for CATs
+        })
+
+    payload = {
+        "payments": sage_payments,
+        "fee": str(int(fee_mojos)),
+        "auto_submit": True,  # CRITICAL: without this, Sage plans but never sends
+    }
+    return rpc("multi_send", payload, timeout=30)
+
+
+# ============================================================================
+# OFFER MANAGEMENT
+# ============================================================================
+
+def create_offer(offer_dict: dict, validate_only: bool = True, max_time: int = None,
+                  reuse_puzhash: bool = True,
+                  min_coin_amount: int = None, max_coin_amount: int = None,
+                  coin_ids: list = None, fee_mojos: int = 0):
+    """Create an offer via Sage's make_offer endpoint.
+
+    Sage's make_offer uses offered_assets / requested_assets arrays:
+      {
+        "offered_assets": [{"asset_id": null, "amount": "50000000000"}],
+        "requested_assets": [{"asset_id": "b8edcc...", "amount": "1000"}],
+        "fee": "0",
+        "expires_at_second": 1709500000,  (optional)
+        "auto_import": true
+      }
+
+    The offer_dict from our bot uses wallet_id keys with signed amounts:
+      {1: -50000000000, 5: 1000}  (negative = offering, positive = requesting)
+    We translate: wallet_id 1 → asset_id null (XCH), others → CAT asset_id.
+    """
+    # ── GUARDRAIL: watch-only wallets cannot create offers ──────
+    if not _require_signing_capability():
+        return {"success": False, "error": "Watch-only wallet cannot sign offers"}
+
+    # ── GUARDRAIL: validate_only is not supported by Sage ──────
+    # The parameter exists for Chia wallet compatibility but Sage's make_offer
+    # always creates and submits. Reject explicitly rather than silently ignoring.
+    if validate_only:
+        print(f"  [Sage] create_offer: validate_only=True is not supported by Sage adapter")
+        return {"success": False, "error": "validate_only not supported by Sage — offers are always submitted"}
+
+    offered_assets = []
+    requested_assets = []
+
+    # ── GUARDRAIL: request-only offers require a fee ──────
+    # Sage requires a fee for request-only offers (no offered assets).
+    # Block them early since we hardcode fee="0".
+    has_offered = any(int(v) < 0 for v in offer_dict.values())
+    if not has_offered:
+        print(f"  [Sage] create_offer: request-only offers require a fee (currently hardcoded to 0)")
+        return {"success": False, "error": "Request-only offers require a fee — not supported"}
+
+    # ── GUARDRAIL: Verify CAT asset_id matches configured token ──────
+    # Prevents creating offers in the wrong CAT if the wallet_id → asset_id
+    # mapping is stale or was incorrectly populated by get_wallets().
+    # This is a hard safety check — the bot must NEVER trade the wrong token.
+    configured_cat = _get_cat_asset_id()
+    configured_cat_normalized = (configured_cat or "").lower().replace("0x", "").strip()
+
+    for key, amount in offer_dict.items():
+        key_int = int(key)
+        amount_int = int(amount)
+
+        # Determine asset_id: null for XCH, resolved from mapping for CATs
+        if key_int == WALLET_ID_XCH:
+            asset_id = None  # XCH has no asset_id in Sage
+        else:
+            asset_id = _resolve_asset_id(key_int)
+            if not asset_id:
+                print(f"❌ [Sage] No asset_id for wallet {key_int} — cannot create offer")
+                return {"success": False, "error": f"No asset_id for wallet {key_int} — cannot create offer"}
+
+            # CRITICAL SAFETY CHECK: resolved asset_id MUST match configured CAT
+            resolved_normalized = asset_id.lower().replace("0x", "").strip()
+            if configured_cat_normalized and resolved_normalized != configured_cat_normalized:
+                print(f"🚫 [Sage] SAFETY BLOCK: wallet_id {key_int} resolved to "
+                      f"asset_id {asset_id[:16]}... but configured CAT is "
+                      f"{configured_cat[:16]}... — REFUSING to create offer "
+                      f"in wrong token!", flush=True)
+                return {"success": False, "error": f"SAFETY BLOCK: wallet {key_int} resolves to wrong token asset_id"}
+
+        if amount_int < 0:
+            # Negative = we are offering this asset
+            offered_assets.append({
+                "asset_id": asset_id,
+                "amount": str(abs(amount_int)),
+            })
+        elif amount_int > 0:
+            # Positive = we are requesting this asset
+            requested_assets.append({
+                "asset_id": asset_id,
+                "amount": str(amount_int),
+            })
+
+    payload = {
+        "offered_assets": offered_assets,
+        "requested_assets": requested_assets,
+        "fee": str(int(fee_mojos)) if fee_mojos else "0",
+        "auto_import": True,
+    }
+
+    # Only set expiry if max_time is a positive timestamp.
+    # CRITICAL: Sage interprets expires_at_second=0 as "expired at Unix epoch 0"
+    # (January 1 1970), NOT "no expiry". The Chia official wallet treats max_time=0
+    # as "no expiry", but Sage is literal. So we must omit the field entirely
+    # when the intent is "never expires".
+    if max_time is not None and int(max_time) > 0:
+        payload["expires_at_second"] = int(max_time)
+
+    # Pass specific coin IDs if provided (requires Sage PR #761 / coin_ids feature)
+    # IMPORTANT: Strip 0x prefix — Sage expects bare hex (like split/combine endpoints)
+    if coin_ids is not None and len(coin_ids) > 0:
+        bare_ids = [cid.replace("0x", "") for cid in coin_ids]
+        payload["coin_ids"] = bare_ids
+        if WALLET_DEBUG:
+            print(f"  [Sage] Using specific coin_ids: {bare_ids}")
+
+    if WALLET_DEBUG:
+        print(f"  [Sage] make_offer payload: offered={offered_assets}, requested={requested_assets}")
+
+    result = rpc("make_offer", payload, timeout=15)
+
+    if result and isinstance(result, dict):
+        # ALWAYS log response keys so we can debug format issues
+        # (This was the cause of the "offers created but not tracked" bug)
+        result_keys = list(result.keys())
+        print(f"  [Sage] make_offer response keys: {result_keys}", flush=True)
+
+        # Normalize response to match Chia format expected by offer_manager.
+        # Chia returns: {"success": true, "offer": "offer1...", "trade_record": {"trade_id": "..."}}
+        # Sage returns: varies by version — try multiple possible key names.
+        # We need to ensure both "trade_id" and "trade_record" exist for compatibility.
+
+        # --- Extract offer_id: try multiple possible key names ---
+        offer_id = (result.get("offer_id")
+                    or result.get("id")
+                    or result.get("trade_id")
+                    or result.get("offerId")
+                    or "")
+
+        # If still empty, check nested structures
+        if not offer_id:
+            # Check trade_record.trade_id (Chia format)
+            tr = result.get("trade_record")
+            if isinstance(tr, dict):
+                offer_id = tr.get("trade_id") or tr.get("offer_id") or ""
+            # Check offer object if it's a dict (some Sage versions nest it)
+            offer_obj = result.get("offer")
+            if isinstance(offer_obj, dict):
+                offer_id = offer_obj.get("id") or offer_obj.get("offer_id") or ""
+
+        if offer_id:
+            result["trade_id"] = offer_id
+            result["trade_record"] = result.get("trade_record", {})
+            if not isinstance(result["trade_record"], dict):
+                result["trade_record"] = {}
+            result["trade_record"]["trade_id"] = offer_id
+            print(f"  [Sage] ✅ trade_id extracted: {offer_id[:16]}...", flush=True)
+        else:
+            # CRITICAL: offer was created but we can't track it!
+            print(f"  ⚠️  [Sage] make_offer succeeded but NO offer_id found!", flush=True)
+            print(f"  ⚠️  [Sage] Response (first 500 chars): {str(result)[:500]}", flush=True)
+
+        # Ensure success flag is set
+        if "offer" in result and "success" not in result:
+            result["success"] = True
+
+        # Also set success if we have an offer_id (offer was clearly created)
+        if offer_id and "success" not in result:
+            result["success"] = True
+
+        return result
+
+    # Log if we got None/empty back
+    print(f"  ❌ [Sage] make_offer returned: {result}", flush=True)
+    if result is None:
+        return {"success": False, "error": "make_offer RPC returned None (network or Sage error)"}
+    return result
+
+
+def cancel_offer(trade_id: str, secure: bool = True, timeout: int = 60,
+                 fee_mojos: Optional[int] = None):
+    """Cancel an offer via Sage.
+
+    Sage's cancel_offer takes offer_id and optional fee.
+    The 'secure' flag maps to whether we pay a fee for on-chain cancel.
+
+    Returns dict with 'success' key, or error dict on failure.
+    """
+    if not _require_signing_capability():
+        return {"success": False, "error": "Watch-only wallet cannot cancel offers"}
+
+    resolved_fee = 0 if not secure else (
+        max(0, int(fee_mojos))
+        if fee_mojos is not None
+        else get_effective_transaction_fee_mojos()
+    )
+
+    payload = {
+        "offer_id": trade_id,  # Sage uses offer_id, not trade_id
+        "fee": str(int(resolved_fee)),  # REQUIRED — Sage 422s without fee field
+        "auto_submit": True,   # Submit the cancel transaction immediately
+    }
+
+    # Use _sage_post directly so we can see the actual HTTP status + body
+    # on failure (rpc() swallows the error details)
+    try:
+        result = _sage_post("cancel_offer", payload, timeout=timeout)
+
+        if WALLET_DEBUG:
+            print(f"   [Sage] cancel_offer {trade_id[:16]}... → {str(result)[:200]}")
+
+        if result is None:
+            return {"success": False, "error": f"Cancel RPC returned None for {trade_id[:16]}..."}
+
+        # Sage may not include 'success' key — add it if missing, but only
+        # when there are no failure indicators (error key or failed status)
+        if isinstance(result, dict) and "success" not in result:
+            if ("error" in result or "reason" in result
+                    or result.get("status") in ("failed", "error", "rejected")):
+                result["success"] = False
+            else:
+                result["success"] = True
+
+        return result
+
+    except ConnectionError as e:
+        err_str = str(e)
+        # Sage may return non-200 but still process the cancel.
+        # Log the actual status for debugging, but DON'T assume failure yet —
+        # the confirmation poll in cancel_offers_batch will verify.
+        print(f"   [Sage] cancel_offer {trade_id[:16]}... HTTP error: {err_str[:200]}")
+
+        # V5 FIX: Sage returns 404 "Missing offer" when the offer is already
+        # gone (cancelled, filled, or expired). This IS a successful cancel
+        # from our perspective — the offer no longer exists. Don't retry.
+        if "404" in err_str or "Missing offer" in err_str or "not found" in err_str.lower():
+            print(f"   [Sage] cancel_offer {trade_id[:16]}... → offer already gone (404), treating as success")
+            return {"success": True, "already_gone": True,
+                    "note": "Sage 404 — offer already gone"}
+
+        # HTTP 500/202 are NOT success — don't promote them.
+        # The retry mechanism in cancel_offers will handle re-attempts.
+        # Previously these were treated as success which masked real failures.
+        if "HTTP 500" in err_str or "HTTP 202" in err_str:
+            print(f"   [Sage] cancel_offer {trade_id[:16]}... got {err_str[:50]} — not treating as success")
+            return {"success": False, "uncertain": True,
+                    "error": f"Sage returned non-200: {err_str[:100]}"}
+
+        return {"success": False, "error": err_str[:200]}
+
+    except Exception as e:
+        err_str = str(e)
+        # V5 FIX: Also catch 404/Missing offer from non-ConnectionError exceptions
+        if "404" in err_str or "Missing offer" in err_str or "not found" in err_str.lower():
+            print(f"   [Sage] cancel_offer {trade_id[:16]}... → offer already gone (404), treating as success")
+            return {"success": True, "already_gone": True,
+                    "note": "Sage 404 — offer already gone"}
+        if not _quiet_mode:
+            print(f"   [Sage] cancel_offer {trade_id[:16]}... error: {e}")
+        return {"success": False, "error": err_str[:200]}
+
+
+def is_offer_time_expired(offer: dict) -> bool:
+    """Check if an offer has expired based on its max_time field.
+
+    This is pure logic — no RPC needed. Works the same for both
+    Chia and Sage since it operates on the offer dict.
+    """
+    # Check Chia-style valid_times
+    valid_times = offer.get("valid_times") or {}
+    max_time = valid_times.get("max_time", 0)
+
+    # Also check Sage-style top-level max_time
+    if not max_time:
+        max_time = offer.get("max_time", 0)
+
+    if max_time and max_time > 0:
+        return int(time.time()) > max_time
+    return False
+
+
+def get_offer_expiry_info(offer: dict) -> dict:
+    """Get expiry timing info for an offer.
+
+    Pure logic — same as Chia wallet version.
+    """
+    valid_times = offer.get("valid_times") or {}
+    max_time = valid_times.get("max_time", 0)
+
+    # Also check Sage-style
+    if not max_time:
+        max_time = offer.get("max_time", 0)
+
+    now = int(time.time())
+
+    if not max_time or max_time <= 0:
+        return {"max_time": 0, "expired": False, "seconds_remaining": float('inf')}
+
+    return {
+        "max_time": max_time,
+        "expired": now > max_time,
+        "seconds_remaining": max_time - now,
+    }
+
+
+def cleanup_expired_offers(log_fn=None) -> int:
+    """Cancel any offers whose max_time has passed.
+
+    Same logic as Chia version — works on the offer dicts.
+    """
+    def _log(level, msg):
+        if log_fn:
+            log_fn(level, msg)
+
+    offers = get_all_offers(include_completed=False, start=0, end=200)
+    if not offers:
+        return 0
+
+    now = int(time.time())
+    cancelled = 0
+    expired_found = 0
+
+    for offer in offers:
+        if not isinstance(offer, dict):
+            continue
+
+        if is_offer_time_expired(offer):
+            expired_found += 1
+            trade_id = offer.get("trade_id", "")
+            valid_times = offer.get("valid_times") or {}
+            max_time = valid_times.get("max_time", 0) or offer.get("max_time", 0)
+            expired_ago = now - max_time if max_time else 0
+            trade_id_short = str(trade_id)[:16]
+
+            _log("info", f"  Cancelling expired offer {trade_id_short}... "
+                         f"(expired {expired_ago}s / {expired_ago // 60}m ago)")
+
+            result = cancel_offer(str(trade_id), secure=False)
+            if result and result.get("success"):
+                cancelled += 1
+            else:
+                _log("warning", f"  Failed to cancel {trade_id_short}: {result}")
+
+            time.sleep(0.3)
+
+    if expired_found > 0:
+        _log("success" if cancelled > 0 else "warning",
+             f"Expired offer cleanup: found {expired_found}, "
+             f"cancelled {cancelled}")
+
+    return cancelled
+
+
+def get_all_offers(include_completed: bool = True, start: int = 0, end: int = 50):
+    """Get all offers from Sage.
+
+    Sage uses 'get_offers' endpoint (not 'get_all_offers').
+    Response format may differ — we normalize to Chia's format.
+    """
+    payload = {
+        "include_completed": include_completed,
+        "start": start,
+        "end": end,
+    }
+    res = rpc("get_offers", payload, timeout=8)
+
+    # IMPORTANT: Sage RPC wrappers may return a structured error dict on timeout/
+    # transport failure. That must not be interpreted as "zero open offers",
+    # or the bot can falsely conclude the entire book vanished and start
+    # rebuilding on top of still-live offers.
+    get_all_offers._last_error = ""
+    if not res:
+        get_all_offers._last_error = "get_offers returned None/empty"
+        print(f"  [Sage] get_offers returned None/empty!", flush=True)
+        return None
+    if isinstance(res, dict) and res.get("success") is False and res.get("error"):
+        get_all_offers._last_error = str(res.get("error") or "wallet get_offers failed")
+        print(f"  ⚠️  [Sage] get_offers failed: {get_all_offers._last_error}", flush=True)
+        return None
+
+    # Handle Sage's response format
+    # Sage may return {"offers": [...]} or {"trades": [...]}
+    offers_list = res.get("offers")
+    if offers_list is None:
+        offers_list = res.get("trades")
+    if offers_list is None:
+        offers_list = res.get("trade_records")
+    if offers_list is None:
+        offers_list = []
+
+    # Log format details on first call AND on first call that has offers
+    # (first call may return 0 offers before any are created)
+    _call_count = getattr(get_all_offers, '_call_count', 0) + 1
+    get_all_offers._call_count = _call_count
+    _should_log = (not hasattr(get_all_offers, '_format_logged') or
+                   (not hasattr(get_all_offers, '_offers_logged') and len(offers_list) > 0))
+    if _should_log:
+        get_all_offers._format_logged = True
+        if len(offers_list) > 0:
+            get_all_offers._offers_logged = True
+        print(f"  [Sage] get_offers response keys: {list(res.keys())} "
+              f"(call #{_call_count}, include_completed={include_completed})", flush=True)
+        print(f"  [Sage] get_offers found {len(offers_list)} raw offers", flush=True)
+        if offers_list and isinstance(offers_list[0], dict):
+            first = offers_list[0]
+            print(f"  [Sage] First offer keys: {list(first.keys())}", flush=True)
+            print(f"  [Sage] First offer status: {repr(first.get('status'))}, "
+                  f"trade_id/offer_id: {(first.get('trade_id') or first.get('offer_id', '?'))[:16]}...", flush=True)
+            # Log status distribution across all offers
+            status_counts = {}
+            for o in offers_list[:200]:
+                s = repr(o.get('status', 'MISSING'))
+                status_counts[s] = status_counts.get(s, 0) + 1
+            print(f"  [Sage] Status distribution: {status_counts}", flush=True)
+            raw_summary = first.get('summary')
+            if raw_summary and isinstance(raw_summary, dict):
+                print(f"  [Sage] First offer summary keys: {list(raw_summary.keys())}", flush=True)
+                import json
+                print(f"  [Sage] First offer summary: {json.dumps(raw_summary, default=str)[:300]}", flush=True)
+            else:
+                print(f"  [Sage] First offer summary: {raw_summary}", flush=True)
+
+    if not isinstance(offers_list, list):
+        return []
+
+    # Normalize each offer to ensure Chia-compatible fields exist
+    normalized = []
+    for offer in offers_list:
+        if not isinstance(offer, dict):
+            continue
+
+        # --- Sage → Chia field mapping ---
+
+        # 1. offer_id → trade_id (Sage uses offer_id, Chia uses trade_id)
+        if "trade_id" not in offer and "offer_id" in offer:
+            offer["trade_id"] = offer["offer_id"]
+
+        # 2. Ensure valid_times exists (Sage may use different key)
+        # Sage uses "expires_at_second" instead of Chia's "max_time"
+        if "valid_times" not in offer:
+            max_t = (offer.get("expires_at_second", 0) or
+                     offer.get("max_time", 0) or 0)
+            if max_t and int(max_t) > 0:
+                offer["valid_times"] = {"max_time": int(max_t)}
+            else:
+                offer["valid_times"] = {}
+
+        # 3. Normalize summary: Sage uses maker/taker arrays with nested
+        #    asset objects; Chia uses offered/requested dicts keyed by
+        #    "xch" or asset_id with integer amounts.
+        summary = offer.get("summary")
+        if summary and isinstance(summary, dict):
+            if "maker" in summary or "taker" in summary:
+                offer["summary"] = _normalize_sage_summary(summary)
+            elif "offered" not in summary and "requested" not in summary:
+                offer["summary"] = _build_offer_summary(offer)
+        elif not summary:
+            offer["summary"] = _build_offer_summary(offer)
+
+        normalized.append(offer)
+
+    # Log first normalized offer's summary once to verify conversion worked
+    if not hasattr(get_all_offers, '_norm_logged'):
+        get_all_offers._norm_logged = True
+        if normalized and isinstance(normalized[0], dict):
+            ns = normalized[0].get("summary", {})
+            print(f"  [Sage] After normalization — first offer summary: "
+                  f"offered={list(ns.get('offered', {}).keys())} "
+                  f"requested={list(ns.get('requested', {}).keys())}", flush=True)
+
+    # CLIENT-SIDE SAFETY FILTER: Sage may ignore include_completed=False
+    # and return all offers (expired, cancelled, etc.) regardless.
+    # If that happens and the count keeps growing, open offers could get
+    # pushed out of the end=500 window — the exact truncation bug from V1.
+    # Fix: filter completed offers ourselves when include_completed=False.
+    if not include_completed:
+        before_count = len(normalized)
+        OPEN_STATUS_STRINGS = {"PENDING_ACCEPT", "PENDING_CONFIRM", "PENDING",
+                               "IN_PROGRESS", "OPEN", "ACTIVE"}
+        filtered = []
+        for offer in normalized:
+            status_val = offer.get("status")
+            if status_val is None:
+                filtered.append(offer)  # keep unknowns for classification to handle
+                continue
+            if isinstance(status_val, int):
+                if status_val <= 1:  # PENDING_ACCEPT or PENDING_CONFIRM
+                    filtered.append(offer)
+            else:
+                if str(status_val).upper() in OPEN_STATUS_STRINGS:
+                    filtered.append(offer)
+
+        if before_count != len(filtered):
+            if not hasattr(get_all_offers, '_filter_logged'):
+                get_all_offers._filter_logged = True
+                print(f"  [Sage] Client-side filter: {before_count} raw → "
+                      f"{len(filtered)} open (Sage ignored include_completed=False)",
+                      flush=True)
+        normalized = filtered
+
+    return normalized
+
+
+def _normalize_sage_summary(sage_summary: dict) -> dict:
+    """Convert Sage's maker/taker summary format to Chia's offered/requested.
+
+    Sage format:
+        {"maker": [{"asset": {"asset_id": "abc..." or null}, "amount": 1000}],
+         "taker": [{"asset": {"asset_id": null}, "amount": 500}],
+         "fee": 0}
+
+    Chia format:
+        {"offered": {"xch": 500, "abc...": 1000},
+         "requested": {"xch": 500, "abc...": 1000}}
+
+    In Sage: maker = what we're offering, taker = what we want back.
+    """
+    offered = {}
+    requested = {}
+
+    for item in sage_summary.get("maker", []):
+        asset_info = item.get("asset", {})
+        asset_id = asset_info.get("asset_id")
+        amount = item.get("amount", 0)
+        key = "xch" if asset_id is None else asset_id
+        offered[key] = amount
+
+    for item in sage_summary.get("taker", []):
+        asset_info = item.get("asset", {})
+        asset_id = asset_info.get("asset_id")
+        amount = item.get("amount", 0)
+        key = "xch" if asset_id is None else asset_id
+        requested[key] = amount
+
+    return {"offered": offered, "requested": requested}
+
+
+def _build_offer_summary(offer: dict) -> dict:
+    """Build a Chia-compatible offer summary from Sage's offer format.
+
+    Sage may structure offer data differently. This function creates
+    the expected {"offered": {"xch": amount, asset_id: amount}, ...}
+    format that classify_offers_from_list() expects.
+    """
+    summary = {"offered": {}, "requested": {}}
+
+    # Try to extract from Sage's format — try multiple possible field names
+    offered = (offer.get("offered_assets") or offer.get("offered")
+               or offer.get("offer_assets") or offer.get("offering") or {})
+    requested = (offer.get("requested_assets") or offer.get("requested")
+                 or offer.get("request_assets") or offer.get("requesting") or {})
+
+    # If Sage uses a nested "summary" or "offer" structure, try that too
+    if not offered and not requested:
+        inner = offer.get("offer") or offer.get("trade") or {}
+        if isinstance(inner, dict):
+            offered = inner.get("offered") or inner.get("offered_assets") or {}
+            requested = inner.get("requested") or inner.get("requested_assets") or {}
+
+    # Log first unknown format for debugging
+    if not offered and not requested and WALLET_DEBUG:
+        print(f"   ⚠️  [Sage] Could not parse offer summary. Keys: {list(offer.keys())}")
+
+    # Normalize keys to lowercase. Sage may use full asset IDs as keys,
+    # while Chia's classify_offers_from_list expects lowercase "xch".
+    for key, value in offered.items():
+        amount = int(value) if isinstance(value, str) else value
+        normalized_key = key.lower() if len(key) < 10 else key  # Keep asset_ids as-is
+        summary["offered"][normalized_key] = amount
+
+    for key, value in requested.items():
+        amount = int(value) if isinstance(value, str) else value
+        normalized_key = key.lower() if len(key) < 10 else key
+        summary["requested"][normalized_key] = amount
+
+    return summary
+
+
+def get_offer_bech32(trade_id: str) -> str:
+    """Get the bech32 offer string for a specific trade_id.
+
+    Sage's get_offer endpoint should return the full offer data.
+    """
+    # Sage uses offer_id, not trade_id
+    res = rpc("get_offer", {
+        "offer_id": trade_id,
+        "file_contents": True
+    }, timeout=10)
+
+    if not res:
+        return None
+
+    # Check standard locations for the offer string
+    offer_str = res.get("offer")
+    if offer_str and isinstance(offer_str, str) and offer_str.startswith("offer1"):
+        return offer_str
+
+    trade_record = res.get("trade_record") or {}
+    offer_str = trade_record.get("offer")
+    if offer_str and isinstance(offer_str, str) and offer_str.startswith("offer1"):
+        return offer_str
+
+    return None
+
+
+def _is_open_status(status_val, offer_record=None) -> bool:
+    """Determine if an offer status represents an open/active offer.
+
+    Chia TradeStatus integer enum:
+        0 = PENDING_ACCEPT  (open)
+        1 = PENDING_CONFIRM (open)
+        2 = PENDING_CANCEL  (transitioning — treat as closed)
+        3 = CANCELLED       (closed)
+        4 = CONFIRMED       (closed)
+        5 = FAILED          (closed)
+    """
+    if offer_record and is_offer_time_expired(offer_record):
+        return False
+
+    if status_val is None:
+        return False
+    if isinstance(status_val, int):
+        # Only 0 (PENDING_ACCEPT) and 1 (PENDING_CONFIRM) are truly open
+        return status_val <= 1
+
+    status = str(status_val).upper()
+    OPEN_STATUSES = {"PENDING_ACCEPT", "PENDING_CONFIRM", "PENDING", "IN_PROGRESS", "OPEN", "ACTIVE"}
+    CLOSED_STATUSES = {"PENDING_CANCEL", "CANCELLED", "CANCELED", "CONFIRMED", "FAILED",
+                       "EXPIRED", "COMPLETED", "SUCCESS"}
+
+    if status in CLOSED_STATUSES:
+        return False
+    if status in OPEN_STATUSES:
+        return True
+
+    # Unknown status — log it once so we can add it to the right set
+    if not hasattr(_is_open_status, '_unknown_logged'):
+        _is_open_status._unknown_logged = set()
+    if status not in _is_open_status._unknown_logged:
+        _is_open_status._unknown_logged.add(status)
+        print(f"  ⚠️  [Sage] Unknown offer status: {repr(status_val)} "
+              f"(uppercased: {status}) — treating as CLOSED. "
+              f"Add to OPEN_STATUSES or CLOSED_STATUSES in _is_open_status().",
+              flush=True)
+    return False
+
+
+def classify_offers_from_list(offers_list: list, asset_id_mz: str):
+    """Classify offers from a pre-fetched list.
+
+    Same logic as Chia version — operates on normalized offer dicts.
+    """
+    open_buy = []
+    open_sell = []
+    closed_offers = []
+
+    _first_classify = not hasattr(classify_offers_from_list, '_logged')
+    if _first_classify:
+        classify_offers_from_list._logged = True
+        print(f"  [classify] Starting classification of {len(offers_list)} offers for asset {asset_id_mz[:12]}...", flush=True)
+    skipped_status = 0
+    skipped_pair = 0
+    for i, tr in enumerate(offers_list):
+        if not isinstance(tr, dict):
+            continue
+
+        status_val = tr.get("status")
+        summary = tr.get("summary") or {}
+        offered = summary.get("offered") or {}
+        requested = summary.get("requested") or {}
+
+        is_open = _is_open_status(status_val, offer_record=tr)
+
+        is_buy = "xch" in offered and asset_id_mz in requested
+        is_sell = asset_id_mz in offered and "xch" in requested
+
+        # Debug: log first few offers on first call only
+        if _first_classify and i < 3:
+            print(f"  [classify] offer #{i}: status={status_val} is_open={is_open} "
+                  f"offered_keys={list(offered.keys())[:3]} requested_keys={list(requested.keys())[:3]} "
+                  f"is_buy={is_buy} is_sell={is_sell}", flush=True)
+
+        if is_open:
+            if is_buy:
+                open_buy.append(tr)
+            elif is_sell:
+                open_sell.append(tr)
+            else:
+                skipped_pair += 1
+        else:
+            if is_buy or is_sell:
+                closed_offers.append(tr)
+            else:
+                skipped_status += 1
+
+    if _first_classify:
+        print(f"  [classify] Result: {len(open_buy)} buys, {len(open_sell)} sells, "
+              f"{len(closed_offers)} closed, {skipped_status} wrong status, {skipped_pair} wrong pair",
+              flush=True)
+    return open_buy, open_sell, closed_offers
+
+
+def classify_open_offers_for_pair(asset_id_mz: str):
+    """LEGACY: Keep for backwards compatibility."""
+    offers_list = get_all_offers(include_completed=True)
+    if offers_list is None:
+        print("⚠️  [Sage] Could not fetch offers from Sage RPC.")
+        return [], []
+
+    open_buy, open_sell, _ = classify_offers_from_list(offers_list, asset_id_mz)
+    return open_buy, open_sell
+
+
+def _normalize_offer_lock_id(offer_id: Any) -> Optional[str]:
+    """Normalize offer/trade ids for lock matching.
+
+    Sage coin records may report offer_id/offer_hash with or without a 0x
+    prefix, while the app may track trade ids in either form.
+    """
+    if not isinstance(offer_id, str):
+        return None
+    normalized = offer_id.strip().lower()
+    if normalized.startswith("0x"):
+        normalized = normalized[2:]
+    return normalized or None
+
+
+def _get_still_locked_trade_ids(trade_ids: set, owned_coin_map: Optional[Dict]) -> set:
+    """Return trade ids that still have owned coins locked by offer_id."""
+    if not trade_ids or not owned_coin_map:
+        return set()
+    locked_offer_ids = set()
+    for info in owned_coin_map.values():
+        if not isinstance(info, dict):
+            continue
+        normalized = _normalize_offer_lock_id(info.get("offer_id"))
+        if normalized:
+            locked_offer_ids.add(normalized)
+    still_locked = set()
+    for trade_id in trade_ids:
+        normalized = _normalize_offer_lock_id(trade_id)
+        if normalized and normalized in locked_offer_ids:
+            still_locked.add(trade_id)
+    return still_locked
+
+
+def cancel_offers_batch(trade_ids: list, secure: bool = True, max_workers: int = 3,
+                        fee_mojos: Optional[int] = None):
+    """Cancel multiple offers — tries Sage's bulk cancel_offers first,
+    falls back to sequential cancel_offer if bulk fails.
+
+    Sage supports: cancel_offers(offer_ids=[...], fee="0", auto_submit=True)
+    which can cancel many offers in a single RPC call.
+
+    After cancellation, polls the wallet to confirm offers are actually gone
+    (matching the bot's confirmation pattern for all wallet operations).
+    """
+    results = {}
+    resolved_fee = 0 if not secure else (
+        max(0, int(fee_mojos))
+        if fee_mojos is not None
+        else get_effective_transaction_fee_mojos()
+    )
+
+    if not trade_ids:
+        return results
+
+    cancel_succeeded = False
+    trade_id_set = set(trade_ids)
+
+    # Helper: include both XCH wallet (1) and CAT wallet for coin-count checks
+    _confirm_wallet_ids: set = {1}
+    try:
+        _confirm_wallet_ids.add(int(getattr(cfg, "CAT_WALLET_ID", 1)))
+    except Exception:
+        pass
+
+    def _total_spendable() -> int:
+        total = 0
+        for _wid in _confirm_wallet_ids:
+            try:
+                total += get_spendable_coin_count(wallet_id=_wid)
+            except Exception:
+                pass
+        return total
+
+    def _merged_owned_coins():
+        merged: dict = {}
+        any_success = False
+        for _wid in _confirm_wallet_ids:
+            try:
+                part = get_owned_coins_detailed(wallet_id=_wid)
+                if part is not None:
+                    merged.update(part)
+                    any_success = True
+            except Exception:
+                pass
+        return merged if any_success else None
+
+    # --- Pre-cancel snapshots for verification ---
+    # Use Sage's documented count and pending-tx endpoints rather than
+    # approximating from coin list lengths.
+    pre_cancel_coin_count = 0
+    pre_pending_count = 0
+    try:
+        pre_cancel_coin_count = _total_spendable()
+        print(f"   📸 [Sage] Pre-cancel snapshot: {pre_cancel_coin_count} spendable coins")
+    except Exception as e:
+        print(f"   ⚠️ [Sage] Could not snapshot pre-cancel coins: {e}")
+    try:
+        pre_pending_count = len(get_pending_transactions() or [])
+        print(f"   📸 [Sage] Pre-cancel pending txs: {pre_pending_count}")
+    except Exception as e:
+        print(f"   ⚠️ [Sage] Could not snapshot pending txs: {e}")
+
+    # --- Try bulk cancel first (Sage-specific) ---
+    # DISABLED for now — bulk cancel overwhelms Sage and causes long pending
+    # states. The caller now sends measured batches (currently 25), so
+    # sequential cancel is slower than one blind bulk RPC but more reliable.
+    # Only try bulk for very large batches (>100) as a last resort.
+    if len(trade_ids) > 100:
+        print(f"📋 [Sage] Attempting bulk cancel of {len(trade_ids)} offers...")
+        try:
+            # Use _sage_post directly to see actual HTTP status on error
+            bulk_result = _sage_post("cancel_offers", {
+                "offer_ids": trade_ids,
+                "fee": str(int(resolved_fee)),
+                "auto_submit": True,
+            }, timeout=max(30, len(trade_ids) * 2))
+
+            if bulk_result is not None:
+                print(f"   ✅ [Sage] Bulk cancel RPC accepted. Response: "
+                      f"{str(bulk_result)[:200]}")
+                cancel_succeeded = True
+                for tid in trade_ids:
+                    results[tid] = {"success": True, "method": "bulk"}
+            else:
+                print(f"   ⚠️ [Sage] Bulk cancel returned None — falling back to sequential")
+        except ConnectionError as e:
+            err_str = str(e)
+            print(f"   ⚠️ [Sage] Bulk cancel HTTP error: {err_str[:300]}")
+            # If Sage returned 500 but actually processed, the confirmation poll
+            # below will catch it. For now, fall through to sequential.
+            if "HTTP 500" in err_str:
+                print(f"   [Sage] Bulk cancel got HTTP 500 — may be async processing. "
+                      f"Will verify via polling.", flush=True)
+                # Do NOT set cancel_succeeded or mark results as success.
+                # Polling will determine actual outcome. If polling also fails,
+                # the sequential fallback will run.
+        except Exception as e:
+            print(f"   ⚠️ [Sage] Bulk cancel error: {e} — falling back to sequential")
+
+    # --- Sequential cancel (used for small batches, or fallback for large) ---
+    # 1.0s delay between each cancel gives Sage time to process each
+    # transaction individually, preventing MEMPOOL_CONFLICT errors.
+    if not cancel_succeeded:
+        delay = 1.0
+        print(f"📋 [Sage] Cancelling {len(trade_ids)} offers sequentially "
+              f"({delay}s delay)...")
+
+        for i, tid in enumerate(trade_ids):
+            try:
+                timeout = 60
+                result = cancel_offer(tid, secure, timeout=timeout, fee_mojos=resolved_fee)
+                results[tid] = result or {"success": False, "error": "RPC returned None"}
+                if result and result.get("success"):
+                    if (i + 1) % 10 == 0 or (i + 1) == len(trade_ids):
+                        print(f"   ✅ [Sage] Cancelled {i + 1}/{len(trade_ids)}")
+                else:
+                    error = (result or {}).get("error", "unknown")
+                    print(f"   ❌ [Sage] Failed {tid[:16]}...: {error}")
+                time.sleep(delay)
+            except Exception as e:
+                print(f"❌ [Sage] Failed to cancel offer {tid}: {e}")
+                results[tid] = {"success": False, "error": str(e)}
+
+    # --- Confirmation polling: verify cancels actually happened ON-CHAIN ---
+    # CRITICAL: Sage wallet may optimistically remove cancelled offers from its
+    # local active list BEFORE the on-chain cancel transaction confirms. This
+    # means checking "not in active list" is NOT reliable. We use TWO methods:
+    #
+    # 1. Status check: get_all_offers(include_completed=True) and look for
+    #    explicit CANCELLED status (not just "absent from active list")
+    # 2. Coin check: count spendable coins — if cancel worked on-chain, the
+    #    coins locked by those offers should now be free (count increases)
+    #
+    # An offer is only confirmed cancelled if:
+    #   - It shows explicit CANCELLED/CONFIRMED status in the wallet, OR
+    #   - Spendable coin count increased by at least the number of cancelled offers
+
+    # Chia TradeStatus numeric: 0=PENDING_ACCEPT, 1=PENDING_CONFIRM,
+    # 2=PENDING_CANCEL, 3=CANCELLED, 4=CONFIRMED (filled), 5=FAILED
+    CANCELLED_STATUSES = {"CANCELLED", "CANCELED", "3", "CONFIRMED_CANCEL",
+                          "PENDING_CANCEL", "2"}  # 2/PENDING_CANCEL = en route
+    ACTIVE_STATUSES = {"ACTIVE", "OPEN", "PENDING_ACCEPT", "PENDING",
+                       "PENDING_CONFIRM", "IN_PROGRESS", "0", "1"}
+    TERMINAL_NON_CANCEL = {"CONFIRMED", "COMPLETED", "SUCCESS", "FAILED", "4", "5"}
+
+    if len(trade_ids) > 0:
+        print(f"🔄 [Sage] Confirming cancellations ON-CHAIN (2-layer verification)...")
+        max_wait = min(120, max(45, len(trade_ids) * 5))
+        poll_interval = 4
+        start_time = time.time()
+        confirmed = False
+
+        while (time.time() - start_time) < max_wait:
+            time.sleep(poll_interval)
+            try:
+                # Layer 1: Check offer statuses WITH completed offers included
+                current_offers = get_all_offers(include_completed=True, start=0, end=500)
+                if current_offers is None:
+                    print(f"   ⚠️ [Sage] Confirm poll: wallet returned None, retrying...")
+                    continue
+
+                # Categorize each target offer
+                explicitly_cancelled = set()
+                still_active = set()
+                vanished = set(trade_id_set)  # start assuming all vanished
+
+                for o in current_offers:
+                    tid = o.get("trade_id", "") or o.get("offer_id", "")
+                    if tid not in trade_id_set:
+                        continue
+
+                    status = str(o.get("status", "")).upper()
+                    vanished.discard(tid)  # found it, so it didn't vanish
+
+                    if status in CANCELLED_STATUSES:
+                        explicitly_cancelled.add(tid)
+                    elif status in ACTIVE_STATUSES:
+                        still_active.add(tid)
+                    elif status in TERMINAL_NON_CANCEL:
+                        # Offer was FILLED (or FAILED) before cancel completed —
+                        # treat as a definitive non-cancel terminal state.
+                        results[tid] = {"success": False,
+                                        "error": f"Offer reached terminal non-cancel status "
+                                                 f"({o.get('status')}) — likely filled before cancel",
+                                        "method": "terminal_non_cancel"}
+                        vanished.discard(tid)
+                    # Other unknown statuses = in-progress, keep waiting
+
+                # Layer 2: Spendable coin count and exact offer-lock state
+                post_cancel_coin_count = 0
+                coin_delta = 0
+                pending_count = pre_pending_count
+                still_locked = set()
+                lock_state_known = False
+                try:
+                    post_cancel_coin_count = _total_spendable()
+                    coin_delta = post_cancel_coin_count - pre_cancel_coin_count
+                except Exception:
+                    pass
+                try:
+                    pending_count = len(get_pending_transactions() or [])
+                except Exception:
+                    pass
+                try:
+                    owned_coin_map = _merged_owned_coins()
+                    if owned_coin_map is not None:
+                        still_locked = _get_still_locked_trade_ids(
+                            trade_id_set, owned_coin_map
+                        )
+                        lock_state_known = True
+                except Exception:
+                    still_locked = set()
+                    lock_state_known = False
+
+                elapsed = int(time.time() - start_time)
+                print(f"   🔄 [Sage] Confirm [{elapsed}s]: "
+                      f"cancelled={len(explicitly_cancelled)}, "
+                      f"active={len(still_active)}, "
+                      f"vanished={len(vanished)}, "
+                      f"locked={'?' if not lock_state_known else len(still_locked)}, "
+                      f"pending={pending_count}, "
+                      f"coin_delta=+{coin_delta}")
+
+                # Success criteria: all offers either explicitly cancelled OR
+                # gone from list AND coins freed on-chain
+                if len(still_active) == 0 and len(vanished) == 0:
+                    # All offers found with CANCELLED status — best case
+                    print(f"   ✅ [Sage] All {len(trade_ids)} cancellations "
+                          f"confirmed by status!")
+                    confirmed = True
+                    for tid in trade_ids:
+                        results[tid] = {"success": True, "method": "confirmed_by_status"}
+                    break
+
+                if len(still_active) == 0 and lock_state_known and len(still_locked) == 0 and (
+                    pending_count <= pre_pending_count or coin_delta > 0
+                ):
+                    # Offers no longer active, no owned coins remain locked to
+                    # those offer_ids, and either the pending queue is back to
+                    # baseline or spendable coins have already increased.
+                    print(f"   ✅ [Sage] All {len(trade_ids)} cancellations "
+                          f"confirmed by unlock state "
+                          f"(pending={pending_count}, coin_delta=+{coin_delta})!")
+                    confirmed = True
+                    for tid in explicitly_cancelled:
+                        results[tid] = {"success": True, "method": "confirmed_by_status"}
+                    for tid in (trade_id_set - explicitly_cancelled):
+                        results[tid] = {
+                            "success": True,
+                            "method": "confirmed_by_unlock",
+                            "note": (
+                                "Offer no longer active, no owned coins remain locked "
+                                f"to that offer_id, pending={pending_count}, "
+                                f"coin_delta=+{coin_delta}"
+                            ),
+                        }
+                    break
+
+                if len(still_active) == 0 and lock_state_known and len(still_locked) == 0 and pending_count > pre_pending_count:
+                    print(f"   ⏳ [Sage] Offers are unlocked but {pending_count} pending "
+                          f"txs remain (baseline {pre_pending_count}) — waiting...")
+                elif len(still_active) == 0 and lock_state_known and len(still_locked) > 0:
+                    print(f"   ⏳ [Sage] Offers vanished from the list but "
+                          f"{len(still_locked)} still have locked owned coins — waiting...")
+
+            except Exception as e:
+                print(f"   ⚠️ [Sage] Confirm poll error: {e}")
+
+        # --- Final verdict ---
+        if not confirmed:
+            elapsed = int(time.time() - start_time)
+
+            # One final check with both layers
+            try:
+                current_offers = get_all_offers(include_completed=True, start=0, end=500)
+                post_coin_count = 0
+                final_pending_count = pre_pending_count
+                final_still_locked = set()
+                final_lock_state_known = False
+                try:
+                    post_coin_count = _total_spendable()
+                except Exception:
+                    post_coin_count = 0
+                final_coin_delta = post_coin_count - pre_cancel_coin_count
+                try:
+                    final_pending_count = len(get_pending_transactions() or [])
+                except Exception:
+                    pass
+                try:
+                    owned_coin_map = _merged_owned_coins()
+                    if owned_coin_map is not None:
+                        final_still_locked = _get_still_locked_trade_ids(
+                            trade_id_set, owned_coin_map
+                        )
+                        final_lock_state_known = True
+                except Exception:
+                    final_still_locked = set()
+                    final_lock_state_known = False
+
+                if current_offers is not None:
+                    final_still_active = set()
+                    final_cancelled = set()
+                    final_vanished = set(trade_id_set)
+
+                    for o in current_offers:
+                        tid = o.get("trade_id", "") or o.get("offer_id", "")
+                        if tid not in trade_id_set:
+                            continue
+                        final_vanished.discard(tid)
+                        status = str(o.get("status", "")).upper()
+                        if status in CANCELLED_STATUSES:
+                            final_cancelled.add(tid)
+                        elif status in ACTIVE_STATUSES:
+                            final_still_active.add(tid)
+
+                    # Mark results based on final state
+                    for tid in final_cancelled:
+                        results[tid] = {"success": True, "method": "confirmed_by_status"}
+                    for tid in final_still_active:
+                        results[tid] = {"success": False,
+                                        "error": "STILL ACTIVE after cancel — "
+                                                 "on-chain cancel FAILED",
+                                        "method": "on_chain_verification"}
+                        print(f"   ❌ [Sage] CANCEL FAILED for {tid[:16]}... — "
+                              f"offer is STILL ACTIVE on-chain!")
+                    for tid in final_vanished:
+                        if final_lock_state_known and tid not in final_still_locked and (
+                            final_pending_count <= pre_pending_count or final_coin_delta > 0
+                        ):
+                            results[tid] = {"success": True,
+                                            "method": "confirmed_by_unlock",
+                                            "note": ("Vanished, no owned coins remain locked, "
+                                                     f"pending={final_pending_count}, "
+                                                     f"coin_delta=+{final_coin_delta}")}
+                        else:
+                            results[tid] = {"success": False,
+                                            "error": "Offer vanished from wallet "
+                                                     "but still looks pending/locked — "
+                                                     "cancel not safely confirmed",
+                                            "method": "on_chain_verification"}
+                            print(f"   ❌ [Sage] UNCERTAIN cancel for {tid[:16]}... — "
+                                  f"vanished, locked={tid in final_still_locked}, "
+                                  f"pending={final_pending_count}, "
+                                  f"coin_delta=+{final_coin_delta}")
+
+                    failed_count = len(final_still_active) + sum(
+                        1 for tid in final_vanished
+                        if (final_lock_state_known and tid in final_still_locked)
+                        or (final_pending_count > pre_pending_count and final_coin_delta <= 0)
+                    )
+                    success_count = len(final_cancelled) + sum(
+                        1 for tid in final_vanished
+                        if final_lock_state_known
+                        and tid not in final_still_locked
+                        and (final_pending_count <= pre_pending_count or final_coin_delta > 0)
+                    )
+                    print(f"   ⚠️ [Sage] Cancel verification after {elapsed}s: "
+                          f"{success_count} confirmed, {failed_count} FAILED "
+                          f"(locked={'?' if not final_lock_state_known else len(final_still_locked)}, "
+                          f"pending={final_pending_count}, "
+                          f"coin_delta=+{final_coin_delta})")
+            except Exception as e:
+                print(f"   ⚠️ [Sage] Final verification error: {e}")
+                # If we can't verify, mark RPC-failed ones as failed
+                for tid in trade_ids:
+                    if not results.get(tid, {}).get("success"):
+                        results[tid] = {"success": False,
+                                        "error": "Could not verify on-chain",
+                                        "method": "verification_failed"}
+
+    return results
+
+
+# ============================================================================
+# DASHBOARD / NODE QUERIES (Sage stubs — light wallet has no full node)
+# ============================================================================
+
+def get_blockchain_state_full():
+    """Get blockchain state — Sage has no full node, so we use Coinset API
+    if available, otherwise return a minimal status from get_sync_status.
+    """
+    # Try Coinset API first (if V3 coinset_client is available)
+    try:
+        from coinset_client import CoinsetClient
+        client = CoinsetClient()
+        state = client.get_blockchain_state()
+        if state:
+            return state
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # Fallback: get basic info from Sage's own sync status
+    try:
+        result = rpc("get_sync_status", {}, timeout=5)
+        if result and isinstance(result, dict):
+            return {
+                "success": True,
+                "peak_height": result.get("peak_height", 0),
+                "peak_timestamp": 0,  # Sage sync status doesn't include this
+                "difficulty": 0,  # N/A for light wallet
+                "space_bytes": 0,  # N/A for light wallet
+                "mempool_size": 0,  # N/A for light wallet
+                "synced": result.get("synced", False),
+                "syncing": not result.get("synced", False),
+                "sync_tip_height": result.get("target_height", 0),
+                "sync_progress_height": result.get("peak_height", 0),
+            }
+    except Exception:
+        pass
+
+    return None
+
+
+def get_peer_connections():
+    """Get peer connections — Sage manages its own P2P peers.
+    We can list them via get_peers, but the format differs from full node.
+    Returns empty list if not available (dashboard shows 0 peers gracefully).
+    """
+    try:
+        result = rpc("get_peers", {}, timeout=5)
+        if result and isinstance(result, list):
+            peers = []
+            for p in result:
+                peers.append({
+                    "node_id": str(p.get("ip", ""))[:16],
+                    "peer_host": p.get("ip", ""),
+                    "peer_port": p.get("port", 0),
+                    "type": 1,  # Treat all Sage peers as full_node type for display
+                    "bytes_read": 0,
+                    "bytes_written": 0,
+                    "peak_height": p.get("peak_height", 0),
+                    "creation_time": 0,
+                })
+            return peers
+        elif result and isinstance(result, dict):
+            # Might be wrapped in a dict with a "peers" key
+            peer_list = result.get("peers", [])
+            peers = []
+            for p in peer_list:
+                peers.append({
+                    "node_id": str(p.get("ip", ""))[:16],
+                    "peer_host": p.get("ip", ""),
+                    "peer_port": p.get("port", 0),
+                    "type": 1,
+                    "bytes_read": 0,
+                    "bytes_written": 0,
+                    "peak_height": p.get("peak_height", 0),
+                    "creation_time": 0,
+                })
+            return peers
+    except Exception:
+        pass
+    return []
+
+
+def get_transactions_list(wallet_id: int, start: int = 0, end: int = 50,
+                          sort_key: str = "CONFIRMED_AT_HEIGHT",
+                          reverse: bool = True):
+    """Get transaction history — Sage uses get_transactions endpoint."""
+    try:
+        result = rpc("get_transactions", {
+            "offset": start,
+            "limit": min(end - start, 50),
+            "ascending": not reverse,
+        }, timeout=15)
+        if result and isinstance(result, dict):
+            txs = result.get("transactions", [])
+            return {
+                "success": True,
+                "transactions": txs,
+                "wallet_id": wallet_id,
+            }
+        elif result and isinstance(result, list):
+            return {
+                "success": True,
+                "transactions": result,
+                "wallet_id": wallet_id,
+            }
+    except Exception:
+        pass
+    return None
+
+
+def get_transaction_count(wallet_id: int) -> int:
+    """Get total transaction count — Sage uses get_transactions with limit 0."""
+    try:
+        result = rpc("get_transactions", {"offset": 0, "limit": 1, "ascending": False}, timeout=5)
+        if result and isinstance(result, dict):
+            return result.get("total", 0)
+    except Exception:
+        pass
+    return 0
+
+
+# REMOVED: duplicate get_pending_transactions() that shadowed the correct
+# implementation at line ~833. The correct version uses Sage's documented
+# get_pending_transactions endpoint. This duplicate used get_transactions
+# with heuristic status filtering. See Codex audit item 4.2.
+
+
+def get_all_coins_for_wallet(wallet_id: int):
+    """Get ALL coins for a wallet including locked ones.
+    Returns both spendable and pending coins for the dashboard.
+    """
+    try:
+        if _is_cat_wallet(wallet_id):
+            asset_id = _get_cat_asset_id()
+            if not asset_id or not asset_id.strip():
+                return {"success": True, "confirmed_coins": [], "pending_coins": []}
+            result = rpc("get_coins", {
+                "asset_id": asset_id,
+                "offset": 0, "limit": 500,
+                "sort_mode": "amount",
+                "filter_mode": "all",
+                "ascending": False,
+            }, timeout=15)
+        else:
+            result = rpc("get_coins", {
+                "asset_id": None,
+                "offset": 0, "limit": 500,
+                "sort_mode": "amount",
+                "filter_mode": "all",
+                "ascending": False,
+            }, timeout=15)
+
+        if result and isinstance(result, dict):
+            coins = result.get("coins", [])
+            # Wrap in Chia-compatible format
+            confirmed = []
+            for c in coins:
+                confirmed.append({
+                    "coin": c,
+                    "confirmed_block_index": c.get("confirmed_block_index", 0),
+                    "spent_block_index": c.get("spent_block_index", 0),
+                    "coinbase": False,
+                    "timestamp": c.get("timestamp", 0),
+                })
+            return {
+                "confirmed": confirmed,
+                "pending_additions": [],
+                "pending_removals": [],
+            }
+        elif result and isinstance(result, list):
+            confirmed = []
+            for c in result:
+                confirmed.append({
+                    "coin": c,
+                    "confirmed_block_index": 0,
+                    "spent_block_index": 0,
+                    "coinbase": False,
+                    "timestamp": 0,
+                })
+            return {
+                "confirmed": confirmed,
+                "pending_additions": [],
+                "pending_removals": [],
+            }
+    except Exception as e:
+        print(f"❌ [Sage] get_all_coins_for_wallet failed: {e}")
+    return None
+
+
+def get_owned_coins(wallet_id: int) -> Optional[Dict]:
+    """Get all currently held coins (free + offer-locked, not spent).
+
+    Uses filter_mode="owned" which returns only coins we still hold.
+    Unlike "all" which includes spent coins and mixes asset types,
+    "owned" gives us exactly the coins that exist right now.
+
+    Returns dict: {normalized_coin_id: amount_mojos}
+    """
+    if _is_cat_wallet(wallet_id):
+        asset_id = _get_cat_asset_id()
+        if not asset_id:
+            return None
+    else:
+        asset_id = None
+
+    result = rpc("get_coins", {
+        "asset_id": asset_id,
+        "offset": 0, "limit": 500,
+        "filter_mode": "owned",
+    }, timeout=15)
+
+    if not result:
+        return None
+
+    coins = result.get("coins") or result.get("records") or result.get("data") or []
+    # Return {coin_id: amount_mojos} with normalized IDs (0x prefix)
+    coin_map = {}
+    for c in coins:
+        cid = c.get("coin_id", "")
+        if cid:
+            # Normalize: add 0x prefix if missing
+            if not cid.startswith("0x"):
+                cid = "0x" + cid.lower()
+            else:
+                cid = cid.lower()
+            coin_map[cid] = int(c.get("amount", "0"))
+    return coin_map
+
+
+def get_owned_coins_detailed(wallet_id: int) -> Optional[Dict]:
+    """Get all owned coins with full detail including offer_id.
+
+    Same as get_owned_coins but returns richer data per coin, including
+    the offer_id (offer_hash) which tells us exactly which offer locked
+    a coin. This eliminates the need for unreliable amount-based matching.
+
+    From Sage source (migrations/0002_options.sql):
+      - owned_coins view = wallet_coins WHERE spent_height IS NULL
+        AND mempool_item_hash IS NULL (includes offer-locked coins)
+      - selectable_coins view = same + offer_hash IS NULL (excludes locked)
+
+    The response CoinRecord includes: coin_id, amount, offer_id,
+    transaction_id, created_height, spent_height, etc.
+
+    Returns dict: {normalized_coin_id: {amount, offer_id, created_height, spent_height}}
+    """
+    if _is_cat_wallet(wallet_id):
+        asset_id = _get_cat_asset_id()
+        if not asset_id:
+            return None
+    else:
+        asset_id = None
+
+    result = rpc("get_coins", {
+        "asset_id": asset_id,
+        "offset": 0, "limit": 500,
+        "filter_mode": "owned",
+    }, timeout=15)
+
+    if not result:
+        return None
+
+    coins = result.get("coins") or result.get("records") or result.get("data") or []
+    coin_map = {}
+    for c in coins:
+        cid = c.get("coin_id", "")
+        if cid:
+            if not cid.startswith("0x"):
+                cid = "0x" + cid.lower()
+            else:
+                cid = cid.lower()
+            # Extract offer_id — this is the offer_hash from Sage's DB
+            # If set, this coin is locked by an offer
+            offer_id = c.get("offer_id") or c.get("offer_hash") or None
+            if offer_id and isinstance(offer_id, str):
+                offer_id = offer_id.lower()
+            coin_map[cid] = {
+                "amount": int(c.get("amount", "0")),
+                "offer_id": offer_id,
+                "created_height": c.get("created_height"),
+                "spent_height": c.get("spent_height"),
+                "transaction_id": c.get("transaction_id"),
+            }
+    return coin_map
+
+
+def get_coins_by_ids(coin_ids: list) -> Optional[Dict]:
+    """Get detailed status for specific coins by their IDs.
+
+    Sage endpoint: get_coins_by_ids
+    Request: {coin_ids: ["0xabc...", "0xdef..."]}
+    Response: {coins: [CoinRecord, ...]}
+
+    Each CoinRecord includes: coin_id, amount, offer_id (if locked),
+    spent_height (if spent), created_height, transaction_id.
+
+    Returns dict: {normalized_coin_id: {amount, offer_id, spent_height, created_height}}
+    Returns None on RPC failure.
+    """
+    if not coin_ids:
+        return {}
+
+    # Normalize IDs for the request — Sage expects hex strings
+    normalized = []
+    for cid in coin_ids:
+        if isinstance(cid, str):
+            # Remove 0x prefix if present — Sage might want bare hex
+            clean = cid.lower()
+            if clean.startswith("0x"):
+                clean = clean[2:]
+            normalized.append(clean)
+
+    result = rpc("get_coins_by_ids", {
+        "coin_ids": normalized,
+    }, timeout=15)
+
+    if not result:
+        return None
+
+    coins = result.get("coins") or result.get("records") or result.get("data") or []
+    coin_map = {}
+    for c in coins:
+        cid = c.get("coin_id", "")
+        if cid:
+            if not cid.startswith("0x"):
+                cid = "0x" + cid.lower()
+            else:
+                cid = cid.lower()
+            offer_id = c.get("offer_id") or c.get("offer_hash") or None
+            if offer_id and isinstance(offer_id, str):
+                offer_id = offer_id.lower()
+            coin_map[cid] = {
+                "amount": int(c.get("amount", "0")),
+                "offer_id": offer_id,
+                "spent_height": c.get("spent_height"),
+                "created_height": c.get("created_height"),
+                "transaction_id": c.get("transaction_id"),
+            }
+    return coin_map
+
+
+def are_coins_spendable(coin_ids: list) -> Optional[bool]:
+    """Check if ALL given coins are currently spendable.
+
+    Sage endpoint: get_are_coins_spendable
+    Request: {coin_ids: ["0xabc...", "0xdef..."]}
+    Response: {spendable: bool} — true only if ALL coins are spendable.
+
+    Returns True/False, or None on RPC failure.
+    """
+    return _are_coins_spendable_rpc(coin_ids)
+
+
+def get_selectable_coins_map(wallet_id: int) -> Optional[Dict]:
+    """Get all selectable (spendable/free) coins as a map.
+
+    Returns dict: {normalized_coin_id: amount_mojos}
+    """
+    if _is_cat_wallet(wallet_id):
+        asset_id = _get_cat_asset_id()
+        if not asset_id:
+            return None
+    else:
+        asset_id = None
+
+    result = rpc("get_coins", {
+        "asset_id": asset_id,
+        "offset": 0, "limit": 500,
+        "filter_mode": "selectable",
+    }, timeout=15)
+
+    if not result:
+        return None
+
+    coins = result.get("coins") or result.get("records") or result.get("data") or []
+    coin_map = {}
+    for c in coins:
+        cid = c.get("coin_id", "")
+        if cid:
+            if not cid.startswith("0x"):
+                cid = "0x" + cid.lower()
+            else:
+                cid = cid.lower()
+            coin_map[cid] = int(c.get("amount", "0"))
+    return coin_map
+
+
+# ============================================================================
+# SAGE-SPECIFIC FEATURES (not available in Chia wallet)
+# ============================================================================
+
+def auto_combine_xch(fee_mojos: int = 0, max_coins: int = 500):
+    """Auto-combine small XCH coins into larger ones.
+    Sage's smart combining — picks the optimal coins automatically.
+    Requires max_coins parameter (max number of coins to combine per call).
+    """
+    if not _require_signing_capability():
+        return {"success": False, "error": "Watch-only wallet cannot auto-combine XCH coins"}
+    payload = {
+        "fee": str(int(fee_mojos)),
+        "max_coins": max_coins,
+        "auto_submit": True,  # CRITICAL: without this, Sage plans but never sends
+    }
+    result = rpc("auto_combine_xch", payload, timeout=120)
+    if WALLET_DEBUG:
+        print(f"  [Sage] auto_combine_xch result: {result}")
+    return result
+
+
+def auto_combine_cat(asset_id: str = None, fee_mojos: int = 0, max_coins: int = 500):
+    """Auto-combine small CAT coins into larger ones.
+    Sage picks the optimal coins for the given CAT asset.
+    Requires max_coins parameter (max number of coins to combine per call).
+    """
+    if not _require_signing_capability():
+        return {"success": False, "error": "Watch-only wallet cannot auto-combine CAT coins"}
+    if asset_id is None:
+        asset_id = _get_cat_asset_id()
+    if not asset_id:
+        print("❌ [Sage] No CAT_ASSET_ID — cannot auto-combine CATs")
+        return None
+
+    payload = {
+        "asset_id": asset_id,
+        "fee": str(int(fee_mojos)),
+        "max_coins": max_coins,
+        "auto_submit": True,  # CRITICAL: without this, Sage plans but never sends
+    }
+    result = rpc("auto_combine_cat", payload, timeout=120)
+    if WALLET_DEBUG:
+        print(f"  [Sage] auto_combine_cat result: {result}")
+    return result
+
+
+def delete_offer(offer_id: str) -> bool:
+    """Delete an offer record from Sage's local database.
+
+    This is a LOCAL operation only — it does NOT cancel the offer on-chain.
+    Use this to clean up completed, cancelled, or expired offers that are
+    cluttering Sage's offer list. The offer must already be in a terminal
+    state (cancelled/completed/expired) before calling this.
+
+    Args:
+        offer_id: The offer/trade ID to delete (hex string, with or without 0x)
+
+    Returns:
+        True if successfully deleted, False on error.
+    """
+    bare_id = offer_id.replace("0x", "")
+    try:
+        result = _sage_post("delete_offer", {"offer_id": bare_id}, timeout=10)
+        if WALLET_DEBUG:
+            print(f"   [Sage] delete_offer {bare_id[:16]}... → {result}")
+        if not result or not result.get("success"):
+            err = result.get("error", "unknown error") if result else "no response"
+            if not _quiet_mode:
+                print(f"   ⚠️ [Sage] delete_offer {bare_id[:16]}... returned failure: {err}")
+            return False
+        return True
+    except Exception as e:
+        if not _quiet_mode:
+            print(f"   ⚠️ [Sage] delete_offer {bare_id[:16]}... failed: {e}")
+        return False
+
+
+def delete_offers_batch(offer_ids: list) -> dict:
+    """Delete multiple offer records from Sage's local database.
+
+    Iterates through the list and deletes each one. Returns summary.
+
+    Args:
+        offer_ids: List of offer/trade IDs to delete
+
+    Returns:
+        dict with 'deleted' and 'failed' counts
+    """
+    deleted = 0
+    failed = 0
+    for oid in offer_ids:
+        if delete_offer(oid):
+            deleted += 1
+        else:
+            failed += 1
+        time.sleep(0.1)  # Small delay to not hammer Sage
+    return {"deleted": deleted, "failed": failed}
+
+
+# REMOVED: duplicate get_spendable_coin_count() that shadowed the correct
+# implementation at line ~796. The correct version uses Sage's documented
+# get_spendable_coin_count endpoint. This duplicate used get_coins with
+# filter_mode=selectable approximation. See Codex audit item 4.3.
+
+
+def get_sage_version() -> str:
+    """Get Sage wallet version for health diagnostics."""
+    try:
+        result = rpc("get_version", {}, timeout=3)
+        if result and isinstance(result, dict):
+            return result.get("version", "unknown")
+        elif result and isinstance(result, str):
+            return result
+    except Exception:
+        pass
+    return "unknown"
+
+
+def view_offer(offer_bech32: str):
+    """Parse an offer string without importing it.
+    Returns the offer details (what's being offered/requested).
+    Useful for inspecting incoming Splash/Dexie offers before taking them.
+    """
+    try:
+        result = rpc("view_offer", {"offer": offer_bech32}, timeout=10)
+        return result
+    except Exception as e:
+        print(f"❌ [Sage] view_offer failed: {e}")
+        return None
+
+
+# ============================================================================
+# COIN MANAGEMENT HELPERS
+# ============================================================================
+
+def cat_to_mojos(amount: Decimal, decimals: int) -> int:
+    """Convert CAT amount to mojos."""
+    scale = Decimal(10) ** Decimal(decimals)
+    return int((amount * scale).to_integral_value(ROUND_DOWN))
+
+
+def xch_to_mojos(amount: Decimal) -> int:
+    """Convert XCH amount to mojos (1 XCH = 1e12 mojos)."""
+    return int((amount * Decimal("1000000000000")).to_integral_value(ROUND_DOWN))
+
+
+def prepare_coins_for_trading(
+    xch_wallet_id: int,
+    cat_wallet_id: int,
+    num_buy_offers: int,
+    num_sell_offers: int,
+    xch_per_offer: Decimal,
+    cat_per_offer: Decimal,
+    cat_decimals: int = 3,
+    reserve_multiplier: float = 2.0,
+) -> Dict[str, Any]:
+    """Prepare optimal coin structure for market making.
+
+    Same logic as Chia version — uses Sage's split endpoints internally.
+    """
+    print("\n🪙 [Sage] Starting smart coin preparation...")
+    print(f"📊 Requirements: {num_buy_offers} buy × {xch_per_offer} XCH, {num_sell_offers} sell × {cat_per_offer} CAT")
+
+    xch_mojos_per_coin = xch_to_mojos(xch_per_offer)
+    cat_mojos_per_coin = cat_to_mojos(cat_per_offer, cat_decimals)
+
+    # Check existing coins
+    xch_coins = count_suitable_coins(xch_wallet_id, xch_mojos_per_coin, is_cat=False)
+    cat_coins = count_suitable_coins(cat_wallet_id, cat_mojos_per_coin, is_cat=True, decimals=cat_decimals)
+
+    xch_needed = max(0, num_buy_offers - xch_coins)
+    cat_needed = max(0, num_sell_offers - cat_coins)
+
+    print(f"📊 XCH: Have {xch_coins}, need {num_buy_offers}, will create {xch_needed}")
+    print(f"📊 CAT: Have {cat_coins}, need {num_sell_offers}, will create {cat_needed}")
+
+    status = {
+        "xch": {"existing": xch_coins, "needed": xch_needed, "created": 0, "success": True},
+        "cat": {"existing": cat_coins, "needed": cat_needed, "created": 0, "success": True},
+    }
+
+    # Split XCH if needed
+    if xch_needed > 0:
+        result = split_coins_bulk(
+            wallet_id=xch_wallet_id,
+            num_coins=xch_needed,
+            coin_size_mojos=xch_mojos_per_coin,
+            fee_mojos=get_effective_transaction_fee_mojos(),
+            reserve_multiplier=reserve_multiplier,
+            is_cat=False
+        )
+        if result and result.get("success"):
+            status["xch"]["created"] = result.get("coins_created", 0)
+        else:
+            status["xch"]["success"] = False
+            status["xch"]["error"] = result.get("error", "Unknown") if result else "Split failed"
+            return {"success": False, "status": status}
+
+    # Split CAT if needed
+    if cat_needed > 0:
+        result = split_coins_bulk(
+            wallet_id=cat_wallet_id,
+            num_coins=cat_needed,
+            coin_size_mojos=float(cat_per_offer),
+            fee_mojos=get_effective_transaction_fee_mojos(),
+            reserve_multiplier=reserve_multiplier,
+            is_cat=True,
+            cat_decimals=cat_decimals
+        )
+        if result and result.get("success"):
+            status["cat"]["created"] = result.get("coins_created", 0)
+        else:
+            status["cat"]["success"] = False
+            status["cat"]["error"] = result.get("error", "Unknown") if result else "Split failed"
+            return {"success": False, "status": status}
+
+    # Wait for confirmations
+    if xch_needed > 0 or cat_needed > 0:
+        print("🪙 [Sage] Waiting for coin confirmations...")
+
+        if xch_needed > 0:
+            max_wait = 300
+            start_time = time.time()
+            while (time.time() - start_time) < max_wait:
+                current = count_suitable_coins(xch_wallet_id, xch_mojos_per_coin, is_cat=False)
+                if current - xch_coins >= xch_needed:
+                    break
+                time.sleep(10)
+
+        if cat_needed > 0:
+            max_wait = 300
+            start_time = time.time()
+            while (time.time() - start_time) < max_wait:
+                current = count_suitable_coins(cat_wallet_id, cat_mojos_per_coin, is_cat=True, decimals=cat_decimals)
+                if current - cat_coins >= cat_needed:
+                    break
+                time.sleep(10)
+
+    print("✅ [Sage] Coin preparation complete!")
+    return {"success": True, "status": status}
+
+
+def prepare_coins_for_offers_v2(
+    xch_wallet_id: int,
+    cat_wallet_id: int,
+    num_buy_offers: int,
+    num_sell_offers: int,
+    xch_per_offer_mojos: int,
+    cat_per_offer_mojos: int,
+    xch_spendable_mojos: int,
+    cat_spendable_mojos: int,
+    xch_reserve_mojos: int = 0,
+    cat_reserve_mojos: int = 0,
+    progress_callback=None
+) -> Dict:
+    """V2 coin preparation — matches wallet_chia.py signature exactly."""
+    result = {
+        'success': False,
+        'xch_coins_created': 0,
+        'cat_coins_created': 0,
+        'xch_coins_ready': 0,
+        'cat_coins_ready': 0,
+        'message': ''
+    }
+
+    def update_progress(status, xch_done=0, xch_total=0, cat_done=0, cat_total=0):
+        if progress_callback:
+            progress_callback({
+                'status': status,
+                'xch_progress': {'done': xch_done, 'total': xch_total},
+                'cat_progress': {'done': cat_done, 'total': cat_total}
+            })
+
+    try:
+        update_progress("Calculating requirements...")
+
+        xch_needed_total = num_buy_offers * xch_per_offer_mojos
+        cat_needed_total = num_sell_offers * cat_per_offer_mojos
+
+        if (xch_spendable_mojos - xch_needed_total) < xch_reserve_mojos:
+            result['message'] = f"Insufficient XCH balance"
+            return result
+
+        if (cat_spendable_mojos - cat_needed_total) < cat_reserve_mojos:
+            result['message'] = f"Insufficient CAT balance"
+            return result
+
+        update_progress("Checking existing coins...")
+
+        xch_existing = count_suitable_coins(xch_wallet_id, xch_per_offer_mojos, tolerance=0.25)
+        cat_existing = count_suitable_coins(cat_wallet_id, cat_per_offer_mojos, tolerance=0.25)
+
+        xch_to_create = max(0, num_buy_offers - xch_existing)
+        cat_to_create = max(0, num_sell_offers - cat_existing)
+
+        result['xch_coins_ready'] = xch_existing
+        result['cat_coins_ready'] = cat_existing
+
+        if xch_to_create == 0 and cat_to_create == 0:
+            result['success'] = True
+            result['message'] = "All coins already prepared!"
+            return result
+
+        if xch_to_create > 0:
+            update_progress(f"Splitting {xch_to_create} XCH coins...")
+            split_result = split_coins_bulk(
+                wallet_id=xch_wallet_id,
+                num_coins=xch_to_create,
+                coin_size_mojos=xch_per_offer_mojos,
+                fee_mojos=get_effective_transaction_fee_mojos()
+            )
+            if not split_result or not split_result.get("success"):
+                result['message'] = f"Failed to split XCH coins"
+                return result
+            result['xch_coins_created'] = xch_to_create
+
+            confirmed = wait_for_coin_confirmations(
+                wallet_id=xch_wallet_id,
+                target_coin_size_mojos=xch_per_offer_mojos,
+                target_count=num_buy_offers,
+                max_wait_seconds=180,
+            )
+            if not confirmed:
+                result['message'] = "Timeout waiting for XCH coins"
+                return result
+            result['xch_coins_ready'] = count_suitable_coins(xch_wallet_id, xch_per_offer_mojos)
+
+        if cat_to_create > 0:
+            update_progress(f"Splitting {cat_to_create} CAT coins...")
+            split_result = split_coins_bulk(
+                wallet_id=cat_wallet_id,
+                num_coins=cat_to_create,
+                coin_size_mojos=cat_per_offer_mojos,
+                fee_mojos=get_effective_transaction_fee_mojos()
+            )
+            if not split_result or not split_result.get("success"):
+                result['message'] = f"Failed to split CAT coins"
+                return result
+            result['cat_coins_created'] = cat_to_create
+
+            confirmed = wait_for_coin_confirmations(
+                wallet_id=cat_wallet_id,
+                target_coin_size_mojos=cat_per_offer_mojos,
+                target_count=num_sell_offers,
+                max_wait_seconds=180,
+            )
+            if not confirmed:
+                result['message'] = "Timeout waiting for CAT coins"
+                return result
+            result['cat_coins_ready'] = count_suitable_coins(cat_wallet_id, cat_per_offer_mojos)
+
+        result['success'] = True
+        result['message'] = f"✅ Created {result['xch_coins_created']} XCH and {result['cat_coins_created']} CAT coins!"
+        return result
+
+    except Exception as e:
+        result['message'] = f"Error preparing coins: {e}"
+        import traceback
+        print(traceback.format_exc())
+        return result

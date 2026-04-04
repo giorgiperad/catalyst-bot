@@ -1,0 +1,12 @@
+[package]
+name = "chia-market-maker-tauri"
+version = "4.0.0"
+edition = "2021"
+description = "Tauri desktop shell for Chia Market Maker"
+publish = false
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }

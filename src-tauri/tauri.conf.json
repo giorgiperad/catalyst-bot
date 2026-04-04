@@ -1,0 +1,22 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Chia Market Maker",
+  "version": "4.0.0",
+  "identifier": "com.monkeyzoo.chia-market-maker",
+  "build": {
+    "frontendDist": "../tauri-shell"
+  },
+  "app": {
+    "security": {
+      "csp": "default-src 'self' http://127.0.0.1:5000; script-src 'self' 'unsafe-inline' http://127.0.0.1:5000; style-src 'self' 'unsafe-inline' http://127.0.0.1:5000 https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; connect-src 'self' http://127.0.0.1:5000; img-src 'self' http://127.0.0.1:5000 data:; frame-ancestors 'none'"
+    },
+    "windows": []
+  },
+  "bundle": {
+    "active": false,
+    "icon": [
+      "../bot_icon_new.png",
+      "../bot_icon_new.ico"
+    ]
+  }
+}

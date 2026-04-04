@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bot Console — Live Logs</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html {
+            scrollbar-gutter: stable;
+        }
+        html, body, * {
+            scrollbar-width: thin;
+            scrollbar-color: rgba(96, 165, 250, 0.76) rgba(15, 23, 42, 0.28);
+        }
+        *::-webkit-scrollbar {
+            width: 12px;
+            height: 12px;
+        }
+        *::-webkit-scrollbar-track {
+            background: linear-gradient(180deg, rgba(15, 23, 42, 0.12), rgba(15, 23, 42, 0.28));
+            border-radius: 999px;
+            border: 1px solid rgba(148, 163, 184, 0.08);
+        }
+        *::-webkit-scrollbar-thumb {
+            background: linear-gradient(180deg, rgba(71, 85, 105, 0.94), rgba(96, 165, 250, 0.72));
+            border-radius: 999px;
+            border: 2px solid rgba(10, 14, 23, 0.72);
+            box-shadow:
+                inset 0 0 0 1px rgba(255, 255, 255, 0.08),
+                0 0 10px rgba(59, 130, 246, 0.14);
+        }
+        *::-webkit-scrollbar-thumb:hover {
+            background: linear-gradient(180deg, rgba(96, 165, 250, 0.88), rgba(129, 140, 248, 0.82));
+        }
+        *::-webkit-scrollbar-corner {
+            background: transparent;
+        }
+        body {
+            background: #0d0d1a;
+            color: #c8c8d0;
+            font-family: 'Consolas', 'Courier New', monospace;
+            font-size: 13px;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        .toolbar {
+            background: #1a1a2e;
+            padding: 8px 16px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            border-bottom: 1px solid #2a2a4a;
+            flex-shrink: 0;
+        }
+        .toolbar h1 {
+            font-size: 14px;
+            color: #e0e0e8;
+            font-weight: 600;
+        }
+        .status-dot {
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            background: #666;
+            transition: background 0.3s;
+        }
+        .status-dot.connected { background: #4ade80; }
+        .status-dot.disconnected { background: #ef4444; }
+        .toolbar-spacer { flex: 1; }
+        .toolbar button {
+            background: #2a2a4a;
+            color: #c8c8d0;
+            border: 1px solid #3a3a5a;
+            padding: 4px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            font-family: inherit;
+        }
+        .toolbar button:hover { background: #3a3a5a; }
+        .filter-group {
+            display: flex;
+            gap: 4px;
+        }
+        .filter-btn {
+            background: transparent;
+            color: #888;
+            border: 1px solid #333;
+            padding: 3px 8px;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 11px;
+            font-family: inherit;
+        }
+        .filter-btn.active { color: #e0e0e8; border-color: #5a5a8a; background: #2a2a4a; }
+        .filter-btn.sev-info.active { border-color: #3b82f6; }
+        .filter-btn.sev-success.active { border-color: #4ade80; }
+        .filter-btn.sev-warning.active { border-color: #f59e0b; }
+        .filter-btn.sev-error.active { border-color: #ef4444; }
+        #log-container {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px 16px;
+            scroll-behavior: smooth;
+        }
+        .log-entry {
+            padding: 2px 0;
+            line-height: 1.5;
+            border-bottom: 1px solid #1a1a2e;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        .log-entry:hover { background: #1a1a2e; }
+        .ts { color: #666; }
+        .sev-info { color: #60a5fa; }
+        .sev-success { color: #4ade80; }
+        .sev-warning { color: #fbbf24; }
+        .sev-error { color: #f87171; font-weight: bold; }
+        .sev-debug { color: #888; font-style: italic; }
+        .evt-type { color: #a78bfa; }
+        .msg { color: #d1d5db; }
+        .repeat-badge {
+            display: inline-block;
+            background: #3a3a5a;
+            color: #a0a0b0;
+            font-size: 10px;
+            padding: 1px 5px;
+            border-radius: 8px;
+            margin-left: 6px;
+        }
+        .counter {
+            color: #888;
+            font-size: 11px;
+        }
+        #search {
+            background: #0d0d1a;
+            color: #c8c8d0;
+            border: 1px solid #3a3a5a;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-family: inherit;
+            width: 180px;
+        }
+        #search::placeholder { color: #555; }
+    </style>
+</head>
+<body>
+    <div class="toolbar">
+        <div class="status-dot" id="statusDot"></div>
+        <h1>Live Console</h1>
+        <span class="counter" id="counter">0 events</span>
+        <div class="toolbar-spacer"></div>
+        <input type="text" id="search" placeholder="Filter messages...">
+        <div class="filter-group">
+            <button class="filter-btn sev-info active" data-sev="info">Info</button>
+            <button class="filter-btn sev-success active" data-sev="success">Success</button>
+            <button class="filter-btn sev-warning active" data-sev="warning">Warn</button>
+            <button class="filter-btn sev-error active" data-sev="error">Error</button>
+            <button class="filter-btn" data-sev="debug">Debug</button>
+        </div>
+        <button id="autoScrollBtn" title="Toggle auto-scroll">⬇ Auto</button>
+        <button id="clearBtn">Clear</button>
+    </div>
+    <div id="log-container"></div>
+
+    <script>
+        const API_URL = window.location.origin;
+        const LOCAL_API_TOKEN = window.__BOT_LOCAL_TOKEN || '';
+        const LOCAL_API_TOKEN_HEADER = window.__BOT_LOCAL_TOKEN_HEADER || 'X-Bot-Local-Token';
+        const logContainer = document.getElementById('log-container');
+        const statusDot = document.getElementById('statusDot');
+        const counterEl = document.getElementById('counter');
+        const searchInput = document.getElementById('search');
+        let autoScroll = true;
+        let eventCount = 0;
+        let allEntries = [];
+        // Debug OFF by default — user toggles it on if needed for fault-finding
+        let activeFilters = new Set(['info', 'success', 'warning', 'error']);
+        let searchTerm = '';
+
+        // --- Deduplication: collapse repeated identical event_type + message ---
+        let lastEventKey = '';  // "eventType|message"
+        let lastEntry = null;
+        let repeatCount = 0;
+
+        // --- Noise filter: event types that are too noisy for the console ---
+        // These fire every loop cycle and add no diagnostic value.
+        // Debug events are already hidden by default filter.
+        const NOISE_EVENTS = new Set([
+            'loop_timing',          // Every cycle — pure stats
+            'price_cache_hit',      // Every cycle when cache valid
+            'sse_keepalive',        // Heartbeats
+        ]);
+
+        function buildLocalApiUrl(input) {
+            try {
+                const url = new URL(
+                    input instanceof URL ? input.href : String(input),
+                    window.location.origin
+                );
+                if (LOCAL_API_TOKEN && url.origin === window.location.origin && url.pathname === '/api/events') {
+                    url.searchParams.set('_local_token', LOCAL_API_TOKEN);
+                }
+                return url.toString();
+            } catch (e) {
+                return input;
+            }
+        }
+
+        (function patchLocalApiFetch() {
+            const nativeFetch = window.fetch.bind(window);
+            window.fetch = function(input, init) {
+                try {
+                    const url = new URL(
+                        input instanceof URL ? input.href : String(input),
+                        window.location.origin
+                    );
+                    if (LOCAL_API_TOKEN && url.origin === window.location.origin && url.pathname.startsWith('/api/')) {
+                        const options = init ? { ...init } : {};
+                        const headers = new Headers(options.headers || undefined);
+                        headers.set(LOCAL_API_TOKEN_HEADER, LOCAL_API_TOKEN);
+                        options.headers = headers;
+                        return nativeFetch(buildLocalApiUrl(input), options);
+                    }
+                } catch (e) {}
+                return nativeFetch(input, init);
+            };
+        })();
+
+        // --- SSE Connection ---
+        function connectSSE() {
+            const es = new EventSource(buildLocalApiUrl(`${API_URL}/api/events`));
+            es.onopen = () => {
+                statusDot.className = 'status-dot connected';
+            };
+            es.onmessage = (e) => {
+                try {
+                    const msg = JSON.parse(e.data);
+                    if (msg.type === 'log' || msg.type === 'event') {
+                        addLogEntry(msg.data || msg);
+                    }
+                } catch (err) {
+                    // Non-JSON keepalive, ignore
+                }
+            };
+            es.onerror = () => {
+                statusDot.className = 'status-dot disconnected';
+                setTimeout(connectSSE, 3000);
+            };
+        }
+
+        // --- Load recent events from DB ---
+        async function loadHistory() {
+            try {
+                const resp = await fetch(`${API_URL}/api/logs?limit=200`);
+                if (!resp.ok) return;
+                const data = await resp.json();
+                const events = data.logs || data.events || data || [];
+                // Add oldest first
+                const sorted = events.reverse();
+                sorted.forEach(evt => addLogEntry(evt, false));
+                scrollToBottom();
+            } catch (e) {
+                addLogEntry({
+                    severity: 'warning',
+                    event_type: 'console',
+                    message: `Could not load history: ${e.message}`,
+                    timestamp: new Date().toISOString()
+                });
+            }
+        }
+
+        function addLogEntry(data, scroll = true) {
+            const severity = data.severity || 'info';
+            const eventType = data.event_type || '';
+            const message = data.message || '';
+            const timestamp = data.timestamp || new Date().toISOString();
+            const ts = timestamp.substring(11, 23); // HH:MM:SS.mmm
+
+            // Skip noise events entirely
+            if (NOISE_EVENTS.has(eventType)) return;
+
+            eventCount++;
+            counterEl.textContent = `${eventCount} events`;
+
+            // --- Deduplication: if same event_type + message as last, increment badge ---
+            const eventKey = eventType + '|' + message;
+            if (eventKey === lastEventKey && lastEntry && lastEntry.el) {
+                repeatCount++;
+                let badge = lastEntry.el.querySelector('.repeat-badge');
+                if (!badge) {
+                    badge = document.createElement('span');
+                    badge.className = 'repeat-badge';
+                    lastEntry.el.appendChild(badge);
+                }
+                badge.textContent = '×' + (repeatCount + 1);
+                // Update the timestamp on the existing entry
+                const tsSpan = lastEntry.el.querySelector('.ts');
+                if (tsSpan) tsSpan.textContent = ts;
+                if (scroll && autoScroll) scrollToBottom();
+                return;
+            }
+            // New unique entry — reset dedup
+            lastEventKey = eventKey;
+            repeatCount = 0;
+
+            const entry = { severity, eventType, message, ts, el: null };
+            allEntries.push(entry);
+
+            const div = document.createElement('div');
+            div.className = 'log-entry';
+            div.dataset.severity = severity;
+            div.innerHTML = `<span class="ts">${escapeHtml(ts)}</span> `
+                + `<span class="sev-${escapeHtml(severity)}">[${escapeHtml(severity).toUpperCase()}]</span> `
+                + `<span class="evt-type">${escapeHtml(eventType)}</span> `
+                + `<span class="msg">${escapeHtml(message)}</span>`;
+
+            entry.el = div;
+            lastEntry = entry;
+
+            // Apply current filters
+            const visible = activeFilters.has(severity)
+                && (!searchTerm || message.toLowerCase().includes(searchTerm)
+                    || eventType.toLowerCase().includes(searchTerm));
+            div.style.display = visible ? '' : 'none';
+
+            logContainer.appendChild(div);
+
+            if (scroll && autoScroll) {
+                scrollToBottom();
+            }
+
+            // Trim to 2000 entries max
+            if (allEntries.length > 2000) {
+                const removed = allEntries.shift();
+                if (removed.el && removed.el.parentNode) {
+                    removed.el.parentNode.removeChild(removed.el);
+                }
+            }
+        }
+
+        function scrollToBottom() {
+            logContainer.scrollTop = logContainer.scrollHeight;
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function applyFilters() {
+            allEntries.forEach(entry => {
+                if (!entry.el) return;
+                const visible = activeFilters.has(entry.severity)
+                    && (!searchTerm || entry.message.toLowerCase().includes(searchTerm)
+                        || entry.eventType.toLowerCase().includes(searchTerm));
+                entry.el.style.display = visible ? '' : 'none';
+            });
+        }
+
+        // --- Event listeners ---
+        document.querySelectorAll('.filter-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const sev = btn.dataset.sev;
+                btn.classList.toggle('active');
+                if (activeFilters.has(sev)) {
+                    activeFilters.delete(sev);
+                } else {
+                    activeFilters.add(sev);
+                }
+                applyFilters();
+            });
+        });
+
+        searchInput.addEventListener('input', () => {
+            searchTerm = searchInput.value.toLowerCase();
+            applyFilters();
+        });
+
+        document.getElementById('autoScrollBtn').addEventListener('click', function() {
+            autoScroll = !autoScroll;
+            this.style.opacity = autoScroll ? 1 : 0.5;
+            if (autoScroll) scrollToBottom();
+        });
+
+        document.getElementById('clearBtn').addEventListener('click', () => {
+            logContainer.innerHTML = '';
+            allEntries = [];
+            eventCount = 0;
+            counterEl.textContent = '0 events';
+            lastEventKey = '';
+            lastEntry = null;
+            repeatCount = 0;
+        });
+
+        // Detect manual scroll
+        logContainer.addEventListener('scroll', () => {
+            const atBottom = logContainer.scrollHeight - logContainer.scrollTop - logContainer.clientHeight < 50;
+            if (!atBottom && autoScroll) {
+                // User scrolled up — pause auto-scroll
+            }
+        });
+
+        // --- Init ---
+        // No history load — console starts fresh, shows only live events.
+        // Historical logs available via superlog files or Debug Logs download.
+        connectSSE();
+    </script>
+</body>
+</html>

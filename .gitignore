@@ -1,0 +1,97 @@
+# ============================================================
+# Chia Market Maker — .gitignore
+# Review before every commit. If it's not here, it might go up.
+# ============================================================
+
+# --- Secrets & environment ---
+.env
+.env.*
+user_secrets.json
+secrets.json
+
+# --- SSL / TLS certs and keys (Sage wallet mTLS) ---
+sage_client_ssl/
+*.key
+*.pem
+*.crt
+*.cert
+*.p12
+*.pfx
+
+# --- Live databases ---
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+bot_backup_*.db
+bot_backup_*/
+tmp_db_*
+
+# --- Log files ---
+*.log
+tauri_backend_stdout.log
+coin_prep_output.log
+bot_superlog_*.log
+crash.log
+
+# --- Runtime archive files ---
+superlog_archive.jsonl
+
+# --- Runtime state files (regenerated on start) ---
+coin_prep_status.json
+coin_prep_last.json
+designation_debug.json
+worker_cancelled_ids.json
+.fresh_start_chosen
+*.tmp
+*.temp
+
+# --- Python cache ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+*.egg
+
+# --- Rust / Tauri build artefacts ---
+src-tauri/target/
+
+# --- Backup and archive directories (large, no public value) ---
+_backups/
+_archive/
+_tauri_release_runtime_monitor/
+tauri-shell/
+
+# --- OS / editor junk ---
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+.idea/
+.vscode/settings.json
+*.iml
+
+# --- PyInstaller build output ---
+*.spec
+dist/
+build/
+
+# --- Runtime lock files (NOT Cargo.lock — that should be committed for apps) ---
+.tauri-instance.lock
+
+# --- Compiled binaries (not suitable for source repo) ---
+# splash.exe ships as a separate download, not via git
+splash.exe
+splash.exe.bak
+*.exe
+*.exe.bak
+
+# --- Misc ---
+tmp_greenfloor_review/

@@ -1,0 +1,9 @@
+{
+  "name": "chia-market-maker-tauri-shell",
+  "private": true,
+  "version": "0.4.0-beta.1",
+  "scripts": {
+    "tauri:dev": "cargo run --manifest-path src-tauri/Cargo.toml",
+    "tauri:build": "cargo build --manifest-path src-tauri/Cargo.toml --release"
+  }
+}

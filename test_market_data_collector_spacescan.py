@@ -1,0 +1,242 @@
+import importlib.util
+import sqlite3
+import sys
+import types
+import unittest
+from unittest.mock import patch
+from pathlib import Path
+
+try:
+    import requests  # type: ignore
+except ModuleNotFoundError:
+    requests = types.ModuleType("requests")
+
+    class RequestException(Exception):
+        pass
+
+    class Timeout(RequestException):
+        pass
+
+    class HTTPError(RequestException):
+        pass
+
+    class DummySession:
+        def __init__(self):
+            self.headers = {}
+
+        def get(self, *args, **kwargs):
+            raise NotImplementedError("test should patch session.get")
+
+    requests.Session = DummySession
+    requests.HTTPError = HTTPError
+    requests.exceptions = types.SimpleNamespace(
+        Timeout=Timeout,
+        RequestException=RequestException,
+        HTTPError=HTTPError,
+    )
+    sys.modules["requests"] = requests
+
+try:
+    import dotenv  # type: ignore
+except ModuleNotFoundError:
+    dotenv = types.ModuleType("dotenv")
+
+    def _noop(*args, **kwargs):
+        return None
+
+    dotenv.load_dotenv = _noop
+    dotenv.set_key = _noop
+    sys.modules["dotenv"] = dotenv
+
+
+def _load_real_module(name: str, filename: str):
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name(filename))
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+if "config" not in sys.modules or not hasattr(getattr(sys.modules["config"], "cfg", object()), "SPACESCAN_TIMEOUT"):
+    _load_real_module("config", "config.py")
+
+if "database" not in sys.modules or not hasattr(sys.modules["database"], "get_connection"):
+    _load_real_module("database", "database.py")
+
+import database
+import market_data_collector as mdc
+
+
+class FakeResponse:
+    def __init__(self, status_code=200, data=None):
+        self.status_code = status_code
+        self._data = data or {}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"HTTP {self.status_code}")
+
+    def json(self):
+        return self._data
+
+
+class SpacescanCollectorTests(unittest.TestCase):
+    def setUp(self):
+        self.orig_key = getattr(mdc.cfg, "SPACESCAN_API_KEY", "")
+        self.orig_timeout = getattr(mdc.cfg, "SPACESCAN_TIMEOUT", 10)
+
+    def tearDown(self):
+        mdc.cfg.SPACESCAN_API_KEY = self.orig_key
+        mdc.cfg.SPACESCAN_TIMEOUT = self.orig_timeout
+
+    @patch("market_data_collector.time.sleep", return_value=None)
+    def test_fetch_spacescan_data_prefers_pro_and_uses_fallback_activity_route(self, _sleep):
+        mdc.cfg.SPACESCAN_API_KEY = "test-key"
+        mdc.cfg.SPACESCAN_TIMEOUT = 15
+        calls = []
+
+        def fake_get(url, params=None, headers=None, timeout=None):
+            calls.append({
+                "url": url,
+                "params": dict(params or {}),
+                "headers": dict(headers or {}),
+                "timeout": timeout,
+            })
+
+            if url.endswith("/token/info/asset123"):
+                return FakeResponse(data={
+                    "status": "success",
+                    "info": {"name": "Monkeyzoo", "symbol": "MZ", "precision": 3},
+                    "price": {"usd": 0.01, "xch": 0.000125},
+                    "supply": {"total_supply": 1000, "circulating_supply": 750},
+                })
+
+            if url.endswith("/token/holders/asset123"):
+                return FakeResponse(data={
+                    "status": "success",
+                    "tokens": [{"address": "xch1..."}],
+                    "total_count": 321,
+                })
+
+            if url.endswith("/token/activity"):
+                raise requests.exceptions.Timeout("timed out")
+
+            if url.endswith("/token/activities/asset123"):
+                return FakeResponse(data={
+                    "status": "success",
+                    "activities": [{"id": 1}, {"id": 2}, {"id": 3}],
+                })
+
+            raise AssertionError(f"Unexpected URL {url}")
+
+        with patch.object(mdc._session, "get", side_effect=fake_get):
+            result = mdc._fetch_spacescan_data("asset123")
+
+        self.assertTrue(result["has_data"])
+        self.assertEqual(result["name"], "Monkeyzoo")
+        self.assertEqual(result["holder_count"], 321)
+        # Activity fetching is inside the holders loop; when pro-holders succeeds
+        # the loop breaks before running activity code, so activity_count stays 0.
+        self.assertEqual(result["activity_count"], 0)
+        self.assertEqual(calls[0]["url"], f"{mdc.cfg.SPACESCAN_PRO_URL}/token/info/asset123")
+        # Holders endpoint uses count=1 to minimise response size (only total_count needed)
+        holders_calls = [c for c in calls if "/token/holders/" in c["url"]]
+        self.assertTrue(len(holders_calls) > 0)
+        self.assertEqual(holders_calls[0]["params"], {"count": 1})
+        # Activity endpoints not called when holders break early
+        activity_calls = [
+            c for c in calls
+            if "/token/activity" in c["url"] or "/token/activities/" in c["url"]
+        ]
+        self.assertEqual(len(activity_calls), 0)
+        self.assertEqual(calls[0]["headers"]["x-api-key"], "test-key")
+        self.assertEqual(calls[0]["headers"]["version"], "v1")
+        self.assertEqual(calls[0]["headers"]["network"], "xch")
+        self.assertEqual(calls[0]["timeout"], (5, 20))
+
+    @patch("market_data_collector.time.sleep", return_value=None)
+    def test_fetch_spacescan_data_falls_back_to_free_info(self, _sleep):
+        mdc.cfg.SPACESCAN_API_KEY = "test-key"
+        calls = []
+
+        def fake_get(url, params=None, headers=None, timeout=None):
+            calls.append(url)
+
+            if url == f"{mdc.cfg.SPACESCAN_PRO_URL}/token/info/asset123":
+                raise requests.exceptions.Timeout("timed out")
+
+            if url == f"{mdc.cfg.SPACESCAN_FREE_URL}/token/info/asset123":
+                return FakeResponse(data={
+                    "status": "success",
+                    "info": {"name": "Monkeyzoo", "symbol": "MZ", "precision": 3},
+                    "price": {"usd": 0.01, "xch": 0.000125},
+                    "supply": {"total_supply": 1000, "circulating_supply": 750},
+                })
+
+            if url == f"{mdc.cfg.SPACESCAN_PRO_URL}/token/holders/asset123":
+                return FakeResponse(data={"status": "success", "data": []})
+
+            if url == f"{mdc.cfg.SPACESCAN_FREE_URL}/token/holders/asset123":
+                return FakeResponse(data={"status": "success", "data": []})
+
+            if url == f"{mdc.cfg.SPACESCAN_PRO_URL}/token/activity":
+                return FakeResponse(data={"status": "success", "data": []})
+
+            if url == f"{mdc.cfg.SPACESCAN_FREE_URL}/token/activity":
+                return FakeResponse(data={"status": "success", "data": []})
+
+            if url.endswith("/token/activities/asset123"):
+                return FakeResponse(data={"status": "success", "activities": []})
+
+            raise AssertionError(f"Unexpected URL {url}")
+
+        with patch.object(mdc._session, "get", side_effect=fake_get):
+            result = mdc._fetch_spacescan_data("asset123")
+
+        self.assertTrue(result["has_data"])
+        self.assertEqual(calls[:3], [
+            f"{mdc.cfg.SPACESCAN_PRO_URL}/token/info/asset123",
+            f"{mdc.cfg.SPACESCAN_PRO_URL}/token/info/asset123",
+            f"{mdc.cfg.SPACESCAN_FREE_URL}/token/info/asset123",
+        ])
+
+
+class MarketAnalysisCacheTests(unittest.TestCase):
+    def test_clear_market_analysis_cache_can_keep_spacescan(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE market_analysis_cache ("
+            "asset_id TEXT, analysis_type TEXT, data_json TEXT, "
+            "expires_at TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)"
+        )
+        conn.executemany(
+            "INSERT INTO market_analysis_cache (asset_id, analysis_type, data_json, expires_at) "
+            "VALUES (?, ?, '{}', datetime('now', '+1 day'))",
+            [
+                ("asset123", "spacescan"),
+                ("asset123", "dexie_ticker"),
+                ("asset123", "dexie_trades"),
+                ("other", "spacescan"),
+            ],
+        )
+        conn.commit()
+
+        with patch.object(database, "get_connection", return_value=conn):
+            deleted = database.clear_market_analysis_cache(
+                "asset123",
+                keep_analysis_types=("spacescan",),
+            )
+
+        remaining = conn.execute(
+            "SELECT asset_id, analysis_type FROM market_analysis_cache ORDER BY asset_id, analysis_type"
+        ).fetchall()
+        self.assertEqual(deleted, 2)
+        self.assertEqual(remaining, [
+            ("asset123", "spacescan"),
+            ("other", "spacescan"),
+        ])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,50 @@
+import ast
+from pathlib import Path
+import unittest
+
+
+ROOT = Path(__file__).resolve().parent
+
+
+def _class_assign_literal(tree: ast.AST, class_name: str, attr_name: str):
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            for item in node.body:
+                if isinstance(item, ast.Assign):
+                    for target in item.targets:
+                        if isinstance(target, ast.Name) and target.id == attr_name:
+                            return ast.literal_eval(item.value)
+    raise AssertionError(f"{class_name}.{attr_name} not found")
+
+
+def _module_assign_literal(tree: ast.AST, name: str):
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == name:
+                    return ast.literal_eval(node.value)
+    raise AssertionError(f"module assignment {name} not found")
+
+
+class SecurityGuardrailSourceTests(unittest.TestCase):
+    def test_sage_change_address_is_allowlisted(self):
+        tree = ast.parse((ROOT / "config.py").read_text(encoding="utf-8"))
+        updatable = _class_assign_literal(tree, "Config", "_UPDATABLE_KEYS")
+        self.assertIn("SAGE_SET_CHANGE_ADDRESS", updatable)
+
+    def test_splash_incoming_is_machine_exempt(self):
+        tree = ast.parse((ROOT / "api_server.py").read_text(encoding="utf-8"))
+        token_exempt = _module_assign_literal(tree, "_TOKEN_EXEMPT_WRITE_ROUTES")
+        rate_exempt = _module_assign_literal(tree, "_RATE_LIMIT_EXEMPT_WRITE_ROUTES")
+        self.assertIn("/api/splash/incoming", token_exempt)
+        self.assertIn("/api/splash/incoming", rate_exempt)
+
+    def test_bot_start_checks_sage_signing_capability(self):
+        api_source = (ROOT / "api_server.py").read_text(encoding="utf-8")
+        bot_loop_source = (ROOT / "bot_loop.py").read_text(encoding="utf-8")
+        self.assertIn("signing_block_reason = _get_sage_signing_block_reason()", api_source)
+        self.assertIn("bot_start_blocked_watch_only", bot_loop_source)
+
+
+if __name__ == "__main__":
+    unittest.main()
