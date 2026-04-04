@@ -20,6 +20,26 @@ Then in JavaScript:
 IMPORTANT: All methods must return JSON-serializable dicts/lists.
 PyWebView serializes them automatically for the JS side.
 No Decimal, no datetime objects — convert to str/float/int.
+
+SECURITY MODEL:
+    The bridge runs IN-PROCESS — it calls Flask route handlers directly via
+    test_request_context(), which bypasses the before_request hooks (loopback
+    check, per-run token validation, rate limiting). This means the bridge has
+    UNAUTHENTICATED access to all bot control endpoints.
+
+    This is acceptable because:
+    1. The bridge is only reachable via window.pywebview.api.* from JavaScript
+       running inside the PyWebView/Tauri desktop window.
+    2. The only way an attacker can invoke bridge methods is by injecting
+       JavaScript into the GUI (XSS). The GUI applies escapeHtml() to all
+       server-sourced data rendered via innerHTML, closing this vector.
+    3. Switching to test_client() with token headers on all 82+ methods would
+       be a massive refactor for no practical gain — the token would need to
+       be embedded in the same process that already has full access.
+
+    If defense-in-depth is desired in the future, a lightweight approach would
+    be to add a per-session nonce check in _safe() that validates a token set
+    during PyWebView initialization. This is Phase 3+ work.
 """
 
 import json
