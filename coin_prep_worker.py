@@ -29,7 +29,7 @@ import subprocess
 import threading
 import re
 from queue import Empty, Full, Queue
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
@@ -1372,7 +1372,7 @@ class CoinPrepWorker:
                     if found_id == wallet_id and current_balance is not None:
                         # We found our wallet and already captured its balance
                         return current_balance
-                except:
+                except (ValueError, IndexError, AttributeError):
                     pass
                 # Reset for next wallet
                 in_wallet_section = False
@@ -1388,7 +1388,7 @@ class CoinPrepWorker:
                         # Get first token (the number before units or mojo)
                         amount_str = value_part.split()[0]
                         current_balance = Decimal(amount_str)
-                except:
+                except (ValueError, IndexError, AttributeError, InvalidOperation):
                     pass
         
         return Decimal("0")

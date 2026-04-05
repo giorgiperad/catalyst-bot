@@ -141,6 +141,7 @@ _RATE_LIMIT_EXEMPT_WRITE_ROUTES = {
 # Simple per-endpoint rate limiter for state-changing operations
 # ---------------------------------------------------------------------------
 _rate_limit_log: dict = {}  # {endpoint: [timestamp, ...]}
+_rate_limit_lock = threading.Lock()
 _RATE_LIMIT_WINDOW = 10     # seconds
 _RATE_LIMIT_MAX = 20        # max requests per window
 
@@ -149,11 +150,12 @@ def _is_rate_limited(endpoint: str) -> bool:
     import time as _rl_time
     now = _rl_time.time()
     cutoff = now - _RATE_LIMIT_WINDOW
-    hits = _rate_limit_log.get(endpoint, [])
-    hits = [t for t in hits if t > cutoff]
-    hits.append(now)
-    _rate_limit_log[endpoint] = hits
-    return len(hits) > _RATE_LIMIT_MAX
+    with _rate_limit_lock:
+        hits = _rate_limit_log.get(endpoint, [])
+        hits = [t for t in hits if t > cutoff]
+        hits.append(now)
+        _rate_limit_log[endpoint] = hits
+        return len(hits) > _RATE_LIMIT_MAX
 
 _dbx_pair_cache = {}
 _LOCAL_API_TOKEN_HEADER = "X-Bot-Local-Token"
