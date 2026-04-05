@@ -264,13 +264,18 @@ def ensure_initialized(force_retry: bool = False) -> bool:
             return False
         _init_last_attempt = now
 
-        # Attempt initialization under the lock
+        # Attempt initialization under the lock.
+        # Some Sage versions don't have /initialize (returns 404) — that's OK,
+        # it means the wallet doesn't require explicit init.
         try:
             result = rpc("initialize", {}, timeout=30)
-            if not _rpc_succeeded(result):
+            if _rpc_succeeded(result):
+                _console("  [Sage] initialize OK")
+            elif isinstance(result, dict) and "404" in str(result.get("error", "")):
+                _console("  [Sage] initialize endpoint not found (Sage version doesn't require it) — OK")
+            else:
                 _console(f"  [Sage] INIT FAILED: initialize returned {result!r}")
                 return False
-            _console("  [Sage] initialize OK")
             _init_ok = True
             return True
         except Exception as e:

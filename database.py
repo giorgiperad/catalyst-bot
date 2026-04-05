@@ -302,7 +302,11 @@ def init_database():
         conn.commit()
     except sqlite3.IntegrityError:
         # Old schema — recreate offers table with new constraint.
-        # Use explicit transaction (not executescript which auto-commits each stmt).
+        # Rollback the failed test INSERT before starting the migration transaction.
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         try:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute("ALTER TABLE offers RENAME TO offers_old")
@@ -323,7 +327,12 @@ def init_database():
                 cat_asset_id    TEXT NOT NULL,
                 coin_id         TEXT
             )""")
-            conn.execute("INSERT INTO offers SELECT *, NULL FROM offers_old")
+            # Copy data — old table has same columns, just a different CHECK on tier
+            old_cols = [row[1] for row in conn.execute("PRAGMA table_info(offers_old)").fetchall()]
+            new_cols = [row[1] for row in conn.execute("PRAGMA table_info(offers)").fetchall()]
+            shared = [c for c in old_cols if c in new_cols]
+            col_list = ", ".join(shared)
+            conn.execute(f"INSERT INTO offers ({col_list}) SELECT {col_list} FROM offers_old")
             conn.execute("DROP TABLE offers_old")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_offers_status ON offers(status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_offers_side ON offers(side)")
