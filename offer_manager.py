@@ -1188,6 +1188,7 @@ class OfferManager:
 
             cat_amount = size_xch / price
             cat_mojos = cat_to_mojos(cat_amount, decimals)
+            cat_amount = mojos_to_cat(cat_mojos, decimals)
             xch_mojos = xch_to_mojos(size_xch)
 
             if side == "buy":

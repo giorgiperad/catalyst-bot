@@ -47,6 +47,7 @@ sys.modules["database"] = fake_database
 fake_offer_manager = types.ModuleType("offer_manager")
 fake_offer_manager.xch_to_mojos = lambda x: int(Decimal(str(x)) * Decimal("1000000000000"))
 fake_offer_manager.cat_to_mojos = lambda x, decimals: int(Decimal(str(x)) * (Decimal(10) ** decimals))
+fake_offer_manager.mojos_to_cat = lambda mojos, decimals: Decimal(str(mojos)) / (Decimal(10) ** decimals)
 sys.modules["offer_manager"] = fake_offer_manager
 
 # Pop sniper so it re-imports with our fakes rather than the cached version

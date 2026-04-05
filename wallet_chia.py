@@ -1463,7 +1463,7 @@ def prepare_coins_for_trading(
         result = split_coins_bulk(
             wallet_id=cat_wallet_id,
             num_coins=cat_needed,
-            coin_size_mojos=float(cat_per_offer),  # For CATs, this is TOKEN amount, not mojos!
+            coin_size_mojos=int(cat_per_offer),  # For CATs, this is TOKEN amount, not mojos!
             fee_mojos=get_effective_transaction_fee_mojos(),
             reserve_multiplier=reserve_multiplier,
             is_cat=True,

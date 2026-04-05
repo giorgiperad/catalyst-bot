@@ -892,12 +892,28 @@ class FillTracker:
         # If still zero after DB fallback, this offer disappeared but we have
         # no record of it at all. This usually means it's a stale offer from
         # a previous session or an expired offer that the wallet cleaned up.
-        # Do NOT count it as a fill — it pollutes PnL tracking and logs.
+        # Record it as 'unmatched' so operators can investigate, but exclude
+        # from PnL (all PnL queries filter verification_status='verified').
         if price == Decimal("0") and size_xch == Decimal("0"):
             log_event("warning", "fill_no_details",
                       f"Offer {trade_id[:16]}... disappeared but has no price/size data "
-                      f"(not in cache or DB) — treating as unknown closure, NOT a fill")
-            return None  # Don't record as fill
+                      f"(not in cache or DB) — recording as unmatched for investigation")
+            try:
+                record_fill(
+                    trade_id=trade_id,
+                    side=side,
+                    price_xch=Decimal("0"),
+                    size_xch=Decimal("0"),
+                    size_cat=Decimal("0"),
+                    cat_asset_id=cfg.CAT_ASSET_ID,
+                    tier="unknown",
+                    verification_status="unmatched",
+                    fee_mojos_xch=0,
+                )
+            except Exception as e:
+                log_event("error", "fill_unmatched_record_failed",
+                          f"Failed to record unmatched fill for {trade_id[:16]}...: {e}")
+            return None  # Still return None — caller shouldn't treat this as a confirmed fill
 
         # Record to database
         try:

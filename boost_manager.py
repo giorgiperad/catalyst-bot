@@ -28,7 +28,7 @@ from typing import Optional, Dict, List
 
 from config import cfg
 from database import log_event, add_offer
-from offer_manager import xch_to_mojos, cat_to_mojos
+from offer_manager import xch_to_mojos, cat_to_mojos, mojos_to_cat
 
 
 def _bps_to_pct(val):
@@ -552,6 +552,7 @@ class BoostManager:
 
         cat_amount = size_xch / price
         cat_mojos = cat_to_mojos(cat_amount, cfg.CAT_DECIMALS)
+        cat_amount = mojos_to_cat(cat_mojos, cfg.CAT_DECIMALS)
         xch_mojos = xch_to_mojos(size_xch)
 
         # Amount validation — reject zero, negative, or absurdly large values

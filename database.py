@@ -3403,6 +3403,9 @@ def get_stats(cat_asset_id: str = None, since: str = None) -> Dict:
             if cat_asset_id:
                 query_base += " AND f1.cat_asset_id=?"
                 params.append(cat_asset_id)
+            if since:
+                query_base += " AND f1.filled_at>=?"
+                params.append(_sqlite_ts(since))
             row = conn.execute(query_base, params).fetchone()
             stats["avg_round_trip_secs"] = float(row["avg_secs"] or 0)
         except Exception:

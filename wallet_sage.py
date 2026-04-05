@@ -1246,6 +1246,11 @@ def split_coins_rpc(wallet_id: int, target_coin_id: str, num_coins: int,
     IMPORTANT: Sage uses a single generic /split endpoint (not split_xch/split_cat).
     It works for both XCH and CAT coins — Sage determines the type from the coin IDs.
 
+    NOTE: Sage /split divides the parent coin evenly by output_count.
+    The amount_per_coin parameter is NOT sent to Sage — it is used only
+    by the caller for balance validation before calling this function.
+    The actual output size = parent_coin_amount / output_count.
+
     Source: sage-api/src/requests/transactions.rs (struct Split)
     Parameters:
       - coin_ids: Vec<String>   — which coin(s) to split
@@ -3712,7 +3717,7 @@ def prepare_coins_for_trading(
         result = split_coins_bulk(
             wallet_id=cat_wallet_id,
             num_coins=cat_needed,
-            coin_size_mojos=float(cat_per_offer),
+            coin_size_mojos=int(cat_per_offer),
             fee_mojos=get_effective_transaction_fee_mojos(),
             reserve_multiplier=reserve_multiplier,
             is_cat=True,
