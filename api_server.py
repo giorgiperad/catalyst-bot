@@ -139,6 +139,11 @@ _RATE_LIMIT_EXEMPT_WRITE_ROUTES = {
 
 # ---------------------------------------------------------------------------
 # Simple per-endpoint rate limiter for state-changing operations
+#
+# Thread-safe within a single process (threading.Lock). This does NOT protect
+# across multiple worker processes, but Flask runs single-process in this app
+# (embedded in desktop_app.py or standalone). If ever deployed multi-worker
+# (gunicorn -w N), replace with a shared store (Redis, SQLite, etc.).
 # ---------------------------------------------------------------------------
 _rate_limit_log: dict = {}  # {endpoint: [timestamp, ...]}
 _rate_limit_lock = threading.Lock()
@@ -3007,6 +3012,13 @@ def api_cancel_offer():
     if not bot:
         return jsonify({"error": "Bot not initialised"}), 500
 
+    # Guard: warn if bot is actively creating/requoting — the cancel can
+    # race with the wallet. Still allow it (user may need to emergency-cancel)
+    # but surface the risk so callers can back off if appropriate.
+    if bot.is_running() and bot.coin_manager.is_busy():
+        log_event("warning", "cancel_while_busy",
+                  "Manual cancel issued while coin operations are in progress")
+
     data = request.get_json()
     trade_id = data.get("trade_id", "") if data else ""
     if not trade_id:
@@ -4208,6 +4220,14 @@ def api_coin_topup():
     if not bot:
         return jsonify({"error": "Bot not initialised"}), 500
 
+    # Block if bot is live — topup splits coins and races with offer creation
+    if bot.is_running():
+        return jsonify({
+            "error": "Stop the bot before manual top-up. "
+                     "The bot handles top-up automatically while running.",
+            "requires_stop": True,
+        }), 409
+
     open_buys = bot.offer_manager.get_open_offer_count("buy")
     open_sells = bot.offer_manager.get_open_offer_count("sell")
 
@@ -4220,6 +4240,14 @@ def api_coin_prep():
     """Manually trigger full coin prep."""
     if not bot:
         return jsonify({"error": "Bot not initialised"}), 500
+
+    # Block if bot is live — coin prep splits/combines and races with offer creation
+    if bot.is_running():
+        return jsonify({
+            "error": "Stop the bot before manual coin prep. "
+                     "The bot handles coin prep automatically while running.",
+            "requires_stop": True,
+        }), 409
 
     started = bot.coin_manager.start_coin_prep()
     return jsonify({"status": "started" if started else "already_running"})

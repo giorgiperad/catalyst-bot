@@ -207,6 +207,7 @@ class BotLoop:
         }
         self._state_lock = threading.Lock()
         self._probe_lock = threading.Lock()   # Protects _probe_state multi-key updates
+        self._ladder_threads: list = []       # Track active ladder-creation threads
 
         # ---- Event bus (set by api_server after creation) ----
         self._event_bus = None
@@ -4639,14 +4640,29 @@ class BotLoop:
             for side, needed, spread in work_items:
                 _create_side(side, needed, spread)
         else:
+            # Guard: skip if previous cycle's ladder threads are still alive.
+            # Without this, a timed-out thread keeps mutating the wallet while
+            # the new cycle spawns replacements — doubling offers or causing
+            # MEMPOOL_CONFLICT.
+            stale = [t for t in self._ladder_threads if t.is_alive()]
+            if stale:
+                names = ", ".join(t.name for t in stale)
+                log_event("warning", "ladder_overlap_skip",
+                          f"Skipping ladder creation — previous threads still alive: {names}")
+                return
+            self._ladder_threads.clear()
+
             threads = []
             for side, needed, spread in work_items:
                 t = threading.Thread(
                     target=_create_side,
                     args=(side, needed, spread),
                     name=f"create-{side}",
+                    daemon=True,  # Don't block process exit
                 )
                 threads.append(t)
+
+            self._ladder_threads = threads
 
             # Start all threads and wait for completion
             for t in threads:

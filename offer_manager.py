@@ -467,8 +467,21 @@ class OfferManager:
 
     @staticmethod
     def _get_ladder_parallelism(coin_ids_enabled: bool) -> int:
-        """Choose a safe worker count for live offer creation."""
+        """Choose a safe worker count for live offer creation.
+
+        Only allows parallelism when coin_ids are both enabled AND the
+        wallet backend actually sends them in the RPC payload. Currently
+        only Sage supports coin_ids; Chia wallet silently ignores them,
+        so parallel creates would race on coin selection.
+        """
         if not coin_ids_enabled:
+            return 1
+        # Chia wallet doesn't pass coin_ids to the RPC — force serial
+        try:
+            from wallet import get_wallet_type
+            if get_wallet_type() != "sage":
+                return 1
+        except Exception:
             return 1
         try:
             configured = int(getattr(cfg, "LADDER_CREATE_PARALLELISM", 5) or 5)

@@ -4275,8 +4275,13 @@ class CoinManager:
             with self._lock:
                 self._prep_running = False
 
-        if self._prep_running:
-            return False
+        # Atomic check-and-set: both the guard and the flag update must be
+        # inside the same lock acquisition to prevent two callers from both
+        # passing the check and spawning duplicate workers.
+        with self._lock:
+            if self._prep_running or self._topup_running:
+                return False
+            self._prep_running = True
 
         try:
             worker_path = os.path.join(
@@ -4287,10 +4292,9 @@ class CoinManager:
             if not os.path.exists(worker_path):
                 log_event("error", "coin_prep_missing",
                           f"coin_prep_worker.py not found at {worker_path}")
+                with self._lock:
+                    self._prep_running = False
                 return False
-
-            with self._lock:
-                self._prep_running = True
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = "utf-8"
 
@@ -4550,8 +4554,13 @@ class CoinManager:
         return None
 
     def is_busy(self) -> bool:
-        """Check if any coin operation is in progress."""
-        return self._prep_running or self._topup_running
+        """Check if any coin operation is in progress.
+
+        Reads both flags under the lock to avoid torn reads where one flag
+        is stale while the other is current.
+        """
+        with self._lock:
+            return self._prep_running or self._topup_running
 
     def reset_backoff(self):
         """Reset no-coins backoff (called after fills bring new coins)."""
