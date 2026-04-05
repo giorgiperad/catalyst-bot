@@ -12403,10 +12403,18 @@
                 }
                 case 'openLiveControls': {
                     // Scroll to and expand Live Controls, then highlight the gap-closer button
+                    // First switch to dashboard view if not already there
+                    if (typeof switchView === 'function') switchView('dashboard');
                     const liveControlsEl = document.getElementById('liveControlsBody');
-                    const liveControlsSection = document.querySelector('[data-section="live-controls"], .v4-section-header');
-                    if (liveControlsEl && liveControlsEl.style.display === 'none') {
-                        liveControlsEl.style.display = '';
+                    // Remove collapsed class (v4 collapse mechanism) AND inline display:none
+                    if (liveControlsEl) {
+                        liveControlsEl.classList.remove('collapsed');
+                        if (liveControlsEl.style.display === 'none') {
+                            liveControlsEl.style.display = '';
+                        }
+                        // Also un-collapse the toggle button if present
+                        const toggleBtn = document.querySelector('[onclick*="liveControlsBody"]');
+                        if (toggleBtn) toggleBtn.classList.remove('collapsed');
                     }
                     const boostBtn = document.getElementById('boostBtn');
                     if (boostBtn) {
@@ -12426,8 +12434,8 @@
         function saApplySpread(bps) {
             document.getElementById('lcSpreadSlider').value = bps;
             lcSpreadInput(document.getElementById('lcSpreadSlider'));
-            document.getElementById('lcSpreadStatus').textContent = 'Adjusted — click Apply';
-            document.getElementById('lcSpreadStatus').style.color = '';
+            // Actually apply the spread change via API, not just move the slider
+            lcApplySpread();
         }
 
         function saEnableInventory() {
@@ -17504,6 +17512,14 @@
                     };
                     acceptPairDataRefresh(activeDashboardAssetId, 'dashboard payload');
                 }
+                // Normalize field names: API returns fill_rate_per_hour,
+                // advisor reads fills_per_hour. Map once on receipt.
+                if (_dashboardData.performance) {
+                    const p = _dashboardData.performance;
+                    if (p.fill_rate_per_hour !== undefined && p.fills_per_hour === undefined) {
+                        p.fills_per_hour = p.fill_rate_per_hour;
+                    }
+                }
                 updateCommandCentre(_dashboardData);
                 lcSyncFromDashboard(_dashboardData);
                 saUpdateAdvisor(_dashboardData);
@@ -18130,6 +18146,8 @@
                 if (data.stats.loop_count !== undefined) perf.loop_count = data.stats.loop_count;
                 if (data.stats.total_fills !== undefined) perf.total_fills = data.stats.total_fills;
                 if (data.stats.uptime_seconds !== undefined) perf.uptime_secs = data.stats.uptime_seconds;
+                // Map fill_rate_per_hour → fills_per_hour so advisor sees fresh data
+                if (data.stats.fill_rate_per_hour !== undefined) perf.fills_per_hour = data.stats.fill_rate_per_hour;
             }
 
             if (data.sniper) {
@@ -18187,6 +18205,18 @@
             };
         }
 
+        // SSE staleness watchdog: if no real event for 60s, force reconnect
+        // and re-fetch alerts. Catches the case where the server dropped our
+        // subscriber queue but the HTTP connection stays alive via keepalives.
+        setInterval(() => {
+            if (_lastSseEventTime && (Date.now() - _lastSseEventTime > 60000)) {
+                console.warn('[SSE] No events for 60s — forcing reconnect');
+                _lastSseEventTime = Date.now(); // prevent rapid-fire reconnects
+                connectSSE();
+                loadAlerts(); // refresh alert state that may have been missed
+            }
+        }, 15000);
+
         const SYSTEM_LOG_EVENT_ICONS = {
             bot_started: '▶️', bot_stopped: '⏹️',
             bot_starting: '▶️', bot_loop_exit: '⏹️',
@@ -18240,6 +18270,10 @@
                     if (midEl) midEl.textContent = parseFloat(data.mid_price).toFixed(8);
                     if (!bot_state) bot_state = {};
                     bot_state.mid_price = data.mid_price;
+                    // Also update pricing.mid so the advisor's price-rail check
+                    // uses live data instead of waiting for 20s status poll.
+                    if (!bot_state.pricing) bot_state.pricing = {};
+                    bot_state.pricing.mid = data.mid_price;
                 }
                 if (data.arb_gap_bps !== undefined) {
                     if (!bot_state) bot_state = {};
@@ -18535,6 +18569,12 @@
                 }
                 // Update hero mid price from SSE push
                 if (data.mid_price) {
+                    // Keep bot_state.pricing.mid in sync for advisor price-rail checks
+                    if (!bot_state) bot_state = {};
+                    if (!bot_state.pricing) bot_state.pricing = {};
+                    bot_state.pricing.mid = data.mid_price;
+                    bot_state.mid_price = data.mid_price;
+
                     const heroMid = document.getElementById('heroMidPrice');
                     if (heroMid) {
                         const midStr = parseFloat(data.mid_price).toFixed(8);
@@ -18563,6 +18603,20 @@
                     _lcDashboardData = _lcDashboardData || _dashboardData || { settings: {}, performance: {} };
                     _lcDashboardData.market_health = mergedMarketHealth || data.market_health;
                     _lcDashboardData.market_health.metrics = _lcDashboardData.market_health.metrics || {};
+
+                    // Propagate circuit breaker state into settings.safety so
+                    // the advisor reads live CB data instead of stale dashboard snapshot.
+                    const mhm = _lcDashboardData.market_health.metrics || {};
+                    if (!_lcDashboardData.settings) _lcDashboardData.settings = {};
+                    if (!_lcDashboardData.settings.safety) _lcDashboardData.settings.safety = {};
+                    _lcDashboardData.settings.safety.circuit_breaker_active = !!(mhm.circuit_breaker_active);
+                    _lcDashboardData.settings.safety.circuit_breaker_reason = mhm.circuit_breaker_reason || '';
+
+                    // Propagate net_position from SSE so advisor doesn't wait for 120s dashboard poll
+                    if (data.net_position !== undefined) {
+                        _lcDashboardData.performance = _lcDashboardData.performance || {};
+                        _lcDashboardData.performance.net_position = data.net_position;
+                    }
                     if (data.fills_per_hour !== undefined) {
                         _lcDashboardData.performance = _lcDashboardData.performance || {};
                         _lcDashboardData.performance.fills_per_hour = data.fills_per_hour;
@@ -19590,38 +19644,18 @@
         }
         
         async function restartSage() {
-            const btn = document.getElementById('chiaRestartBtn');
-            const proceed = await showStyledConfirm({
+            // Sage cannot be restarted programmatically — inform the user.
+            await showStyledConfirm({
                 icon: '🔄',
-                title: 'Restart Sage Services',
-                message: 'This will restart the local Sage wallet connection path.<br><br>The bot will wait for Sage to come back before continuing.',
-                confirmText: 'Restart',
-                cancelText: 'Cancel',
-                style: 'danger'
+                title: 'Restart Sage Manually',
+                message: 'Sage must be restarted outside the bot:<br><br>' +
+                    '<b>1.</b> Close the Sage application<br>' +
+                    '<b>2.</b> Reopen it and wait for sync<br>' +
+                    '<b>3.</b> The bot will reconnect automatically',
+                confirmText: 'Got it',
+                cancelText: '',
+                style: 'info'
             });
-            if (!proceed) return;
-            
-            btn.disabled = true;
-            btn.textContent = '🔄 Restarting...';
-            
-            try {
-                const resp = await apiFetch(`${API_URL}/sage/restart`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                });
-                const data = await resp.json();
-                if (data.success) {
-                    showToast('Sage restart initiated...', 'success');
-                } else {
-                    showToast(data.error || 'Restart failed', 'error');
-                    btn.disabled = false;
-                    btn.textContent = '🔄 Restart Sage';
-                }
-            } catch (err) {
-                showToast('Could not reach server', 'error');
-                btn.disabled = false;
-                btn.textContent = '🔄 Restart Sage';
-            }
         }
         const restartChia = restartSage;
 

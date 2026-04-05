@@ -1563,6 +1563,8 @@ class BotLoop:
         self._clear_alert("wallet_signing")
         self._clear_alert("buy_disabled")
         self._clear_alert("sell_disabled")
+        self._clear_alert("cancel_retries")
+        self._clear_alert("bot_recovery")
 
         # Clear any previous stop signal so ladder creation works
         self.offer_manager._stop_requested = False
@@ -1741,6 +1743,12 @@ class BotLoop:
                           f"Splash node stop raised during shutdown: {e}")
 
         self._set_state(status="stopped")
+
+        # Clear all operational alerts so they don't linger on the GUI after stop
+        for alert_id in ("circuit_breaker", "bot_recovery", "cancel_retries",
+                         "buy_disabled", "sell_disabled"):
+            self._clear_alert(alert_id)
+
         log_event("info", "bot_stopped", "Bot loop stopped")
         return True
 
@@ -4233,6 +4241,13 @@ class BotLoop:
             # Reuse fills_hour from earlier in this cycle instead of re-querying
             _fills_hr = fills_hour if fills_hour is not None else 0
 
+            # Include net_position so the advisor doesn't rely on stale 120s dashboard poll
+            _net_pos = "0"
+            try:
+                _net_pos = str(self.risk_manager._net_position_cat)
+            except Exception:
+                pass
+
             self._emit("dashboard_update", {
                 "market_health": health_data,
                 "loop_count": self._loop_count,
@@ -4243,6 +4258,7 @@ class BotLoop:
                 "mid_price": str(mid_price),
                 "competitor_spread_bps": _competitor_bps,
                 "fills_per_hour": _fills_hr,
+                "net_position": _net_pos,
                 "our_best_bid": offer_edges.get("our_best_bid", "0"),
                 "our_best_ask": offer_edges.get("our_best_ask", "0"),
                 "best_bid": _best_bid,
