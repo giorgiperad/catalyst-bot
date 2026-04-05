@@ -245,6 +245,14 @@ def start_flask_server():
     except Exception:
         pass
 
+    # Restore fresh-run cutoff so PnL/history stay scoped to the current run
+    try:
+        restored_cutoff = api_server._restore_run_history_cutoff_from_events()
+        if restored_cutoff:
+            print(f"  [Fresh Run] Restored history cutoff: {restored_cutoff}")
+    except Exception:
+        pass
+
     # Run Flask (this blocks until shutdown)
     from database import log_event
     log_event("info", "server_started", f"Desktop app v{APP_VERSION} starting Flask on port {FLASK_PORT}")
