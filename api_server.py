@@ -4889,12 +4889,18 @@ def api_market_summary():
         pass
 
     # --- Compute mid price and arb gap ---
+    # Use live orderbook mid (best bid + best ask / 2) for arb gap, not the
+    # 24h-average dexie_price from the ticker endpoint which is stale.
+    bb = result["best_bid"]
+    ba = result["best_ask"]
+    dexie_live_mid = (bb + ba) / 2 if bb > 0 and ba > 0 else result["dexie_price"]
     dp = result["dexie_price"]
     tp = result["tibet_price"]
-    if dp > 0 and tp > 0:
+    if dexie_live_mid > 0 and tp > 0:
+        result["mid_price"] = (dexie_live_mid + tp) / 2
+        result["arb_gap_bps"] = round(abs(dexie_live_mid - tp) / dexie_live_mid * 10000, 1)
+    elif dp > 0 and tp > 0:
         result["mid_price"] = (dp + tp) / 2
-        # Match the bot's price engine / market-health calculation so the
-        # top strip and Command Centre report the same arb gap basis.
         result["arb_gap_bps"] = round(abs(dp - tp) / dp * 10000, 1)
     elif dp > 0:
         result["mid_price"] = dp
