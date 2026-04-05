@@ -1558,6 +1558,10 @@ class BotLoop:
         self._set_state(running=True, status="starting")
         self._circuit_breaker_offer_safed = False
         self._clear_alert("circuit_breaker")
+        self._clear_alert("preflight_blocked")
+        self._clear_alert("wallet_signing")
+        self._clear_alert("buy_disabled")
+        self._clear_alert("sell_disabled")
 
         # Clear any previous stop signal so ladder creation works
         self.offer_manager._stop_requested = False

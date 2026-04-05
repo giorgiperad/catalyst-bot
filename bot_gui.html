@@ -12061,14 +12061,16 @@
             const catTotal = parseFloat(walletData.cat_total) || 0;
             const circuitBreakerActive = !!(safety.circuit_breaker_active);
             const circuitBreakerReason = String(safety.circuit_breaker_reason || '');
-            const walletReachable = bot_state?.wallet_reachable !== false; // default true if unknown
+            const walletReachable = (bot_state?.chia_health?.wallet_reachable ?? bot_state?.wallet_reachable) !== false;
             const uptimeSecs = parseInt(perf.uptime_secs ?? 0, 10) || 0;
             const totalFills = parseInt(perf.total_fills ?? 0, 10) || 0;
             const sniperEnabled = !!(s.features && s.features.sniper);
             const isRunning = !!(bot_state && bot_state.running);
 
             function pushSuggestion(item) {
-                if (!item || suggestions.length >= 2) return;
+                if (!item) return;
+                // Errors always show; cap softer messages at 3 total
+                if (item.type !== 'error' && suggestions.length >= 3) return;
                 if (!suggestions.some((existing) => existing.msg === item.msg)) {
                     suggestions.push(item);
                 }
@@ -12102,11 +12104,19 @@
 
             // ── Circuit breaker — risk manager has halted trading ──
             if (isRunning && circuitBreakerActive) {
+                const cbBlockedSide = String(mhMetrics.circuit_breaker_blocked_side || '').toLowerCase();
+                const isPartialCB = cbBlockedSide === 'buy' || cbBlockedSide === 'sell';
+                const correctingSide = cbBlockedSide === 'buy' ? 'sell' : 'buy';
+                const cbMsg = isPartialCB
+                    ? `Position circuit breaker tripped — ${cbBlockedSide} side is blocked while ${correctingSide} offers continue to reduce your position.${circuitBreakerReason ? ' Reason: ' + circuitBreakerReason + '.' : ''} The bot is actively correcting; let it run unless you want to intervene manually.`
+                    : `Price circuit breaker tripped — all trading is paused.${circuitBreakerReason ? ' Reason: ' + circuitBreakerReason + '.' : ''} The market price is outside your configured safe range. Check Settings → Safety & Limits and adjust your price rails, or wait for the price to return to range.`;
                 pushSuggestion({
                     type: 'error',
                     icon: '!!',
-                    msg: `The risk manager has tripped the circuit breaker and paused all trading.${circuitBreakerReason ? ' Reason: ' + circuitBreakerReason + '.' : ''} Stop the bot, check your inventory and wallet balance, then restart once conditions look normal. If it trips repeatedly, lower your position sizes in Settings.`,
-                    action: null
+                    msg: cbMsg,
+                    action: isPartialCB ? null : 'Open Settings',
+                    actionType: isPartialCB ? null : 'openSettings',
+                    actionValue: isPartialCB ? null : 'safety'
                 });
             }
 
