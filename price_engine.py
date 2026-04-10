@@ -920,3 +920,4 @@ def _decimal_sqrt(value: Decimal, precision: int = 20) -> Decimal:
     for _ in range(precision):
         x = (x + value / x) / Decimal("2")
     return x
+
