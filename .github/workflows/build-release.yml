@@ -1,0 +1,67 @@
+name: Build Release
+
+# Triggers when you push a version tag (e.g. v4.0.1, v4.1.0)
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: Catalyst-windows
+            ext: .zip
+          - os: macos-latest
+            artifact: Catalyst-macos
+            ext: .zip
+          - os: ubuntu-latest
+            artifact: Catalyst-linux
+            ext: .tar.gz
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install pyinstaller
+          pip install flask requests python-dotenv pywebview pystray plyer Pillow cryptography
+
+      - name: Build with PyInstaller
+        run: python build.py
+
+      - name: Package (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/ChiaMarketMaker/* -DestinationPath "${{ matrix.artifact }}-${{ github.ref_name }}${{ matrix.ext }}"
+
+      - name: Package (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          cd dist && zip -r "../${{ matrix.artifact }}-${{ github.ref_name }}${{ matrix.ext }}" ChiaMarketMaker/
+
+      - name: Package (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cd dist && tar -czf "../${{ matrix.artifact }}-${{ github.ref_name }}${{ matrix.ext }}" ChiaMarketMaker/
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifact }}-${{ github.ref_name }}${{ matrix.ext }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
