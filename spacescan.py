@@ -588,3 +588,4 @@ def check_balance_discrepancy(our_address: str, wallet_xch: Decimal,
                           f"On-chain: {cat_onchain}, Diff: {result['cat_diff']}")
 
     return result
+
