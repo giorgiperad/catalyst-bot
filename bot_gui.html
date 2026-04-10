@@ -22811,6 +22811,10 @@
                     /offers are protected/,
                     /Bulk cancel result/,
                     /Cancellation error/,
+                    /PARALLEL CONSOLIDATION/,
+                    /Staggering \d+ seconds/,
+                    /Fee-enabled consolidation/,
+                    /^\s*XCH has \d+ coins but no consolidation/,
                 ];
                 function _cpFilterLine(line) {
                     return !_cpSkip.some(rx => rx.test(line));
@@ -22823,11 +22827,14 @@
                         .replace(/Cancelling open offers.*/, 'Cancelling open offers')
                         .replace(/⚡ Using bulk cancel.*/, 'Cancelling open offers')
                         .replace(/No offers were cancelled/, 'No offers to cancel')
-                        // Consolidation
-                        .replace(/🔄 Consolidating (\w+) wallet.*/, 'Tidying up $1 coins into 1')
-                        .replace(/Consolidating (\d+) (CAT|XCH) coins.*1 coin.*/, 'Tidying up $1 $2 coins into 1')
+                        // Consolidation / tidy-up
+                        .replace(/🔄 Consolidating (\w+) wallet.*/, 'Tidying up $1 coins')
+                        .replace(/Consolidating (\d+) (CAT|XCH) coins.*/, 'Tidying up $1 $2 coins into 1')
                         .replace(/Consolidating: XCH=(\d+), CAT=(\d+).*/, 'Tidying up XCH ($1 coins) and token ($2 coins)')
+                        .replace(/(\w+) already consolidated.*/, '$1 coins already tidy')
+                        .replace(/Staggering \d+ seconds.*/, '')
                         .replace(/✅ Consolidation submitted/, 'Tidy-up transaction sent')
+                        .replace(/Fee-enabled consolidation.*/, '')
                         // Pool creation
                         .replace(/📦 STEP 1a: Submit XCH multi_send/, 'Step 1: Creating XCH pool coins')
                         .replace(/📦 STEP 1b: Submit CAT multi_send/, 'Step 1: Creating token pool coins')
