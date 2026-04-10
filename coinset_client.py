@@ -766,3 +766,4 @@ class CoinsetClient:
             "success": True,
             "_source": "coinset",
         }
+
