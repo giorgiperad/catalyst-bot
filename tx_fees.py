@@ -300,3 +300,4 @@ def get_fee_settings_snapshot() -> Dict:
         "fee_prep_count": get_fee_pool_count(),
         "tier_name": FEE_TIER_NAME,
     }
+
