@@ -4264,3 +4264,4 @@ def clear_market_analysis_cache(asset_id: str,
         return cursor.rowcount
     except Exception:
         return 0
+
