@@ -33,6 +33,7 @@ class _FakeCfg:
     SNIPER_COOLDOWN_SECS = 0
     INVENTORY_ENABLED = False
     COIN_PREP_HEADROOM_PCT = Decimal("0")
+    BUY_LADDER_REVERSED = False
 
     @staticmethod
     def get_spread_fraction():
@@ -184,7 +185,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             count = int(num_offers or 0)
             return [{"trade_id": f"new-{i}"} for i in range(count)]
 
-        def fake_cancel_offers(trade_ids, reason="requote"):
+        def fake_cancel_offers(trade_ids, reason="requote", skip_confirmation=False):
             cancel_batches.append(list(trade_ids))
             return {tid: {"success": True} for tid in trade_ids}
 
@@ -379,7 +380,13 @@ class OfferManagerCoinIdTests(unittest.TestCase):
                 "offer": "offer-inner",
             }
 
+        # Explicitly disable BUY_LADDER_REVERSED so we test the non-reversed
+        # path deterministically. The coin_size_tier_for_slot_position function
+        # reads cfg from coin_manager, so we must patch it there too.
+        import coin_manager as _cm_mod
         with patch.object(offer_manager.cfg, "TIER_ENABLED", True), \
+                patch.object(offer_manager.cfg, "BUY_LADDER_REVERSED", False), \
+                patch.object(_cm_mod.cfg, "BUY_LADDER_REVERSED", False), \
                 patch.object(offer_manager.OfferManager, "_select_coin_for_offer",
                              side_effect=fake_select), \
                 patch.object(offer_manager.OfferManager, "create_offer_with_retry",
@@ -401,6 +408,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             )
 
         self.assertEqual(len(captured), 1)
+        # BUY_LADDER_REVERSED=False: position inner stays as coin tier inner
         self.assertEqual(captured[0]["preferred_tier"], "inner")
         self.assertEqual(captured[0]["amount_mojos"], offer_manager.xch_to_mojos(Decimal("2.2")))
         self.assertEqual(created[0]["size_xch"], Decimal("2.2"))
@@ -699,8 +707,11 @@ class OfferManagerCoinIdTests(unittest.TestCase):
                 "offer": "offer-headroom-buy",
             }
 
+        import coin_manager as _cm_mod2
         with patch.object(offer_manager.cfg, "TIER_ENABLED", True), \
                 patch.object(offer_manager.cfg, "COIN_PREP_HEADROOM_PCT", Decimal("10")), \
+                patch.object(offer_manager.cfg, "BUY_LADDER_REVERSED", False), \
+                patch.object(_cm_mod2.cfg, "BUY_LADDER_REVERSED", False), \
                 patch.object(offer_manager.OfferManager, "_select_coin_for_offer",
                              side_effect=fake_select), \
                 patch.object(offer_manager.OfferManager, "create_offer_with_retry",

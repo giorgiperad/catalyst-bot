@@ -60,6 +60,10 @@ class PriceEngine:
         self._session = requests.Session()
         self._session.headers.update({"Content-Type": "application/json"})
 
+        # API call counters (session-scoped, reset on restart)
+        self._dexie_price_fetches: int = 0
+        self._tibet_price_fetches: int = 0
+
         # --- Dynamic price limits ---
         # Reference price: set from first successful fetch, then tracks market
         # via exponential moving average (slow — 1% weight per update).
@@ -306,6 +310,7 @@ class PriceEngine:
             ticker_id = f"{ticker_id}_XCH"
 
         try:
+            self._dexie_price_fetches += 1
             url = f"{cfg.DEXIE_API_BASE}/v2/prices/tickers"
             resp = self._session.get(url, params={"ticker_id": ticker_id}, timeout=10)
             if resp.status_code == 429:
@@ -465,6 +470,7 @@ class PriceEngine:
 
         # Fetch outside lock to avoid blocking other threads
         try:
+            self._tibet_price_fetches += 1
             url = f"{cfg.TIBET_API_BASE}/pairs"
             resp = self._session.get(url, params={"skip": 0, "limit": 200},
                                       timeout=cfg.TIBET_TIMEOUT)

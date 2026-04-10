@@ -1096,7 +1096,9 @@ def classify_open_offers_for_pair(asset_id_mz: str):
     return open_buy, open_sell
 
 
-def cancel_offers_batch(trade_ids: list, secure: bool = True, max_workers: int = 3):
+def cancel_offers_batch(trade_ids: list, secure: bool = True, max_workers: int = 3,
+                        fee_mojos: Optional[int] = None,
+                        skip_confirmation: bool = False):
     """Cancel multiple offers — always serialized to avoid overwhelming wallet RPC.
     
     Parallel cancellation was causing failures when the wallet was under load

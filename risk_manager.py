@@ -969,6 +969,25 @@ class RiskManager:
             metrics["buy_spread_bps"] = "0"
             metrics["sell_spread_bps"] = "0"
 
+        # Actual inner spread: real bid-ask gap from live offers (not configured spread).
+        # The configured spread is a target; the actual gap depends on which offers
+        # are live, price anchoring, and rounding. This is what a taker actually sees.
+        try:
+            _bot = getattr(self, "_bot_ref", None)
+            if _bot is None:
+                # Try to get from module-level bot reference
+                import bot_loop as _bl
+                _bot = getattr(_bl, "bot", None)
+            if _bot:
+                _best_bid = Decimal(str(_bot._bot_state.get("our_best_bid", "0") or "0"))
+                _best_ask = Decimal(str(_bot._bot_state.get("our_best_ask", "0") or "0"))
+                _mid = Decimal(str(_bot._bot_state.get("mid_price", "0") or "0"))
+                if _best_bid > 0 and _best_ask > 0 and _mid > 0:
+                    _actual_gap_bps = (_best_ask - _best_bid) / _mid * Decimal("10000")
+                    metrics["your_spread_bps"] = str(_actual_gap_bps)
+        except Exception:
+            pass  # Fall through to configured spread
+
         # --- Circuit breaker ---
         metrics["circuit_breaker_active"] = self._circuit_breaker_active
         metrics["circuit_breaker_reason"] = self._circuit_breaker_reason

@@ -463,6 +463,15 @@ def _get_spacescan_market_context(asset_id: str = "", ticker_id: str = "",
                 context["activity_level"] = "moderate"
             elif ac > 0:
                 context["activity_level"] = "quiet"
+            elif hc >= 500:
+                # Activity endpoint returned 0 but token has many holders —
+                # likely a Spacescan data gap, not genuinely zero activity.
+                # Infer from holder count as a proxy.
+                context["activity_level"] = "active"
+            elif hc >= 100:
+                context["activity_level"] = "moderate"
+            elif hc > 0:
+                context["activity_level"] = "quiet"
             else:
                 context["activity_level"] = "unknown"
             context["confidence"] = "medium" if hc > 0 else "low"
@@ -1072,6 +1081,7 @@ def serve_console():
 
 
 @app.route("/brand/<path:filename>")
+@app.route("/assets/<path:filename>")
 def serve_brand_asset(filename: str):
     """Serve brand assets used by the GUI from the assets/ folder."""
     gui_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1083,6 +1093,8 @@ def serve_brand_asset(filename: str):
         "dexie_logo_official.png",
         "dexie_logo_official.ico",
         "tibetswap_logo_official.png",
+        "MonkeyZoo_Logo.png",
+        "spacescan-logo-192.webp",
     }
     if filename not in allowed:
         return Response("Not Found", status=404, mimetype="text/plain")
@@ -2925,6 +2937,56 @@ def api_diagnostics_api_stats():
     except Exception as e:
         payload["dexie"]["error"] = str(e)
 
+    # --- TibetSwap / AMM Monitor --------------------------------------
+    try:
+        if bot is not None and getattr(bot, "amm_monitor", None):
+            amm_stats = bot.amm_monitor.get_stats() or {}
+            # Also grab price engine stats
+            _pe = getattr(bot, "price_engine", None)
+            _tibet_cache_age = None
+            _pe_tibet_fetches = 0
+            _pe_dexie_fetches = 0
+            if _pe:
+                with getattr(_pe, "_price_lock", type("_", (), {"__enter__": lambda s: s, "__exit__": lambda *a: None})()):
+                    _last_tibet_ts = getattr(_pe, "_last_tibet_price_time", 0) or 0
+                    if _last_tibet_ts > 0:
+                        _tibet_cache_age = round(time.time() - _last_tibet_ts, 1)
+                _pe_tibet_fetches = getattr(_pe, "_tibet_price_fetches", 0)
+                _pe_dexie_fetches = getattr(_pe, "_dexie_price_fetches", 0)
+            # Orderbook refresh count from bot loop
+            _ob_refreshes = 0
+            try:
+                _ob_refreshes = int(bot._bot_state.get("orderbook_refreshes", 0) or 0)
+            except Exception:
+                pass
+            payload["tibetswap"] = {
+                "available": bool(amm_stats.get("available", False)),
+                "amm_price": amm_stats.get("amm_price"),
+                "drift_bps": amm_stats.get("drift_bps"),
+                "arb_pressure": amm_stats.get("arb_pressure", 0),
+                "arb_pressure_label": amm_stats.get("arb_pressure_label", "unknown"),
+                "total_polls": int(amm_stats.get("total_polls", 0) or 0),
+                "failed_polls": int(amm_stats.get("failed_polls", 0) or 0),
+                "consecutive_failures": int(amm_stats.get("consecutive_failures", 0) or 0),
+                "last_success_ago_secs": amm_stats.get("last_success_ago_secs"),
+                "price_cache_age_secs": _tibet_cache_age,
+                "pair_id": amm_stats.get("pair_id", ""),
+                "price_fetches": _pe_tibet_fetches,
+            }
+            # Add Dexie read counters to the Dexie section
+            if payload["dexie"].get("available"):
+                payload["dexie"]["price_fetches"] = _pe_dexie_fetches
+                payload["dexie"]["orderbook_refreshes"] = _ob_refreshes
+            # Dynamic buffer stats if available
+            dyn = amm_stats.get("dynamic_buffer", {})
+            if dyn:
+                payload["tibetswap"]["sweep_count_in_window"] = dyn.get("sweep_count_in_window", 0)
+                payload["tibetswap"]["buffer_widened"] = dyn.get("current_buffer_bps") is not None
+        else:
+            payload["tibetswap"] = {"available": False}
+    except Exception as e:
+        payload["tibetswap"] = {"available": False, "error": str(e)}
+
     # F53 (2026-04-09): human-readable timestamp without microseconds.
     # Previously this returned a full ISO 8601 with microseconds + offset
     # (e.g. "2026-04-09T10:30:07.842809+00:00") which the operator found
@@ -4320,7 +4382,7 @@ def api_purge_fills():
             conn.execute("DELETE FROM round_trips")
             conn.commit()
 
-        log_event("warning", "fills_purged",
+        log_event("info", "fills_purged",
                   f"Purged {fill_count} fills and {rt_count} round-trips "
                   f"(inventory position reset to 0)")
 
@@ -4717,7 +4779,7 @@ def api_dashboard():
 
         links = {
             "dexie_orderbook": dexie_orderbook,
-            "tibetswap_pool": f"https://v2.tibetswap.io/?asset_id={quote(asset_id)}" if asset_id else "https://v2.tibetswap.io",
+            "tibetswap_pool": f"https://v2.tibetswap.io/pair/{quote(getattr(cfg, 'TIBET_PAIR_ID', '') or '')}" if getattr(cfg, 'TIBET_PAIR_ID', '') else (f"https://v2.tibetswap.io/?asset_id={quote(asset_id)}" if asset_id else "https://v2.tibetswap.io"),
             "spacescan_token": f"https://www.spacescan.io/cat2/{quote(asset_id)}" if asset_id else "",
         }
 
@@ -6337,7 +6399,7 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
                 )
                 messages.append(warn_msg)
                 print(f"[SMART_DEFAULTS v2] {warn_msg}")
-                log_event("warning", "smart_defaults_pending_tx",
+                log_event("info", "smart_defaults_pending_tx",
                           f"Smart Settings ran during {_pending_tx_count} pending tx(s); "
                           f"recommend waiting for wallet to settle.")
     except Exception as e:
@@ -9833,7 +9895,7 @@ def api_coin_prep_trigger():
         # coin conflicts, failed splits, and wallet sync chaos.
         if _coin_prep_proc is not None and _coin_prep_proc.poll() is None:
             old_pid = _coin_prep_proc.pid
-            log_event("warning", "coin_prep_kill",
+            log_event("info", "coin_prep_kill",
                       f"Killing previous coin prep worker (PID: {old_pid}) before starting new run")
             try:
                 _coin_prep_proc.terminate()
@@ -9855,7 +9917,7 @@ def api_coin_prep_trigger():
             cm_proc = bot.coin_manager._prep_process
             if cm_proc.poll() is None:
                 cm_pid = cm_proc.pid
-                log_event("warning", "coin_prep_kill",
+                log_event("info", "coin_prep_kill",
                           f"Killing coin_manager worker (PID: {cm_pid}) before starting new run")
                 try:
                     cm_proc.terminate()
@@ -9909,7 +9971,7 @@ def api_coin_prep_trigger():
         # coin prep completes.
         if bot and bot.is_running():
             bot.stop()
-            log_event("warning", "coin_prep_bot_stopped",
+            log_event("info", "coin_prep_bot_stopped",
                       "Bot loop STOPPED for coin prep — press Start Bot after prep completes")
             events.emit("bot_control", {"action": "stopped",
                                         "reason": "coin_prep"})

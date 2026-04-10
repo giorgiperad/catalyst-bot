@@ -2311,7 +2311,7 @@ class BotLoop:
                                   f"({cleaned} cancelled, {len(fill_ids)} filled, "
                                   f"{len(expire_ids)} expired)")
                     else:
-                        log_event("warning", "db_cleanup_done",
+                        log_event("info", "db_cleanup_done",
                                   f"Cleaned {total_cleaned}/{len(stale_ids)} stale DB offers "
                                   f"(some failed due to DB lock)")
                 else:
@@ -2847,11 +2847,11 @@ class BotLoop:
                         # Pass coinset client to coin_manager for use in queries
                         self.coin_manager._coinset_client = self.coinset_client
                     else:
-                        log_event("warning", "coinset_init_skipped",
+                        log_event("info", "coinset_init_skipped",
                                   "Coinset initialization returned no puzzle hashes — "
                                   "using wallet RPC for coin queries")
                 except Exception as e:
-                    log_event("warning", "coinset_init_error",
+                    log_event("info", "coinset_init_error",
                               f"Coinset initialization failed: {e} — "
                               f"using wallet RPC for coin queries")
 
@@ -3216,7 +3216,7 @@ class BotLoop:
                 _sniper_tracked = set(self.sniper._active_snipe_ids)
             _orphan_snipes = (_sniper_tracked & all_open_ids) - _probe_known
             if _orphan_snipes:
-                log_event("warning", "sniper_orphan_sweep",
+                log_event("info", "sniper_orphan_sweep",
                           f"Sweep found {len(_orphan_snipes)} orphan sniper "
                           f"offer(s) not tracked by probe state — cancelling")
                 try:
@@ -3954,7 +3954,7 @@ class BotLoop:
                         _probe_tids.add(sell_tid)
                     _orphan_tids = _new_snipe_ids - _probe_tids
                     if _orphan_tids:
-                        log_event("warning", "probe_orphan_cleanup",
+                        log_event("info", "probe_orphan_cleanup",
                                   f"Cancelling {len(_orphan_tids)} orphan probe offer(s) "
                                   f"that landed after cycle abandonment or race: "
                                   f"{[t[:16] + '...' for t in _orphan_tids]}")
@@ -4073,7 +4073,7 @@ class BotLoop:
                         if requote_result.get("fully_replaced"):
                             self._last_quoted_price[eq_side] = requote_mid
                         else:
-                            log_event("warning", "requote_incomplete",
+                            log_event("info", "requote_incomplete",
                                       f"Did not advance {eq_side} quote baseline: replaced "
                                       f"{requote_result.get('replaced_count', 0)}/"
                                       f"{requote_result.get('target_count', 0)} offers")
@@ -4093,6 +4093,12 @@ class BotLoop:
                     self.coin_manager.snapshot_coins("emergency_requote")
                     self._emit_coin_update("emergency_requote")
                     self._last_bulk_create_time = time.time()
+
+                    # Clear the force_requote flag for this side — we just
+                    # requoted it. Without this, Step 9's _handle_requoting
+                    # would re-requote the same side, doubling the work and
+                    # causing coin exhaustion + cycle blocking.
+                    self._force_requote[eq_side] = False
 
                     done_msg = (f"[OK] Emergency requote {eq_side}: "
                                 f"{len(new_offers)} new offers at {requote_mid:.8f}")
@@ -4398,7 +4404,7 @@ class BotLoop:
                   f"Check create: buys={len(current_buy_ids)}/{cfg.MAX_ACTIVE_BUY_OFFERS}, "
                   f"sells={len(current_sell_ids)}/{cfg.MAX_ACTIVE_SELL_OFFERS}")
         if _reserve_skip_create:
-            log_event("warning", "step10_skipped_reserve",
+            log_event("info", "step10_skipped_reserve",
                       "Skipping offer creation — reserve floor guard active")
             return
 
@@ -4716,6 +4722,47 @@ class BotLoop:
             log_event("debug", "requote_skip", "Coin manager busy — skipping requote")
             return
 
+        # ---- Fresh price for forced requotes ----
+        # When AMM drift forces a requote, the mid_price from Step 1 (cycle
+        # start) may already be stale — the AMM monitor may have detected a
+        # move AFTER get_price() ran but BEFORE we reach this point. The old
+        # mid_price would make us requote at the SAME price, wasting coins.
+        # Re-fetch now so the new offers are at the correct price.
+        force_buy = self._force_requote.get("buy", False)
+        force_sell = self._force_requote.get("sell", False)
+        if force_buy or force_sell:
+            try:
+                fresh_price = self.price_engine.get_price(
+                    cfg.CAT_ASSET_ID, cfg.CAT_DECIMALS, cfg.CAT_TICKER_ID
+                )
+                if fresh_price:
+                    fresh_mid = Decimal(str(fresh_price.get("mid_price", 0)))
+                    if fresh_mid > 0 and fresh_mid != mid_price:
+                        old_mid = mid_price
+                        mid_price = fresh_mid
+                        self._current_mid_price = mid_price
+                        self._set_state(mid_price=str(mid_price))
+                        log_event("info", "requote_price_refresh",
+                                  f"Refreshed mid_price before forced requote: "
+                                  f"{old_mid:.8f} -> {mid_price:.8f}",
+                                  data={"old_mid": str(old_mid),
+                                        "new_mid": str(mid_price)})
+                        # Push updated price to GUI
+                        self._emit("price_update", {
+                            "mid_price": str(mid_price),
+                            "dexie_price": str(fresh_price.get("dexie_price", "")),
+                            "tibet_price": str(fresh_price.get("tibet_price", "")),
+                            "arb_gap_bps": str(fresh_price.get("arb_gap_bps", "0")),
+                            "spread_bps": self._bot_state.get("spread_bps", "0"),
+                        })
+            except Exception as _e:
+                log_event("warning", "requote_price_refresh_failed",
+                          f"Could not refresh price before requote: {_e}")
+
+        # Track requote time budget — don't let requotes block the loop forever
+        _requote_start_time = time.time()
+        _REQUOTE_TIME_BUDGET_SECS = float(getattr(cfg, "REQUOTE_TIME_BUDGET_SECS", 30) or 30)
+
         # Sniper probe active: only defer requoting on SIDES that currently
         # have a live probe offer. The other side can still requote — it's
         # wrong to freeze the whole book for minutes while a probe widens
@@ -4746,6 +4793,17 @@ class BotLoop:
             return
 
         for side in ["buy", "sell"]:
+            # Time budget check — don't let requotes block the loop forever.
+            # If buy-side requote took 20s, defer sell to next cycle.
+            _requote_elapsed = time.time() - _requote_start_time
+            if _requote_elapsed > _REQUOTE_TIME_BUDGET_SECS:
+                log_event("warning", "requote_time_budget",
+                          f"Requote time budget exceeded ({_requote_elapsed:.1f}s > "
+                          f"{_REQUOTE_TIME_BUDGET_SECS}s) — deferring {side} to "
+                          f"next cycle")
+                # Keep the force flag so it fires next cycle
+                break
+
             if side in probe_sides_blocked:
                 log_event("debug", "requote_skip",
                           f"Sniper probe active on {side} — skipping {side} requote")
@@ -4829,7 +4887,7 @@ class BotLoop:
                     if requote_result.get("fully_replaced"):
                         self._last_quoted_price[side] = requote_mid
                     else:
-                        log_event("warning", "requote_incomplete",
+                        log_event("info", "requote_incomplete",
                                   f"Did not advance {side} quote baseline: replaced "
                                   f"{requote_result.get('replaced_count', 0)}/"
                                   f"{requote_result.get('target_count', 0)} offers")
@@ -5245,7 +5303,7 @@ class BotLoop:
 
         # Tier 1: Full coin prep check — total coins critically low
         if self.coin_manager.needs_coin_prep(active_buy_count, active_sell_count):
-            log_event("warning", "coin_prep_trigger",
+            log_event("info", "coin_prep_trigger",
                       "TOTAL coins critically low — starting auto coin top-up")
             self.coin_manager.start_topup(active_buy_count, active_sell_count)
             return
@@ -5498,7 +5556,7 @@ class BotLoop:
                 if has_locked and offer_age_s <= 120:
                     continue
                 if has_locked and offer_age_s > 120:
-                    log_event("warning", "stale_offer_cleanup",
+                    log_event("info", "stale_offer_cleanup",
                               f"Cleaned up stale DB offer {tid[:16]}... "
                               f"(not in wallet after {int(offer_age_s)}s, had locked coins)")
                 stale_db_ids.append(tid)
@@ -6469,7 +6527,7 @@ class BotLoop:
                 pass
 
         if repaired > 0:
-            log_event("warning", "offer_coin_link_repaired",
+            log_event("info", "offer_coin_link_repaired",
                       f"Repaired {repaired} offer-coin link(s) where the offer "
                       f"existed but the coin row wasn't marked locked. Indicates "
                       f"a previous lock_coin call failed silently.")
@@ -6508,12 +6566,10 @@ class BotLoop:
             upgraded_count = sum(1 for r in backfilled if r.get("upgraded"))
             if created_count > 0:
                 log_event(
-                    "warning",
+                    "info",
                     "daily_reconcile_backfilled",
-                    f"Daily reconcile INSERTED {created_count} new fill rows "
-                    f"for offers marked 'filled' in the offers table but "
-                    f"missing from the fills table — PnL was understated. "
-                    f"Now corrected.",
+                    f"Daily reconcile: backfilled {created_count} fill records "
+                    f"for historical offers. PnL tracking is now up to date.",
                 )
             if upgraded_count > 0:
                 log_event(
@@ -7129,7 +7185,7 @@ class BotLoop:
                                 swap_msg = (f"🔔 Tibet swap detected! Reserves moved {change_pct:.3f}% "
                                             f"({direction}) — waking bot for immediate requote")
                                 print(swap_msg, flush=True)
-                                log_event("warning", "tibet_swap_detected", swap_msg)
+                                log_event("info", "tibet_swap_detected", swap_msg)
 
                                 # Invalidate Tibet cache so price_engine fetches fresh
                                 try:

@@ -7242,7 +7242,7 @@
             <div class="startup-brand-lockup">
                 <div class="startup-brand-appname"><span class="catalyst-cat">CAT</span><span class="catalyst-alyst">alyst</span></div>
                 <div class="startup-brand-note">Created by MonkeyZoo</div>
-                <img class="startup-brand-wordmark" src="/brand/bot_icon_new.png" alt="MonkeyZoo logo">
+                <img class="startup-brand-wordmark" src="/assets/MonkeyZoo_Logo.png" alt="MonkeyZoo logo">
             </div>
         </div>
         <div class="startup-container">
@@ -7509,7 +7509,7 @@
             <div class="startup-brand-lockup">
                 <div class="startup-brand-appname"><span class="catalyst-cat">CAT</span><span class="catalyst-alyst">alyst</span></div>
                 <div class="startup-brand-note">Created by MonkeyZoo</div>
-                <img class="startup-brand-wordmark" src="/brand/bot_icon_new.png" alt="MonkeyZoo logo">
+                <img class="startup-brand-wordmark" src="/assets/MonkeyZoo_Logo.png" alt="MonkeyZoo logo">
             </div>
         </div>
         <div class="startup-container">
@@ -7616,14 +7616,14 @@
         <div class="spacescan-card">
             <div class="service-brand-row compact" style="margin-top: 2px;">
                 <span class="brand-chip app-brand">
-                    <img src="/brand/bot_icon_new.png" alt="CATalyst logo">
+                    <img src="/assets/MonkeyZoo_Logo.png" alt="CATalyst logo">
                     <span class="brand-chip-text">
                         <span class="brand-chip-label">CATalyst</span>
                         <span class="brand-chip-note">Bot app</span>
                     </span>
                 </span>
                 <span class="brand-chip spacescan-brand">
-                    
+                    <img src="/assets/spacescan-logo-192.webp" alt="Spacescan logo">
                     <span class="brand-chip-text">
                         <span class="brand-chip-label">Spacescan</span>
                         <span class="brand-chip-note">Explorer service</span>
@@ -7840,7 +7840,7 @@
         <nav class="v4-sidebar" id="v4Sidebar">
             <div class="v4-sidebar-brand">
                 <div class="v4-sidebar-brand-mark">
-                    <img src="/brand/bot_icon_new.png" alt="CATalyst logo">
+                    <img src="/assets/MonkeyZoo_Logo.png" alt="CATalyst logo">
                 </div>
                 <div class="v4-sidebar-brand-copy">
                     <span class="v4-sidebar-brand-name"><span class="catalyst-cat">CAT</span><span class="catalyst-alyst">alyst</span></span>
@@ -8395,7 +8395,7 @@
                 <!-- External links -->
                 <div class="cc-links">
                     <a class="cc-link-btn" id="ccDexieLink" href="#" target="_blank" rel="noopener" onclick="return handleDashboardExternalLink(event, this)"><img src="/brand/dexie_logo_official.png" alt="Dexie logo">Dexie Orderbook</a>
-                    <a class="cc-link-btn" id="ccTibetLink" href="#" target="_blank" rel="noopener" onclick="return handleDashboardExternalLink(event, this)"><img src="/brand/tibetswap_logo_official.png" alt="TibetSwap logo">TibetSwap Pool</a>
+                    <a class="cc-link-btn" id="ccTibetLink" href="#" target="_blank" rel="noopener" onclick="return handleDashboardExternalLink(event, this)"><img src="/assets/tibetswap_logo_official.png" alt="TibetSwap logo">TibetSwap Pool</a>
                     <a class="cc-link-btn" id="ccSpacescanLink" href="#" target="_blank" rel="noopener" onclick="return handleDashboardExternalLink(event, this)">Spacescan</a>
                 </div>
             </div>
@@ -10492,7 +10492,7 @@
                         <p class="v4-modal-copy">A native desktop app for automated Chia CAT market making on Dexie. Runs a live buy/sell ladder, monitors fills via mempool, tracks PnL, reads market intel from Dexie, TibetSwap, and Spacescan, and manages coins — all from a single window.</p>
                         <div class="about-modal-brand">
                             <div class="about-modal-brand-note">Created by <strong>MonkeyZoo</strong></div>
-                            <img class="about-modal-brand-logo" src="/brand/bot_icon_new.png" alt="MonkeyZoo logo">
+                            <img class="about-modal-brand-logo" src="/assets/MonkeyZoo_Logo.png" alt="MonkeyZoo logo">
                         </div>
                     </div>
                 </div>
@@ -22226,9 +22226,10 @@
             try {
                 const resp = await apiFetch('/api/diagnostics/api-stats');
                 const data = await resp.json();
-                const ss = data.spacescan || {};
-                const cs = data.coinset   || {};
-                const dx = data.dexie     || {};
+                const ss = data.spacescan   || {};
+                const cs = data.coinset     || {};
+                const dx = data.dexie       || {};
+                const ts = data.tibetswap   || {};
 
                 const fmtN = (v) => (v === undefined || v === null) ? '—' : Number(v).toLocaleString();
                 const fmtPct = (v) => (v === undefined || v === null) ? '—' : Number(v).toFixed(1) + '%';
@@ -22289,9 +22290,10 @@
                         <div class="v4-modal-panel-title">Dexie</div>
                         ${dx.available ? `
                           <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 16px;font-size:0.92em;">
-                            <div style="color:var(--text-secondary);">Posts this session</div><div>${fmtN(dx.session_posted != null ? dx.session_posted : dx.total_posted)}</div>
-                            <div style="color:var(--text-secondary);">Failed (session)</div><div>${fmtN(dx.session_failed != null ? dx.session_failed : dx.total_failed)}</div>
-                            <div style="color:var(--text-secondary);">Skipped (session)</div><div>${fmtN(dx.session_skipped != null ? dx.session_skipped : dx.total_skipped)}</div>
+                            <div style="color:var(--text-secondary);">Price fetches</div><div>${fmtN(dx.price_fetches)}</div>
+                            <div style="color:var(--text-secondary);">Orderbook refreshes</div><div>${fmtN(dx.orderbook_refreshes)}</div>
+                            <div style="color:var(--text-secondary);">Offer posts</div><div>${fmtN(dx.session_posted != null ? dx.session_posted : dx.total_posted)}</div>
+                            <div style="color:var(--text-secondary);">Post failures</div><div>${fmtN(dx.session_failed != null ? dx.session_failed : dx.total_failed)}</div>
                             <div style="color:var(--text-secondary);">Queue size</div><div>${fmtN(dx.queue_size)}</div>
                             <div style="color:var(--text-secondary);">Known mappings${dx.hydrated_from_db ? ' (DB-hydrated)' : ''}</div><div>${fmtN(dx.known_mappings != null ? dx.known_mappings : dx.tracked_mappings)}</div>
                             <div style="color:var(--text-secondary);">Fingerprints cached</div><div>${fmtN(dx.fingerprints_cached)}</div>
@@ -22304,6 +22306,21 @@
                               ℹ The "known mappings" count includes offers loaded from the local database at startup. "Posts this session" only counts new offers submitted since the bot process started — it resets on restart.
                             </div>` : ''}
                         ` : '<div style="color:var(--text-tertiary);">Dexie manager not running.</div>'}
+                    </div>
+                    <div class="v4-modal-panel">
+                        <div class="v4-modal-panel-title">TibetSwap ${ts.available ? '✅' : '❌'}</div>
+                        ${ts.available ? `
+                          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 16px;font-size:0.92em;">
+                            <div style="color:var(--text-secondary);">AMM price</div><div>${ts.amm_price ? Number(ts.amm_price).toFixed(8) : '—'}</div>
+                            <div style="color:var(--text-secondary);">Drift from quoted</div><div>${ts.drift_bps ? ts.drift_bps + ' bps' : '—'}</div>
+                            <div style="color:var(--text-secondary);">Arb pressure</div><div>${escapeHtml(ts.arb_pressure_label || '—')}</div>
+                            <div style="color:var(--text-secondary);">Total polls</div><div>${fmtN(ts.total_polls)}</div>
+                            <div style="color:var(--text-secondary);">Failed polls</div><div>${fmtN(ts.failed_polls)}</div>
+                            <div style="color:var(--text-secondary);">Consecutive failures</div><div>${fmtN(ts.consecutive_failures)}</div>
+                            <div style="color:var(--text-secondary);">Last success</div><div>${ts.last_success_ago_secs != null ? fmtN(Math.round(ts.last_success_ago_secs)) + 's ago' : '—'}</div>
+                            <div style="color:var(--text-secondary);">Price cache age</div><div>${ts.price_cache_age_secs != null ? fmtN(Math.round(ts.price_cache_age_secs)) + 's' : '—'}</div>
+                          </div>
+                        ` : '<div style="color:var(--text-tertiary);">TibetSwap AMM monitor not running.</div>'}
                     </div>
                 `;
 
@@ -22779,6 +22796,14 @@
                     /TIER MODE ENABLED/,
                     /Total: \d+ XCH coins/,
                     /Saved prep settings/,
+                    /\[Sage\] (Pre-cancel|Post-cancel|Confirm|Bulk cancel|cancel_offers)/,
+                    /\[Sage\] (get_peer|Attempting bulk|Cancelling \d+ offers seq)/,
+                    /multi_send.*response/i,
+                    /submit_response/i,
+                    /transaction_id/,
+                    /^Running coin prep/,
+                    /^Worker subprocess/,
+                    /peer_count/,
                 ];
                 function _cpFilterLine(line) {
                     return !_cpSkip.some(rx => rx.test(line));
@@ -22786,21 +22811,36 @@
                 // Simplify verbose messages into plain English
                 function _cpSimplify(line) {
                     return line
-                        .replace(/📦 STEP 1a: Submit XCH multi_send/, '📦 Creating XCH pool coins...')
-                        .replace(/📦 STEP 1b: Submit CAT multi_send/, '📦 Creating token pool coins...')
-                        .replace(/✂️ STEP 3: Submit ALL splits.*/, '✂️ Splitting pools into trading coins...')
-                        .replace(/🔍 STEP 4: Poll for ALL \d+ splits to confirm/, '🔍 Waiting for splits to confirm on-chain...')
+                        .replace(/📦 STEP 1a: Submit XCH multi_send/, '📦 Creating XCH pool coins')
+                        .replace(/📦 STEP 1b: Submit CAT multi_send/, '📦 Creating token pool coins')
+                        .replace(/✂️ STEP 3: Submit ALL splits.*/, '✂️ Splitting pools into trading coins')
+                        .replace(/🔍 STEP 4: Poll for ALL \d+ splits to confirm/, '🔍 Waiting for splits to confirm on-chain')
                         .replace(/🔍 Polling for ALL pool coins.*/, 'Waiting for pool coins to confirm...')
                         .replace(/🔍 Polling for ALL \d+ splits.*/, 'Waiting for all splits to confirm...')
-                        .replace(/XCH MULTI-SEND: (\d+) payments.*/, 'Sending $1 XCH pool transactions...')
-                        .replace(/CAT MULTI-SEND: (\d+) payments.*/, 'Sending $1 token pool transactions...')
+                        .replace(/XCH MULTI-SEND: (\d+) payments.*/, 'Sending $1 XCH pool transactions')
+                        .replace(/CAT MULTI-SEND: (\d+) payments.*/, 'Sending $1 token pool transactions')
                         .replace(/Payment \d+: (\w+) = [\d,]+ mojos \((\d+) coins\)/, '  $1: $2 coins')
+                        .replace(/(\w+) split submitted \((\d+)\/(\d+)\)/, '$1: split submitted ($2/$3)')
                         .replace(/(\w+) split submitted \((\d+) pieces\)/, '$1: splitting into $2 coins')
                         .replace(/Splitting (XCH|CAT) (\w+):.*into (\d+) pieces/, 'Splitting $2 tier into $3 coins')
                         .replace(/(\w+) pools selectable after (\d+)s/, '$1 pool coins confirmed ($2s)')
                         .replace(/(\w+) split confirmed after (\d+)s/, '$1 split confirmed ($2s)')
-                        .replace(/⏳ (\d+)s — XCH: (.), CAT: (.)/, 'Waiting... $1s (XCH: $2, CAT: $3)')
+                        // Verifying / waiting lines — collapse the noisy repeated polls
+                        .replace(/Verifying: XCH (\d+)\/(\d+)[-\d]*, CAT (\d+)\/(\d+)\s*\((\d+m?\s*\d*s?)\).*/, 'Verifying: XCH $1/$2, token $3/$4 ($5)')
+                        .replace(/⏳ (\d+)s — XCH: (.), CAT: (.)/, 'Waiting... $1s (XCH: $2, token: $3)')
                         .replace(/⏳ (\d+)s — (\d+)\/(\d+) confirmed.*/, 'Waiting... $1s ($2/$3 splits confirmed)')
+                        .replace(/Waiting for spendable balance/, 'Waiting for wallet balance to confirm')
+                        .replace(/Step (\d+)\/(\d+).*Waiting for XCH pool coins/, 'Step $1/$2: Waiting for XCH pool coins to confirm')
+                        .replace(/Step (\d+)\/(\d+).*Waiting for CAT pool coins/, 'Step $1/$2: Waiting for token pool coins to confirm')
+                        .replace(/Step (\d+)\/(\d+).*XCH (\w+) split submitted \((\d+)\/(\d+)\)/, 'Step $1/$2: XCH $3 split sent ($4/$5)')
+                        .replace(/Step (\d+)\/(\d+).*CAT (\w+) split submitted \((\d+)\/(\d+)\)/, 'Step $1/$2: Token $3 split sent ($4/$5)')
+                        .replace(/Step (\d+)\/(\d+).*Waiting for (\d+) splits to confirm/, 'Step $1/$2: Waiting for $3 splits to confirm on-chain')
+                        .replace(/Step (\d+)\/(\d+).*waiting for (.+) \((\d+)\/(\d+)\)/, 'Step $1/$2: Waiting for confirmations ($4/$5)')
+                        // Fee coin cleanup
+                        .replace(/Consolidating (\d+) spare fee coins.*/, 'Tidying up $1 spare fee coins')
+                        .replace(/Fee coin consolidation.*/, 'Cleaning up spare fee coins')
+                        .replace(/fee.*consolidat/i, 'Tidying spare fee coins')
+                        // Final messages
                         .replace(/🎉 All \d+ splits confirmed!/, '🎉 All splits confirmed!')
                         .replace(/COIN PREPARATION COMPLETE!/, 'Coin preparation complete!')
                         .replace(/🏗️ TIER MODE:/, 'Coin layout:')
@@ -26783,21 +26823,35 @@ function closeCtgErrorModal() {
                 const phaseEl = document.getElementById('cpProgressPhase');
                 if (phaseEl) {
                     const phaseLabels = {
-                        'idle': 'Waiting',
-                        'analyzing': 'Analysing wallet coins',
-                        'consolidating': 'Consolidating coins',
-                        'creating_pool': 'Creating coin pools',
-                        'splitting_xch': 'Splitting XCH coins',
-                        'splitting_cat': 'Splitting token coins',
-                        'splitting': 'Preparing coins',
-                        'verifying': 'Verifying coins',
+                        'idle': 'Getting ready',
+                        'analyzing': 'Checking your wallet',
+                        'consolidating': 'Tidying spare fee coins',
+                        'creating_pool': 'Creating pool coins for each tier',
+                        'splitting_xch': 'Splitting XCH into trading coins',
+                        'splitting_cat': 'Splitting tokens into trading coins',
+                        'splitting': 'Splitting coins for trading',
+                        'verifying': 'Waiting for on-chain confirmations',
                         'complete': 'Complete!',
                         'error': 'Error occurred'
                     };
-                    // Use the message from the worker if it contains step info,
-                    // otherwise fall back to the phase label
+                    // Show a short human-readable phase label (not the full message,
+                    // which is shown separately in cpProgressMessage below).
+                    // Extract just the step number and a short label from the message.
+                    let label;
                     const msgHasStep = status.message && status.message.includes('Step ');
-                    const label = msgHasStep ? status.message : (phaseLabels[status.phase] || status.phase || 'Working');
+                    if (msgHasStep) {
+                        const stepMatch = status.message.match(/Step (\d+\/\d+)/);
+                        const stepNum = stepMatch ? stepMatch[1] : '';
+                        // Short phase label based on step content
+                        if (status.message.includes('Waiting for XCH pool')) label = `Step ${stepNum}: Waiting for XCH pool coins`;
+                        else if (status.message.includes('Waiting for CAT pool')) label = `Step ${stepNum}: Waiting for token pool coins`;
+                        else if (status.message.includes('split submitted')) label = `Step ${stepNum}: Splitting coins`;
+                        else if (status.message.includes('waiting for')) label = `Step ${stepNum}: Waiting for confirmations`;
+                        else if (status.message.includes('Waiting for')) label = `Step ${stepNum}: ${status.message.replace(/\(.*$/, '').trim()}`;
+                        else label = `Step ${stepNum}`;
+                    } else {
+                        label = phaseLabels[status.phase] || status.phase || 'Working';
+                    }
                     if (status.phase !== 'complete' && status.phase !== 'error') {
                         // Animated dots
                         const dotCount = (Math.floor(Date.now() / 500) % 4);
@@ -26809,9 +26863,18 @@ function closeCtgErrorModal() {
                     }
                 }
                 
-                // Update message
+                // Update message — hide when phase label already shows the step info
+                // to avoid showing the same text twice
                 const msgEl = document.getElementById('cpProgressMessage');
-                if (msgEl && status.message) msgEl.textContent = status.message;
+                if (msgEl) {
+                    if (msgHasStep) {
+                        // Phase label already shows the step — hide duplicate
+                        msgEl.style.display = 'none';
+                    } else if (status.message) {
+                        msgEl.style.display = '';
+                        msgEl.textContent = status.message;
+                    }
+                }
                 
                 // Update coin counts (show current / target if target available)
                 const xchEl = document.getElementById('cpProgressXchCoins');

@@ -2768,7 +2768,8 @@ def _get_still_locked_trade_ids(trade_ids: set, owned_coin_map: Optional[Dict]) 
 
 
 def cancel_offers_batch(trade_ids: list, secure: bool = True, max_workers: int = 3,
-                        fee_mojos: Optional[int] = None):
+                        fee_mojos: Optional[int] = None,
+                        skip_confirmation: bool = False):
     """Cancel multiple offers — tries Sage's bulk cancel_offers first,
     falls back to sequential cancel_offer if bulk fails.
 
@@ -2917,6 +2918,18 @@ def cancel_offers_batch(trade_ids: list, secure: bool = True, max_workers: int =
             except Exception as e:
                 print(f"❌ [Sage] Failed to cancel offer {tid}: {e}")
                 results[tid] = {"success": False, "error": str(e)}
+
+    # --- Skip confirmation if caller requested fire-and-forget mode ---
+    # Used by the requote path: requote_side() creates new offers BEFORE
+    # cancelling old ones, so the orderbook stays populated. Waiting 90-150s
+    # for on-chain confirmation blocks the entire bot loop and prevents
+    # mid-price updates, fill detection, and sniper management.
+    # The retry_failed_cancels() background loop will handle any cancels
+    # that don't confirm, and the trim pass will clean up over-allocation.
+    if skip_confirmation:
+        print(f"   📨 [Sage] Skipping on-chain confirmation (requote fire-and-forget mode). "
+              f"Background retry will handle any failures.")
+        return results
 
     # --- Confirmation polling: verify cancels actually happened ON-CHAIN ---
     # CRITICAL: Sage wallet may optimistically remove cancelled offers from its

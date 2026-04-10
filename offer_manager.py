@@ -1313,7 +1313,7 @@ class OfferManager:
         offer_specs = []
         for i in range(num):
             if self._stop_requested:
-                log_event("warning", "ladder_interrupted",
+                log_event("info", "ladder_interrupted",
                           f"Ladder creation interrupted by stop signal after "
                           f"{len(offer_specs)}/{num} {side} offers planned")
                 break
@@ -1990,7 +1990,7 @@ class OfferManager:
         while offers_remaining:
             # Check stop signal between batches
             if self._stop_requested:
-                log_event("warning", "requote_interrupted",
+                log_event("info", "requote_interrupted",
                           f"Requote interrupted by stop signal after "
                           f"{batches_done} batches ({len(all_new_offers)} new offers)")
                 break
@@ -2031,7 +2031,8 @@ class OfferManager:
                               f"Requote {side}: open={current_open} >= cap={batch_limit}, "
                               f"skipping new offer creation this batch to prevent "
                               f"over-allocation")
-                    self.cancel_offers(batch_trade_ids, reason="requote_overalloc")
+                    self.cancel_offers(batch_trade_ids, reason="requote_overalloc",
+                                      skip_confirmation=True)
                     break
 
                 # Step 1: Create new offers using available spare coins
@@ -2062,7 +2063,8 @@ class OfferManager:
                                        if o.get("trade_id")]
                         if partial_ids:
                             self.cancel_offers(partial_ids,
-                                               reason="requote_rollback")
+                                               reason="requote_rollback",
+                                               skip_confirmation=True)
                     return {
                         "offers": all_new_offers,
                         "fully_replaced": False,
@@ -2081,10 +2083,14 @@ class OfferManager:
                             dexie_manager.queue_post(bech32, trade_id)
 
                 # Step 3: NOW cancel the old offers (orderbook stays populated)
+                # skip_confirmation=True: new offers are already live, don't block
+                # the bot loop for 90-150s waiting for on-chain cancel confirmation.
+                # Background retry + trim pass will handle any cancel failures.
                 log_event("info", "requote_batch_cancel",
                           f"Rolling wave {side} batch {batch_num}: "
                           f"cancelling {batch_count} old offers")
-                cancel_results = self.cancel_offers(batch_trade_ids, reason="requote")
+                cancel_results = self.cancel_offers(batch_trade_ids, reason="requote",
+                                                    skip_confirmation=True)
 
                 cancel_ok = sum(1 for r in cancel_results.values()
                                 if r and r.get("success"))
@@ -2116,7 +2122,8 @@ class OfferManager:
                           f"Rolling wave {side} batch {batch_num}: "
                           f"cancelling {batch_count} offers (cancel-first — "
                           f"0 spare coins)")
-                self.cancel_offers(batch_trade_ids, reason="requote")
+                self.cancel_offers(batch_trade_ids, reason="requote",
+                                   skip_confirmation=True)
 
                 # Wait for wallet to free the coins from cancelled offers
                 max_poll_secs = max(cfg.REQUOTE_COIN_FREE_WAIT, 15)
@@ -2141,7 +2148,7 @@ class OfferManager:
                         log_event("debug", "requote_coin_poll_failed",
                                   f"Requote coin-free poll failed: {e}")
                 if not coins_ready:
-                    log_event("warning", "requote_coins_slow",
+                    log_event("info", "requote_coins_slow",
                               f"Coins not yet freed after {max_poll_secs}s — "
                               f"creating offers anyway (may partially fail)")
 
@@ -2200,7 +2207,8 @@ class OfferManager:
     # -------------------------------------------------------------------
 
     def cancel_offers(self, trade_ids: List[str], reason: str = "manual",
-                      force_storm: bool = False) -> Dict:
+                      force_storm: bool = False,
+                      skip_confirmation: bool = False) -> Dict:
         """Cancel a list of offers.
 
         Marks them as bot-cancelled so fill detection doesn't count them as fills.
@@ -2256,7 +2264,8 @@ class OfferManager:
                 pass  # lifecycle update is additive — never block cancel
 
         # Sequential cancel (NEVER parallel — breaks the Chia wallet)
-        results = cancel_offers_batch(trade_ids, secure=True)
+        results = cancel_offers_batch(trade_ids, secure=True,
+                                      skip_confirmation=skip_confirmation)
 
         # Log results summary
         successes = sum(1 for r in results.values() if r and r.get("success"))
@@ -2888,7 +2897,7 @@ class OfferManager:
             if not cancel_ids:
                 continue
 
-            log_event("warning", "trim_excess_offers",
+            log_event("info", "trim_excess_offers",
                       f"Trim pass: {side} open={len(open_offers)} > cap={cap}, "
                       f"cancelling {len(cancel_ids)} furthest-from-mid offer(s)")
 
