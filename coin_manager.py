@@ -5359,3 +5359,4 @@ class CoinManager:
             "no_coins_backoff": self._no_coins_backoff,
             "inventory": self.get_inventory_summary(),
         }
+
