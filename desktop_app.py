@@ -75,7 +75,7 @@ def _bundle_path(relative: str) -> str:
 # Version & constants
 # ---------------------------------------------------------------------------
 APP_NAME = "CATalyst"
-APP_VERSION = "4.0.0"
+APP_VERSION = "1.0.0"
 FLASK_HOST = "127.0.0.1"
 FLASK_PORT = 5000
 WINDOW_WIDTH = 1600

@@ -18,7 +18,7 @@ FEATURES:
 - Uses CLI commands for fast splitting
 
 Author: Market Maker Bot Team
-Version: 4.0 (PARALLEL OPTIMIZED)
+Version: 1.0.0
 """
 
 import os
