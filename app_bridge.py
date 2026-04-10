@@ -43,6 +43,7 @@ SECURITY MODEL:
     during PyWebView initialization. This is Phase 3+ work.
 """
 
+import inspect
 import json
 import traceback
 from decimal import Decimal
@@ -65,9 +66,31 @@ def _safe(func):
     Decorator that wraps bridge methods in try/except.
     Returns {"success": False, "error": "..."} on any exception.
     This prevents JS from getting cryptic Python tracebacks.
+
+    Also trims excess positional arguments so no-arg bridge methods
+    don't crash when the JS side accidentally passes an argument.
+    PyWebView serialises a JS ``undefined`` as a positional Python
+    argument, which used to blow up every ``def get_foo(self):`` method
+    with "takes 1 positional argument but 2 were given". We introspect
+    the wrapped function once at decoration time, record the maximum
+    number of positional args it accepts, and clip incoming ``args`` to
+    that length unless the function declares ``*args`` itself.
     """
+    sig = inspect.signature(func)
+    params = list(sig.parameters.values())
+    _POSITIONAL_KINDS = (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.POSITIONAL_ONLY,
+    )
+    max_positional = sum(1 for p in params if p.kind in _POSITIONAL_KINDS)
+    has_var_positional = any(
+        p.kind is inspect.Parameter.VAR_POSITIONAL for p in params
+    )
+
     def wrapper(*args, **kwargs):
         try:
+            if not has_var_positional and len(args) > max_positional:
+                args = args[:max_positional]
             result = func(*args, **kwargs)
             # Recursively convert any Decimals in the result
             return json.loads(json.dumps(result, cls=DecimalEncoder))
@@ -638,17 +661,36 @@ class AppBridge:
     @_safe
     def download_logs(self):
         """Download logs. Maps to GET /api/logs/download.
-        Returns a data URL for JS to trigger a download."""
+        Returns a data URL for JS to trigger a download.
+
+        The backend returns a ZIP debug bundle (not a plain .txt log) —
+        the filename here must reflect that or browsers will save the
+        file with the wrong extension and refuse to open it.
+        """
         import api_server
         import base64
+        import re
+        from datetime import datetime, timezone
         with api_server.app.test_request_context('/api/logs/download'):
             resp = api_server.api_logs_download()
         try:
             if hasattr(resp, 'data'):
                 b64 = base64.b64encode(resp.data).decode('utf-8')
-                ct = resp.content_type or 'text/plain'
+                ct = resp.content_type or 'application/zip'
+                # Prefer the filename the Flask handler already set via
+                # Content-Disposition so the two paths stay in sync.
+                filename = None
+                try:
+                    cd = resp.headers.get('Content-Disposition', '') if hasattr(resp, 'headers') else ''
+                    m = re.search(r'filename=([^;]+)', cd or '')
+                    if m:
+                        filename = m.group(1).strip().strip('"')
+                except Exception:
+                    filename = None
+                if not filename:
+                    filename = 'bot_debug_bundle_' + datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S') + '.zip'
                 return {"success": True, "data_url": f"data:{ct};base64,{b64}",
-                        "filename": "bot_logs.txt"}
+                        "filename": filename}
         except Exception:
             pass
         return _unwrap_flask_response(resp)
@@ -967,7 +1009,7 @@ class AppBridge:
     def get_app_info(self):
         """Return app metadata for the titlebar / about dialog."""
         return {
-            "name": "Chia Market Maker",
+            "name": "CATalyst",
             "version": "4.0.0",
             "mode": "desktop",
             "platform": __import__("sys").platform,
@@ -976,6 +1018,55 @@ class AppBridge:
     # -----------------------------------------------------------------------
     # Window management (called from custom titlebar)
     # -----------------------------------------------------------------------
+
+    @_safe
+    def confirm_close_window(self):
+        """Mark the window as 'confirmed for close' and trigger it.
+
+        The shutdown modal in the GUI calls this after the user clicks
+        the final 'Shutdown App' button. It flips the _state.confirmed_close
+        flag in desktop_app so the on_closing() hook lets the close go
+        through instead of re-opening the modal.
+
+        Safety guard: the bot must already be stopped. This prevents any
+        untrusted JS (e.g. via an XSS-injected payload) from destroying
+        the window while the bot is actively trading, which would lose
+        the user's chance to cancel open offers.
+        """
+        try:
+            # Gate: refuse while the bot is still running — the shutdown
+            # modal is expected to have called /api/bot/stop (and waited)
+            # before invoking this.
+            try:
+                import api_server
+                if api_server.bot and getattr(api_server.bot, "_running", False):
+                    return {
+                        "success": False,
+                        "error": "Bot is still running. Stop the bot before closing the window.",
+                    }
+            except Exception:
+                # If we can't even check, fall through and let the close
+                # proceed — the modal shouldn't have reached this point
+                # unless the rest of the shutdown sequence already ran.
+                pass
+
+            import desktop_app as _da
+            if hasattr(_da, "_state"):
+                _da._state["confirmed_close"] = True
+                # Persist window geometry now — destroy() may bypass the
+                # on_closing hook depending on PyWebView backend.
+                try:
+                    win = _da._state.get("window")
+                    if win and hasattr(_da, "_save_window_state"):
+                        _da._save_window_state(win)
+                except Exception:
+                    pass
+            import webview
+            if webview.windows:
+                webview.windows[0].destroy()
+            return {"success": True}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
     @_safe
     def minimize_window(self):

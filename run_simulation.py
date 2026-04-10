@@ -658,7 +658,7 @@ def main() -> int:
         Exit code (0 = success, 1 = error).
     """
     parser = argparse.ArgumentParser(
-        description="Chia Market Maker — Simulation Runner",
+        description="CATalyst — Simulation Runner",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__.strip(),
     )
@@ -778,7 +778,7 @@ def main() -> int:
 
     # Run scenarios
     print()
-    print("Chia Market Maker — Simulation Runner")
+    print("CATalyst — Simulation Runner")
     print("=" * 40)
 
     if args.mock:

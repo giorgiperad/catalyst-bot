@@ -28,7 +28,7 @@ import secrets
 import webbrowser
 from decimal import Decimal
 from datetime import datetime, timezone
-from typing import Dict
+from typing import Any, Dict
 from urllib.parse import urlparse, quote
 
 # ---------------------------------------------------------------------------
@@ -64,7 +64,6 @@ from database import (
     get_connection,
     get_live_tier_group_counts,
 )
-from coin_manager import get_tier_distribution, get_weighted_tier_prep_counts
 from tx_fees import get_fee_settings_snapshot
 
 _APP_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -136,6 +135,24 @@ _RATE_LIMIT_EXEMPT_WRITE_ROUTES = {
     "/api/splash/incoming",
     "/api/log",              # GUI flushes buffered log entries in bursts
 }
+
+# Dedicated limiter for /api/splash/incoming so an unbounded webhook flood
+# cannot amplify into runaway DB writes. 200/sec per process is still
+# generous for a local webhook but prevents a pathological flood.
+_SPLASH_RATE_LIMIT = {"window_s": 1.0, "max": 200, "hits": [], "lock": threading.Lock()}
+def _splash_incoming_rate_limited() -> bool:
+    import time as _t
+    now = _t.time()
+    with _SPLASH_RATE_LIMIT["lock"]:
+        hits = _SPLASH_RATE_LIMIT["hits"]
+        cutoff = now - _SPLASH_RATE_LIMIT["window_s"]
+        # Drop expired entries
+        while hits and hits[0] < cutoff:
+            hits.pop(0)
+        if len(hits) >= _SPLASH_RATE_LIMIT["max"]:
+            return True
+        hits.append(now)
+        return False
 
 # ---------------------------------------------------------------------------
 # Simple per-endpoint rate limiter for state-changing operations
@@ -237,9 +254,23 @@ def _api_error(e: Exception, endpoint: str = "", status: int = 500):
 # ---------------------------------------------------------------------------
 
 def _check_env_file_permissions():
-    """Warn if the .env file is readable by group or others."""
+    """Warn if the .env file is readable by group or others.
+
+    POSIX permission bits only have meaningful semantics on Unix-like
+    platforms. On Windows, ``os.stat()`` happily returns an ``st_mode``
+    value with group/other bits set (NTFS typically reports 0o666), so
+    the naive mask check fires a false-positive on every startup — we
+    saw it spamming the logs tab. Skip the check entirely on Windows
+    where NTFS ACLs are the actual access-control layer.
+    """
+    if sys.platform == "win32":
+        return
     import stat as _stat
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    try:
+        from user_paths import env_file as _env_file
+        env_path = _env_file()
+    except Exception:
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     if not os.path.exists(env_path):
         return
     try:
@@ -255,7 +286,7 @@ def _check_env_file_permissions():
             except Exception:
                 pass
     except OSError:
-        pass  # Windows does not support POSIX permission bits — skip silently
+        pass
 
 
 _check_env_file_permissions()
@@ -394,22 +425,47 @@ def _get_spacescan_market_context(asset_id: str = "", ticker_id: str = "",
         from database import get_market_analysis_cache
         spacescan = get_market_analysis_cache(asset_id, "spacescan") or {}
         analysis = get_market_analysis_cache(asset_id, "full_analysis") or {}
-        if not spacescan or not analysis:
-            # Cache not yet populated — return empty context rather than triggering
-            # a full background data collection here. Smart Defaults populates this
-            # cache when explicitly run. Triggering it here races with Smart Defaults
-            # (both clear + refill the same cache simultaneously on CAT switch),
-            # producing duplicate "(5/6)/(6/6)" log entries and potential stale data.
+        if not spacescan:
+            # Spacescan raw data not cached at all — return empty context rather than
+            # triggering a full background data collection here. Smart Defaults
+            # populates this cache when explicitly run.
             return context
+        # full_analysis may have expired (30min TTL) while spacescan data (24hr TTL)
+        # is still valid. Use spacescan raw data directly, fall back to analysis
+        # for derived fields (activity_level, risk_level) when available.
         health = (analysis.get("token_health") or {}) if isinstance(analysis, dict) else {}
 
         context["has_data"] = bool(spacescan.get("has_data"))
         context["token_preview_url"] = str(spacescan.get("token_preview_url", "") or "")
         context["holder_count"] = int(spacescan.get("holder_count", 0) or 0)
         context["activity_count"] = int(spacescan.get("activity_count", 0) or 0)
-        context["activity_level"] = str(health.get("activity_level", "unknown") or "unknown")
-        context["risk_level"] = str(health.get("risk_level", "unknown") or "unknown")
-        context["confidence"] = str(health.get("confidence", "low") or "low")
+        # Derive activity_level and risk_level from raw spacescan data when
+        # full_analysis has expired but spacescan cache is still valid.
+        if health:
+            context["activity_level"] = str(health.get("activity_level", "unknown") or "unknown")
+            context["risk_level"] = str(health.get("risk_level", "unknown") or "unknown")
+            context["confidence"] = str(health.get("confidence", "low") or "low")
+        else:
+            # Derive from raw spacescan data inline (same logic as _analyze_token_health)
+            hc = context["holder_count"]
+            ac = int(spacescan.get("activity_count", 0) or 0)
+            if hc >= 200:
+                context["risk_level"] = "healthy"
+            elif hc >= 50:
+                context["risk_level"] = "moderate"
+            elif hc > 0:
+                context["risk_level"] = "thin"
+            else:
+                context["risk_level"] = "unknown"
+            if ac >= 500:
+                context["activity_level"] = "active"
+            elif ac >= 100:
+                context["activity_level"] = "moderate"
+            elif ac > 0:
+                context["activity_level"] = "quiet"
+            else:
+                context["activity_level"] = "unknown"
+            context["confidence"] = "medium" if hc > 0 else "low"
         context["price_xch"] = float(spacescan.get("price_xch", 0) or 0)
         context["price_usd"] = float(spacescan.get("price_usd", 0) or 0)
         context["circulating_supply"] = float(spacescan.get("circulating_supply", 0) or 0)
@@ -744,6 +800,9 @@ _active_cat = {
     "decimals": getattr(cfg, "CAT_DECIMALS", None),
     "ticker_id": getattr(cfg, "CAT_TICKER_ID", None) or None,
 }
+# Lock for multi-key mutations of _active_cat so readers never see a
+# half-updated pair (e.g. asset_id from the new CAT but decimals from the old).
+_active_cat_lock = threading.Lock()
 # Auto-fix: Dexie ticker format is "{CAT}_XCH" e.g. "SBX_XCH" (V1 confirmed)
 if _active_cat["ticker_id"] and "_" not in _active_cat["ticker_id"]:
     _active_cat["ticker_id"] = f"{_active_cat['ticker_id']}_XCH"
@@ -764,10 +823,11 @@ def _background_cat_resolve():
         meta = _resolve_cat(cfg)
         if meta:
             # Keep _active_cat in sync with any newly resolved fields
-            if meta.get("ticker_id") and not _active_cat.get("ticker_id"):
-                _active_cat["ticker_id"] = meta["ticker_id"]
-            if meta.get("name") and (not _active_cat.get("name") or _active_cat.get("name") == "MZ"):
-                _active_cat["name"] = meta["name"]
+            with _active_cat_lock:
+                if meta.get("ticker_id") and not _active_cat.get("ticker_id"):
+                    _active_cat["ticker_id"] = meta["ticker_id"]
+                if meta.get("name") and (not _active_cat.get("name") or _active_cat.get("name") == "MZ"):
+                    _active_cat["name"] = meta["name"]
             print(f"[STARTUP] CAT metadata resolved: pair_id={str(meta.get('pair_id') or '')[:20]}... "
                   f"ticker={meta.get('ticker_id')} name={meta.get('name')}")
     except Exception as e:
@@ -907,11 +967,6 @@ class AlertStore:
         with self._lock:
             return [a for a in self._alerts.values() if not a["dismissed"]]
 
-    def get_all(self) -> list:
-        """Get all alerts including dismissed ones."""
-        with self._lock:
-            return list(self._alerts.values())
-
 
 events = EventBus()
 alerts = AlertStore()
@@ -971,7 +1026,7 @@ def add_no_cache_headers(response):
             "script-src 'self' 'unsafe-inline'; "
             "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
             "font-src 'self' https://fonts.gstatic.com; "
-            "img-src 'self' data: https://icons.dexie.space; "
+            "img-src 'self' data: https://icons.dexie.space https://*.spacescan.io https://cdn.spacescan.io https://assets.spacescan.io; "
             "connect-src 'self'; "
             "frame-ancestors 'none'"
         )
@@ -1197,7 +1252,7 @@ def _reset_fresh_run_session(clear_coins: bool = False,
 
     if bot and getattr(bot, "risk_manager", None):
         try:
-            bot.risk_manager._net_position_cat = Decimal("0")
+            bot.risk_manager.reset_position()
         except Exception:
             pass
 
@@ -1280,6 +1335,280 @@ def api_open_external():
     if request.method == "GET":
         return Response("Opened external link", mimetype="text/plain")
     return jsonify({"success": True, "url": url})
+
+
+@app.route("/api/open-data-folder", methods=["POST"])
+def api_open_data_folder():
+    """Reveal the per-user data directory in the OS file manager.
+
+    Useful for support: users can click this button and then attach
+    crash.log / bot.db / bot_superlog_*.log to a bug report.
+    Loopback only and POST-only to prevent CSRF.
+    """
+    if not _is_loopback_addr(request.remote_addr):
+        return jsonify({"success": False, "error": "loopback_only"}), 403
+
+    try:
+        from user_paths import data_dir as _dd
+        folder = _dd()
+    except Exception as e:
+        return jsonify({"success": False, "error": f"data dir unavailable: {e}"}), 500
+
+    if not os.path.isdir(folder):
+        return jsonify({"success": False, "error": f"data dir does not exist: {folder}"}), 500
+
+    try:
+        if sys.platform == "win32":
+            os.startfile(folder)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            import subprocess as _sp
+            _sp.Popen(["open", folder])
+        else:
+            import subprocess as _sp
+            _sp.Popen(["xdg-open", folder])
+    except Exception as e:
+        return jsonify({"success": False, "error": f"could not open folder: {e}"}), 500
+
+    return jsonify({"success": True, "folder": folder})
+
+
+@app.route("/api/crash-log", methods=["GET"])
+def api_crash_log():
+    """Return the most recent crash.log contents (truncated) so the GUI
+    can show users why the app failed last time, with a button to copy
+    or email it to support.
+
+    Loopback only. Returns a bounded amount of text (256 KiB) and never
+    follows symlinks.
+    """
+    if not _is_loopback_addr(request.remote_addr):
+        return jsonify({"success": False, "error": "loopback_only"}), 403
+
+    try:
+        from user_paths import crash_log_file, data_dir as _dd
+        path = crash_log_file()
+        data_folder = _dd()
+    except Exception as e:
+        return jsonify({"success": False, "error": f"data dir unavailable: {e}"}), 500
+
+    if not os.path.isfile(path):
+        return jsonify({
+            "success": True,
+            "exists": False,
+            "path": path,
+            "folder": data_folder,
+            "content": "",
+            "size": 0,
+        })
+
+    try:
+        st = os.stat(path)
+    except OSError as e:
+        return jsonify({"success": False, "error": f"stat failed: {e}"}), 500
+
+    MAX_BYTES = 256 * 1024  # 256 KiB cap — plenty for a traceback
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            if st.st_size > MAX_BYTES:
+                fh.seek(st.st_size - MAX_BYTES)
+                content = "[... truncated — older content omitted ...]\n" + fh.read()
+            else:
+                content = fh.read()
+    except OSError as e:
+        return jsonify({"success": False, "error": f"read failed: {e}"}), 500
+
+    return jsonify({
+        "success": True,
+        "exists": True,
+        "path": path,
+        "folder": data_folder,
+        "content": content,
+        "size": st.st_size,
+        "mtime": st.st_mtime,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Version check against GitHub releases
+# ---------------------------------------------------------------------------
+#
+# The release API URL is configurable via the RELEASES_API_URL env var so
+# it can be changed without a redeploy, or disabled entirely (empty string).
+# It must return a GitHub-style JSON object with "tag_name" and "html_url".
+# We cache the result for 6 hours to avoid hammering GitHub's unauthenticated
+# rate limit (60 req/hr per IP).
+
+_UPDATE_CHECK_CACHE: dict = {"at": 0.0, "data": None}
+_UPDATE_CHECK_TTL = 6 * 3600  # 6 hours
+
+
+def _parse_semver(tag: str):
+    """Parse 'v1.2.3' / '1.2.3' into a (major, minor, patch) int tuple.
+
+    Returns None if the tag doesn't look like a semver. Extra pre-release /
+    build metadata after the patch number is ignored for comparison purposes.
+    """
+    if not tag:
+        return None
+    s = str(tag).strip().lstrip("vV")
+    head = s.split("-", 1)[0].split("+", 1)[0]
+    parts = head.split(".")
+    if len(parts) < 1:
+        return None
+    try:
+        nums = [int(p) for p in parts[:3]]
+    except ValueError:
+        return None
+    while len(nums) < 3:
+        nums.append(0)
+    return tuple(nums[:3])
+
+
+@app.route("/api/check-update", methods=["GET"])
+def api_check_update():
+    """Check whether a newer release is published on GitHub.
+
+    Returns:
+        {
+            "success": True,
+            "enabled": True/False,
+            "current": "4.0.0",
+            "latest": "4.1.0" | None,
+            "update_available": True/False,
+            "url": "https://github.com/.../releases/tag/v4.1.0" | None,
+            "checked_at": <unix ts>,
+        }
+
+    Loopback only. Silently caches for 6 hours. Never blocks the GUI —
+    network failures return `update_available: False` so the banner
+    stays hidden.
+    """
+    if not _is_loopback_addr(request.remote_addr):
+        return jsonify({"success": False, "error": "loopback_only"}), 403
+
+    current = get_app_version()
+    # Read the releases URL from the environment. It's loaded from .env
+    # via load_dotenv() in config.py, so any change + save is picked up
+    # on the next process start. Leaving this unset disables the check.
+    releases_url = str(os.environ.get("RELEASES_API_URL", "") or "").strip()
+
+    if not releases_url:
+        # Update checking is disabled entirely.
+        return jsonify({
+            "success": True,
+            "enabled": False,
+            "current": current,
+            "latest": None,
+            "update_available": False,
+            "url": None,
+            "checked_at": time.time(),
+        })
+
+    now = time.time()
+    cached = _UPDATE_CHECK_CACHE.get("data")
+    cached_at = float(_UPDATE_CHECK_CACHE.get("at") or 0)
+    if cached and (now - cached_at) < _UPDATE_CHECK_TTL:
+        return jsonify(cached)
+
+    latest_tag = None
+    release_url = None
+    try:
+        import requests as _req
+        r = _req.get(
+            releases_url,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": f"ChiaMarketMaker/{current}",
+            },
+            timeout=6,
+        )
+        if r.status_code == 200:
+            j = r.json()
+            latest_tag = str(j.get("tag_name") or "").strip() or None
+            release_url = str(j.get("html_url") or "").strip() or None
+    except Exception as e:
+        log_event("info", "update_check_failed", f"{e}")
+
+    cur_sv = _parse_semver(current)
+    lat_sv = _parse_semver(latest_tag) if latest_tag else None
+    update_available = bool(cur_sv and lat_sv and lat_sv > cur_sv)
+
+    result = {
+        "success": True,
+        "enabled": True,
+        "current": current,
+        "latest": latest_tag,
+        "update_available": update_available,
+        "url": release_url,
+        "checked_at": now,
+    }
+    _UPDATE_CHECK_CACHE["at"] = now
+    _UPDATE_CHECK_CACHE["data"] = result
+    return jsonify(result)
+
+
+# ---------------------------------------------------------------------------
+# Sage wallet release check (backend proxy for the startup version card)
+# ---------------------------------------------------------------------------
+#
+# The startup flow used to hit api.github.com directly from JavaScript to
+# see if the installed Sage is out of date. That works inside WebView2 on
+# Windows but fails with "Failed to fetch" in a plain browser because of
+# CORS on local-origin requests. Proxying through Flask removes the CORS
+# surface entirely, lets the same HTML run in dev mode without errors,
+# and gives us one place to cache + rate-limit the call.
+
+_SAGE_RELEASE_CACHE: dict = {"at": 0.0, "data": None}
+_SAGE_RELEASE_TTL = 6 * 3600  # 6 hours — GitHub's unauth rate limit is 60/hr
+
+
+@app.route("/api/sage/latest-release", methods=["GET"])
+def api_sage_latest_release():
+    """Return the latest Sage release tag from GitHub, cached 6 hours.
+
+    Response:
+        {"success": True, "tag": "0.12.10", "url": "https://..."}
+        {"success": False, "error": "..."} on failure (non-fatal for GUI)
+
+    Loopback only. Never raises to the caller — network failures return
+    success=False so the startup flow can skip the update card quietly.
+    """
+    if not _is_loopback_addr(request.remote_addr):
+        return jsonify({"success": False, "error": "loopback_only"}), 403
+
+    now = time.time()
+    cached = _SAGE_RELEASE_CACHE.get("data")
+    cached_at = float(_SAGE_RELEASE_CACHE.get("at") or 0)
+    if cached and (now - cached_at) < _SAGE_RELEASE_TTL:
+        return jsonify(cached)
+
+    try:
+        import requests as _req
+        r = _req.get(
+            "https://api.github.com/repos/xch-dev/sage/releases/latest",
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "ChiaMarketMaker/sage-version-check",
+            },
+            timeout=6,
+        )
+        if r.status_code != 200:
+            result = {"success": False, "error": f"github_http_{r.status_code}"}
+        else:
+            j = r.json()
+            tag = str(j.get("tag_name") or "").lstrip("vV").strip()
+            url = str(j.get("html_url") or "").strip() or None
+            if not tag:
+                result = {"success": False, "error": "no_tag_in_response"}
+            else:
+                result = {"success": True, "tag": tag, "url": url}
+    except Exception as e:
+        # Network error, timeout, DNS, etc. — non-fatal
+        result = {"success": False, "error": f"fetch_failed: {e}"}
+
+    _SAGE_RELEASE_CACHE["at"] = now
+    _SAGE_RELEASE_CACHE["data"] = result
+    return jsonify(result)
 
 
 # ---------------------------------------------------------------------------
@@ -1503,6 +1832,20 @@ def api_shutdown():
         except Exception:
             pass
 
+        # 4b. Checkpoint the SQLite WAL before calling os._exit(). Without
+        # this, recent writes sit in the -wal file; a hard exit can lose them.
+        try:
+            from database import get_connection as _get_conn
+            _conn = _get_conn()
+            _conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            try:
+                _conn.commit()
+            except Exception:
+                pass
+            print("   ✅ WAL checkpointed", flush=True)
+        except Exception as _wal_err:
+            print(f"   ⚠️ WAL checkpoint failed: {_wal_err}", flush=True)
+
         print("   Shutting down server...", flush=True)
         log_event("info", "server_shutdown", "Server shutting down via GUI")
 
@@ -1637,7 +1980,7 @@ def api_status():
                         norm_id = asset_id.lower().strip().replace("0x", "")
                         for p in resp.json():
                             p_id = str(p.get("asset_id", "")).lower().strip().replace("0x", "")
-                            if p_id == norm_id or p_id.rstrip("0") == norm_id.rstrip("0"):
+                            if p_id == norm_id:
                                 xr = Decimal(str(p.get("xch_reserve", 0))) / Decimal("1000000000000")
                                 tr = Decimal(str(p.get("token_reserve", 0))) / (Decimal(10) ** int(cat_dec))
                                 if tr > 0:
@@ -1941,7 +2284,7 @@ def api_status():
                         norm_id = asset_id.lower().strip().replace("0x", "")
                         for p in resp.json():
                             p_id = str(p.get("asset_id", "")).lower().strip().replace("0x", "")
-                            if p_id == norm_id or p_id.rstrip("0") == norm_id.rstrip("0"):
+                            if p_id == norm_id:
                                 xr = float(p.get("xch_reserve", 0)) / 1e12
                                 tr = float(p.get("token_reserve", 0)) / (10 ** int(cat_dec))
                                 if tr > 0:
@@ -2214,7 +2557,24 @@ def api_status():
             limit=50,
         )
         if not history_out:
-            history_out = _serialize_list(fills_data.get("recent") or [])
+            # F46 (2026-04-09): the fallback path returns raw fill rows
+            # which lack the `status`/`price` keys the GUI expects.
+            # Normalise the shape here so updateHistory() doesn't throw.
+            raw_recent = _serialize_list(fills_data.get("recent") or [])
+            history_out = []
+            for it in raw_recent:
+                if not isinstance(it, dict):
+                    history_out.append(it)
+                    continue
+                norm = dict(it)
+                if "status" not in norm or not norm.get("status"):
+                    vs = str(norm.get("verification_status") or "").lower()
+                    norm["status"] = "FILLED" if vs in ("verified", "confirmed") else (vs.upper() or "FILLED")
+                if "price" not in norm and "price_xch" in norm:
+                    norm["price"] = norm["price_xch"]
+                if "cat_name" not in norm:
+                    norm["cat_name"] = _active_cat.get("name") or getattr(cfg, "CAT_NAME", "") or "CAT"
+                history_out.append(norm)
         offers_out = {
             "buy": _serialize_list(enriched_buy),
             "sell": _serialize_list(enriched_sell),
@@ -2386,6 +2746,21 @@ def api_status():
         if hasattr(bot, '_bot_state') and bot._bot_state.get("arb_gap_bps"):
             arb_gap_val = bot._bot_state["arb_gap_bps"]
 
+        # --- Risk manager state ---
+        # F48 (2026-04-09): previously /api/status had no 'risk' key at all,
+        # so monitoring scripts that queried for net_position_cat always got
+        # None. Expose the inventory state dict directly so the dashboard
+        # and external monitors can see the bot's own position estimate.
+        risk_out: Dict[str, Any] = {}
+        try:
+            if hasattr(bot, "risk_manager") and bot.risk_manager:
+                inv = bot.risk_manager.get_inventory_state() or {}
+                # get_inventory_state() already serializes Decimals to strings,
+                # but wrap in _serialize_dict for defence-in-depth.
+                risk_out = _serialize_dict(dict(inv))
+        except Exception as _risk_err:
+            risk_out = {"error": f"risk_state_unavailable: {_risk_err}"}
+
         # --- Assemble response ---
         result = {
             "running": raw.get("running", False),
@@ -2397,6 +2772,7 @@ def api_status():
             "coin_tracking": coin_tracking,
             "spread_bps": spread_bps_val,
             "arb_gap_bps": arb_gap_val,
+            "risk": risk_out,
             "sniper": raw.get("sniper") or {},
             "diagnostics": raw.get("diagnostics") or {},
             "chia_health": _get_health_snapshot() if not raw.get("running", False) else (raw.get("chia_health") or {}),
@@ -2435,6 +2811,127 @@ def api_runtime_diagnostics():
         return jsonify(_serialize_dict(raw.get("diagnostics") or {}))
     except Exception as e:
         return _api_error(e, request.path)
+
+
+@app.route("/api/diagnostics/api-stats")
+def api_diagnostics_api_stats():
+    """F45 (2026-04-08): unified usage stats for all 3 external APIs.
+
+    Returns counters for Spacescan (paid call budget), Coinset (hit
+    rate vs wallet RPC fallback) and Dexie (post queue, v3 cache),
+    plus the live circuit-breaker / rate-limit cooldown status for
+    each one. Drives the diagnostics panel so the operator can see
+    at a glance which API is doing the work and how much budget is
+    left before the bot has to fall back.
+    """
+    payload: Dict[str, Any] = {
+        "spacescan": {"available": False},
+        "coinset":   {"available": False},
+        "dexie":     {"available": False},
+    }
+
+    # --- Spacescan ----------------------------------------------------
+    try:
+        import spacescan as _ss
+        stats = _ss.get_api_stats() or {}
+        payload["spacescan"] = {
+            "available": True,
+            "tier": stats.get("tier", "unknown"),
+            "calls_this_session": int(stats.get("calls_this_session", 0) or 0),
+            "calls_today": int(stats.get("calls_today", 0) or 0),
+            "daily_budget": stats.get("daily_budget", "unknown"),
+            "session_uptime_hours": float(stats.get("session_uptime_hours", 0) or 0),
+            "call_interval_secs": float(stats.get("call_interval_secs", 0) or 0),
+            "rate_limited_until": getattr(_ss, "_rate_limited_until", 0.0),
+        }
+        # Compute remaining budget when daily_budget is numeric
+        try:
+            db = stats.get("daily_budget")
+            if isinstance(db, (int, float)) and db > 0:
+                payload["spacescan"]["budget_remaining"] = max(
+                    0, int(db) - int(stats.get("calls_today", 0) or 0)
+                )
+        except Exception:
+            pass
+    except Exception as e:
+        payload["spacescan"]["error"] = str(e)
+
+    # --- Coinset ------------------------------------------------------
+    try:
+        if bot is not None and getattr(bot, "coinset_client", None):
+            cstats = bot.coinset_client.get_stats() or {}
+            payload["coinset"] = {
+                "available": True,
+                # F53 (2026-04-09): mode tells the operator which code path
+                # the client is using. "sage_compat" is the expected state
+                # for Sage wallets — the puzzle-hash cache is intentionally
+                # skipped, but the individual coin / block / hint APIs are
+                # still heavily used via api_calls_total below.
+                "mode": str(cstats.get("mode", "unknown")),
+                "initialized": bool(cstats.get("initialized", False)),
+                "puzzle_hashes_cached": int(cstats.get("puzzle_hashes_cached", 0) or 0),
+                # Legacy counter (only fires when puzzle-hash cache is active)
+                "total_queries": int(cstats.get("total_queries", 0) or 0),
+                "coinset_hits": int(cstats.get("coinset_hits", 0) or 0),
+                "coinset_misses": int(cstats.get("coinset_misses", 0) or 0),
+                "fallback_count": int(cstats.get("fallback_count", 0) or 0),
+                "hit_rate_pct": float(cstats.get("hit_rate_pct", 0) or 0),
+                # F53 counters — fire on every HTTP request regardless of mode
+                "api_calls_total": int(cstats.get("api_calls_total", 0) or 0),
+                "api_calls_by_method": dict(cstats.get("api_calls_by_method", {}) or {}),
+                "api_errors_total": int(cstats.get("api_errors_total", 0) or 0),
+                "last_coinset_time_ms": float(cstats.get("last_coinset_time_ms", 0) or 0),
+                "healthy": bool(cstats.get("healthy", False)),
+                "consecutive_failures": int(cstats.get("consecutive_failures", 0) or 0),
+                "rate_limited_until": float(getattr(bot.coinset_client, "_rate_limited_until", 0.0) or 0),
+            }
+    except Exception as e:
+        payload["coinset"]["error"] = str(e)
+
+    # --- Dexie --------------------------------------------------------
+    try:
+        if bot is not None and getattr(bot, "dexie_manager", None):
+            dstats = bot.dexie_manager.get_stats() or {}
+            payload["dexie"] = {
+                "available": True,
+                # Legacy keys kept for backward compat
+                "total_posted": int(dstats.get("total_posted", 0) or 0),
+                "total_failed": int(dstats.get("total_failed", 0) or 0),
+                "total_skipped": int(dstats.get("total_skipped", 0) or 0),
+                "queue_size": int(dstats.get("queue_size", 0) or 0),
+                "tracked_mappings": int(dstats.get("tracked_mappings", 0) or 0),
+                "fingerprints_cached": int(dstats.get("fingerprints_cached", 0) or 0),
+                # F53 (2026-04-09): session-scoped counters with clearer
+                # semantics. session_posted = posts since bot process
+                # started; known_mappings = DB-hydrated + session posts;
+                # hydrated_from_db = true when DB had mappings we loaded
+                # at startup (explains the common "0 posted, N known"
+                # pattern right after a restart).
+                "session_posted": int(dstats.get("session_posted", 0) or 0),
+                "session_failed": int(dstats.get("session_failed", 0) or 0),
+                "session_skipped": int(dstats.get("session_skipped", 0) or 0),
+                "known_mappings": int(dstats.get("known_mappings", 0) or 0),
+                "hydrated_from_db": bool(dstats.get("hydrated_from_db", False)),
+                "rate_limited_until": float(getattr(bot.dexie_manager, "_rate_limited_until", 0.0) or 0),
+                "v3_trades_cached_pairs": len(getattr(bot.dexie_manager, "_v3_trades_cache", {}) or {}),
+                "v3_pairs_cached": bool(getattr(bot.dexie_manager, "_v3_pairs_cache", None)),
+            }
+    except Exception as e:
+        payload["dexie"]["error"] = str(e)
+
+    # F53 (2026-04-09): human-readable timestamp without microseconds.
+    # Previously this returned a full ISO 8601 with microseconds + offset
+    # (e.g. "2026-04-09T10:30:07.842809+00:00") which the operator found
+    # confusing. Now we return a clean "YYYY-MM-DD HH:MM:SS UTC" string
+    # plus the raw ISO as a secondary field for programmatic use.
+    try:
+        _now = datetime.now(timezone.utc)
+        payload["generated_at"] = _now.strftime("%Y-%m-%d %H:%M:%S UTC")
+        payload["generated_at_iso"] = _now.isoformat(timespec="seconds")
+    except Exception:
+        payload["generated_at"] = None
+        payload["generated_at_iso"] = None
+    return jsonify(payload)
 
 
 def _sage_ts_to_iso(ts) -> str:
@@ -2513,9 +3010,9 @@ def api_config_update():
       Single:  {"key": "SPREAD_BPS", "value": "800"}
       Bulk:    {"spread_bps": 800, "loop_seconds": 90, ...}
     """
-    data = request.get_json()
-    if not data:
-        return jsonify({"success": False, "error": "Missing JSON body"}), 400
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"success": False, "error": "Invalid request body"}), 400
 
     # Block security-sensitive settings from API modification.
     # These can only be changed by editing .env directly.
@@ -2541,7 +3038,7 @@ def api_config_update():
         value = data["value"]
         if key in blocked:
             return jsonify({"success": False, "error": f"Cannot modify {key} via API"}), 403
-        ok = cfg.update(key, str(value))
+        ok = cfg.update(key, str(value), source="api_settings_save")
         if ok:
             extra = None
             if key == "SAGE_SET_CHANGE_ADDRESS" and str(value).strip().lower() in ("true", "1", "yes", "on"):
@@ -2575,7 +3072,13 @@ def api_config_update():
             "requote_batch_size": "REQUOTE_BATCH_SIZE",
             "xch_reserve": "XCH_RESERVE",
             "cat_reserve": "CAT_RESERVE",
-            "max_mid_move_bps": "MAX_MID_MOVE_BPS",
+            # F49 (2026-04-09): topup pool (two-tier reserve system)
+            "topup_pool_pct": "TOPUP_POOL_PCT",
+            "topup_pool_xch": "TOPUP_POOL_XCH",
+            "topup_pool_cat": "TOPUP_POOL_CAT",
+            # max_mid_move_bps removed 2026-04-08 — config key was never
+            # consumed by trading code. Use DYNAMIC_LIMIT_PCT and
+            # MAX_STEP_CHANGE_FRACTION for the equivalent guards.
             "dynamic_limit_pct": "DYNAMIC_LIMIT_PCT",
             "max_step_change_fraction": "MAX_STEP_CHANGE_FRACTION",
             "min_mid": "HARD_MIN_PRICE_XCH",
@@ -2601,14 +3104,40 @@ def api_config_update():
             "mid_size_xch": "MID_SIZE_XCH",
             "outer_size_xch": "OUTER_SIZE_XCH",
             "extreme_size_xch": "EXTREME_SIZE_XCH",
+            # F62 (2026-04-09): per-side tier sizes. Independent buy/sell
+            # offer sizing so each side can fully use its own balance.
+            "buy_inner_size_xch":   "BUY_INNER_SIZE_XCH",
+            "buy_mid_size_xch":     "BUY_MID_SIZE_XCH",
+            "buy_outer_size_xch":   "BUY_OUTER_SIZE_XCH",
+            "buy_extreme_size_xch": "BUY_EXTREME_SIZE_XCH",
+            "sell_inner_size_xch":   "SELL_INNER_SIZE_XCH",
+            "sell_mid_size_xch":     "SELL_MID_SIZE_XCH",
+            "sell_outer_size_xch":   "SELL_OUTER_SIZE_XCH",
+            "sell_extreme_size_xch": "SELL_EXTREME_SIZE_XCH",
             "inner_tier_count": "INNER_TIER_COUNT",
             "mid_tier_count": "MID_TIER_COUNT",
             "outer_tier_count": "OUTER_TIER_COUNT",
             "extreme_tier_count": "EXTREME_TIER_COUNT",
+            "buy_inner_tier_count": "BUY_INNER_TIER_COUNT",
+            "buy_mid_tier_count": "BUY_MID_TIER_COUNT",
+            "buy_outer_tier_count": "BUY_OUTER_TIER_COUNT",
+            "buy_extreme_tier_count": "BUY_EXTREME_TIER_COUNT",
+            "sell_inner_tier_count": "SELL_INNER_TIER_COUNT",
+            "sell_mid_tier_count": "SELL_MID_TIER_COUNT",
+            "sell_outer_tier_count": "SELL_OUTER_TIER_COUNT",
+            "sell_extreme_tier_count": "SELL_EXTREME_TIER_COUNT",
             "inner_tier_spare_count": "INNER_TIER_SPARE_COUNT",
             "mid_tier_spare_count": "MID_TIER_SPARE_COUNT",
             "outer_tier_spare_count": "OUTER_TIER_SPARE_COUNT",
             "extreme_tier_spare_count": "EXTREME_TIER_SPARE_COUNT",
+            "buy_inner_tier_spare_count": "BUY_INNER_TIER_SPARE_COUNT",
+            "buy_mid_tier_spare_count": "BUY_MID_TIER_SPARE_COUNT",
+            "buy_outer_tier_spare_count": "BUY_OUTER_TIER_SPARE_COUNT",
+            "buy_extreme_tier_spare_count": "BUY_EXTREME_TIER_SPARE_COUNT",
+            "sell_inner_tier_spare_count": "SELL_INNER_TIER_SPARE_COUNT",
+            "sell_mid_tier_spare_count": "SELL_MID_TIER_SPARE_COUNT",
+            "sell_outer_tier_spare_count": "SELL_OUTER_TIER_SPARE_COUNT",
+            "sell_extreme_tier_spare_count": "SELL_EXTREME_TIER_SPARE_COUNT",
             # V2: Market Intelligence
             "competitor_aware_enabled": "COMPETITOR_AWARE_ENABLED",
             "dbx_max_spread_bps": "DBX_MAX_SPREAD_BPS",
@@ -2638,7 +3167,7 @@ def api_config_update():
             env_key = key_map.get(gui_key, gui_key.upper())
             if env_key in blocked:
                 continue
-            ok = cfg.update(env_key, str(value))
+            ok = cfg.update(env_key, str(value), source="api_settings_save")
             if ok:
                 updated.append(env_key)
             else:
@@ -2727,8 +3256,10 @@ def api_config_live():
 
     Body: {"key": "BASE_SPREAD_BPS", "value": "600", "graceful": true}
     """
-    data = request.get_json()
-    if not data or "key" not in data or "value" not in data:
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"success": False, "error": "Invalid request body"}), 400
+    if "key" not in data or "value" not in data:
         return jsonify({"success": False, "error": "Missing key/value"}), 400
 
     key = data["key"]
@@ -2754,7 +3285,8 @@ def api_config_live():
         return jsonify({"success": False, "error": f"Cannot modify {key} via live controls"}), 403
 
     # Apply the config change
-    ok = cfg.update(key, value)
+    # F26 (2026-04-08): pass source so config_history audit shows where the change came from
+    ok = cfg.update(key, value, source="gui_live_control")
     if not ok:
         return jsonify({"success": False, "error": f"Failed to update {key}"}), 500
 
@@ -3041,9 +3573,11 @@ def api_cancel_offer():
         log_event("warning", "cancel_while_busy",
                   "Manual cancel issued while coin operations are in progress")
 
-    data = request.get_json()
-    trade_id = data.get("trade_id", "") if data else ""
-    if not trade_id:
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Invalid request body"}), 400
+    trade_id = data.get("trade_id", "")
+    if not trade_id or not isinstance(trade_id, str):
         return jsonify({"error": "Missing trade_id"}), 400
 
     result = bot.offer_manager.cancel_offers([trade_id], reason="manual_api")
@@ -3772,7 +4306,7 @@ def api_purge_fills():
 
         # Reset risk manager state if bot is running
         if bot and bot.risk_manager:
-            bot.risk_manager._net_position_cat = Decimal("0")
+            bot.risk_manager.reset_position()
 
         return jsonify({
             "success": True,
@@ -3943,7 +4477,8 @@ def api_dashboard():
         market_health = {"status": "green", "message": "Waiting for first cycle", "conditions": [], "metrics": {}}
         if bot and bot.risk_manager:
             try:
-                market_health = bot.risk_manager.get_market_health()
+                _lc = getattr(bot, "_loop_count", 0) or 0
+                market_health = bot.risk_manager.get_market_health(loop_count=_lc)
             except Exception as e:
                 market_health["message"] = f"Health check error: {e}"
         if bot:
@@ -4231,9 +4766,30 @@ def api_risk_spreads():
 
 @app.route("/api/coins")
 def api_coins():
-    """Get coin status."""
+    """Get coin status.
+
+    F62 (2026-04-09): refresh inventory on-demand so the dashboard
+    reflects the current wallet state even when the bot isn't running.
+    Without this, the in-memory inventory dict stays at whatever the
+    last loop tick captured — typically all-zero on a fresh session,
+    or stale post-coin-prep until the user starts the bot. The refresh
+    is guarded against running during coin prep / topup so it doesn't
+    race with the worker.
+    """
     if not bot:
         return jsonify({"error": "Bot not initialised"}), 500
+
+    # On-demand refresh when the bot isn't running (so the dashboard
+    # shows accurate numbers after coin prep finishes). When the bot IS
+    # running, its loop refreshes every tick, so skip the extra RPC.
+    try:
+        if not bot.is_running():
+            bot.coin_manager.update_coin_counts()
+    except Exception as _refresh_err:
+        # Don't fail the endpoint if the refresh glitches; the cached
+        # status is still better than a 500.
+        log_event("debug", "api_coins_refresh_failed",
+                  f"On-demand coin refresh failed: {_refresh_err}")
 
     return jsonify(bot.coin_manager.get_status())
 
@@ -4521,7 +5077,9 @@ def api_alerts():
 @app.route("/api/alerts/dismiss", methods=["POST"])
 def api_dismiss_alert():
     """Dismiss an alert by ID."""
-    data = request.get_json() or {}
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"success": False, "error": "Invalid request body"}), 400
     alert_id = data.get("id", "")
     if alert_id:
         alerts.dismiss(alert_id)
@@ -4701,15 +5259,29 @@ def api_splash_incoming():
 
     Splash binary can be configured to POST incoming offers here.
     We store them in the database for potential future sniper use.
+
+    Loopback-only and token-exempt, but rate-limited to prevent a
+    pathological flood from amplifying into unbounded DB writes.
     """
     if not getattr(cfg, "SPLASH_RECEIVE_ENABLED", False):
         return jsonify({"error": "Splash receive disabled"}), 403
 
-    data = request.get_json(silent=True) or {}
+    # Dedicated rate limiter (defined in this module) — 200/sec is generous
+    # for a real local Splash binary but stops abuse.
+    if _splash_incoming_rate_limited():
+        return jsonify({"error": "rate_limited"}), 429
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Invalid request body"}), 400
     offer_bech32 = data.get("offer", "")
 
     if not offer_bech32 or not isinstance(offer_bech32, str):
         return jsonify({"error": "Missing 'offer' field"}), 400
+
+    # Hard cap offer string length — real Chia offers are a few KB, not MB.
+    if len(offer_bech32) > 32768:
+        return jsonify({"error": "Offer too large"}), 413
 
     if not offer_bech32.lower().startswith("offer1"):
         return jsonify({"error": "Invalid offer format"}), 400
@@ -4933,7 +5505,7 @@ def api_market_summary():
             norm_id = asset_id.lower().strip().replace("0x", "")
             for p in resp.json():
                 p_id = str(p.get("asset_id", "")).lower().strip().replace("0x", "")
-                if p_id == norm_id or p_id.rstrip("0") == norm_id.rstrip("0"):
+                if p_id == norm_id:
                     xr = float(p.get("xch_reserve", 0)) / 1e12
                     tr = float(p.get("token_reserve", 0)) / (10 ** decimals)
                     if tr > 0:
@@ -5131,7 +5703,7 @@ def api_debug_pricing():
             norm = asset_id.lower().strip().replace("0x", "")
             for p in pairs:
                 pid = str(p.get("asset_id", "")).lower().strip().replace("0x", "")
-                if pid == norm or pid.rstrip("0") == norm.rstrip("0"):
+                if pid == norm:
                     xr = float(p.get("xch_reserve", 0)) / 1e12
                     tr = float(p.get("token_reserve", 0)) / (10 ** int(cat_dec))
                     result["tibet_match"] = {
@@ -5178,7 +5750,7 @@ def api_debug_tibet_test():
                 norm = asset_id.lower().strip().replace("0x", "")
                 for p in pairs:
                     pid = str(p.get("asset_id", "")).lower().strip().replace("0x", "")
-                    if pid == norm or pid.rstrip("0") == norm.rstrip("0"):
+                    if pid == norm:
                         xr = float(p.get("xch_reserve", 0)) / 1e12
                         dec = _active_cat.get("decimals") or getattr(cfg, "CAT_DECIMALS", 3)
                         tr = float(p.get("token_reserve", 0)) / (10 ** int(dec))
@@ -5365,7 +5937,7 @@ def _fetch_price_standalone(asset_id, decimals):
             p_id = str(p.get("asset_id", "")).lower().strip()
             if p_id.startswith("0x"):
                 p_id = p_id[2:]
-            if p_id == normalized or p_id.rstrip("0") == normalized.rstrip("0"):
+            if p_id == normalized:
                 xch_reserve = Decimal(str(p.get("xch_reserve", 0)))
                 token_reserve = Decimal(str(p.get("token_reserve", 0)))
                 if token_reserve > 0 and xch_reserve > 0:
@@ -5449,90 +6021,6 @@ def _fetch_price_standalone(asset_id, decimals):
 # ---------------------------------------------------------------------------
 # Smart Defaults — Live Market Data Analysis
 # ---------------------------------------------------------------------------
-
-def _fetch_dexie_ticker_full(ticker_id: str) -> dict:
-    """Fetch FULL Dexie ticker data including volume, high/low, bid/ask.
-
-    The normal price fetch only extracts the price — this gets everything
-    the ticker endpoint returns for smarter default calculations.
-    """
-    import requests as _req
-    result = {
-        "price": 0, "bid": 0, "ask": 0,
-        "high": 0, "low": 0,
-        "base_volume": 0, "target_volume": 0,
-        "has_data": False,
-    }
-    if not ticker_id:
-        return result
-
-    if "_" not in ticker_id:
-        ticker_id = f"{ticker_id}_XCH"
-
-    try:
-        dexie_base = getattr(cfg, "DEXIE_API_BASE", "https://api.dexie.space")
-        resp = _req.get(f"{dexie_base}/v2/prices/tickers",
-                        params={"ticker_id": ticker_id}, timeout=8)
-        if resp.status_code != 200:
-            return result
-
-        tickers = resp.json().get("tickers", [])
-        if not tickers:
-            return result
-
-        t = tickers[0]
-
-        # Volume
-        result["base_volume"] = float(t.get("base_volume", 0) or 0)
-        result["target_volume"] = float(t.get("target_volume", 0) or 0)
-
-        # High/Low (try common Dexie field names)
-        for hf in ["high", "high_24h", "highest_price_24h"]:
-            val = t.get(hf)
-            if val and float(val or 0) > 0:
-                result["high"] = float(val)
-                break
-        for lf in ["low", "low_24h", "lowest_price_24h"]:
-            val = t.get(lf)
-            if val and float(val or 0) > 0:
-                result["low"] = float(val)
-                break
-
-        # Bid/Ask
-        for bf in ["bid", "best_bid", "highest_bid"]:
-            val = t.get(bf)
-            if val and float(val or 0) > 0:
-                result["bid"] = float(val)
-                break
-        for af in ["ask", "best_ask", "lowest_ask"]:
-            val = t.get(af)
-            if val and float(val or 0) > 0:
-                result["ask"] = float(val)
-                break
-
-        # Price: prefer bid/ask midpoint (real market price) over last_price
-        # which can be an outlier trade far from the current market.
-        if result["bid"] > 0 and result["ask"] > 0:
-            result["price"] = (result["bid"] + result["ask"]) / 2
-        else:
-            for field in ["current_avg_price", "last_price", "price"]:
-                val = t.get(field)
-                if val and str(val) != "0":
-                    result["price"] = float(val)
-                    break
-
-        result["has_data"] = result["price"] > 0
-        # Log what fields we actually found for debugging
-        found_fields = [k for k in t.keys() if k not in ("ticker_id", "pool_id")]
-        print(f"[SMART_DEFAULTS] Dexie ticker fields: {found_fields}")
-        print(f"[SMART_DEFAULTS] Ticker data: price={result['price']:.10f}, "
-              f"vol={result['base_volume']:.4f}, high={result['high']:.10f}, "
-              f"low={result['low']:.10f}, bid={result['bid']:.10f}, ask={result['ask']:.10f}")
-        return result
-    except Exception as e:
-        print(f"[SMART_DEFAULTS] Dexie ticker fetch failed: {e}")
-        return result
-
 
 def _fetch_dexie_orderbook_standalone(asset_id: str) -> dict:
     """Fetch Dexie orderbook and calculate competitor spread/depth.
@@ -5641,38 +6129,6 @@ def _fetch_dexie_orderbook_standalone(asset_id: str) -> dict:
         return result
 
 
-def _fetch_tibet_pool_standalone(asset_id: str, decimals: int) -> dict:
-    """Fetch TibetSwap pool reserves for depth analysis."""
-    import requests as _req
-    result = {"xch_reserve": 0, "token_reserve": 0, "price": 0, "has_data": False}
-    if not asset_id:
-        return result
-    try:
-        resp = _req.get("https://api.v2.tibetswap.io/pairs",
-                        params={"skip": 0, "limit": 200}, timeout=8)
-        if resp.status_code != 200:
-            return result
-        pairs = resp.json() if isinstance(resp.json(), list) else []
-        normalized = asset_id.lower().strip().replace("0x", "")
-        for p in pairs:
-            p_id = str(p.get("asset_id", "")).lower().strip().replace("0x", "")
-            if p_id == normalized or p_id.rstrip("0") == normalized.rstrip("0"):
-                xch_raw = float(p.get("xch_reserve", 0))
-                tok_raw = float(p.get("token_reserve", 0))
-                if xch_raw > 0 and tok_raw > 0:
-                    result["xch_reserve"] = xch_raw / 1e12
-                    result["token_reserve"] = tok_raw / (10 ** decimals)
-                    result["price"] = result["xch_reserve"] / result["token_reserve"]
-                    result["has_data"] = True
-                    print(f"[SMART_DEFAULTS] Tibet pool: {result['xch_reserve']:.2f} XCH, "
-                          f"price={result['price']:.8f}")
-                break
-        return result
-    except Exception as e:
-        print(f"[SMART_DEFAULTS] Tibet pool fetch failed: {e}")
-        return result
-
-
 @app.route("/api/smart-defaults")
 def api_smart_defaults():
     """Calculate ALL smart default settings from live market data.
@@ -5690,8 +6146,8 @@ def api_smart_defaults():
         import traceback
         tb = traceback.format_exc()
         print(f"[SMART_DEFAULTS] ERROR: {e}\n{tb}")
-        log_event("error", "smart_defaults", f"Smart Defaults failed: {e}")
-        return jsonify({"error": "Smart Defaults calculation failed", "code": "SERVER_ERROR"}), 500
+        log_event("error", "smart_defaults", f"Smart Settings failed: {e}")
+        return jsonify({"error": "Smart Settings calculation failed", "code": "SERVER_ERROR"}), 500
 
 
 def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="balanced"):
@@ -5708,53 +6164,61 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
     """
     # ── RISK PROFILE ──────────────────────────────────────────────────────────
     # Multipliers applied to Smart Settings outputs. Balanced = no change.
-    # conservative: fewer + smaller offers, more spares, wider spread, less capital deployed
-    # aggressive:   more but smaller-per-offer offers, more spares, tighter spread, ~same total capital
+    # Risk profiles only change HOW the bot reacts to market conditions.
+    # Total capital deployed and number of offers are IDENTICAL across all
+    # three profiles — only spread behaviour, requote speed, position
+    # tolerance, inventory rebalancing, and safety buffers differ.
+    #
+    # conservative: wider spreads, slower requoting, tighter inventory
+    #               tolerance, gentler rebalancing, bigger safety buffers
+    # balanced:     baseline reactivity
+    # aggressive:   tighter spreads, faster requoting, looser inventory
+    #               tolerance, harder rebalancing, same safety buffers
     _RISK_PROFILES = {
         "conservative": {
-            # EXISTING
-            "inner_tier_mult":    0.7,   # inner tier offer size (fills most — kept small)
-            "max_offers_mult":    0.8,   # fewer offers per side
-            "coin_prep_adj":     +0.5,   # more buffer coins (floor enforced at 2.0 max)
-            "spread_step_mult":   1.20,  # wider requote threshold (let offers ride, less churn)
-            "capital_mult":       0.7,   # less total capital deployed
-            # NEW
-            "spread_bps_mult":    1.10,  # wider base spread = earn more per fill, fewer fills
-            "tier_size_mult":     0.85,  # mid/outer/extreme offers proportionally smaller
-            "spare_adj":         +1,     # +1 spare per active tier (more TX safety buffer)
-            "position_mult":      0.75,  # tighter max inventory position (circuit breaker sooner)
-            "skew_mult":          0.75,  # gentler inventory rebalancing (let drift happen)
+            # ── Capital / sizing (IDENTITY — all 1.0) ──
+            "capital_mult":       1.0,
+            "max_offers_mult":    1.0,
+            "inner_tier_mult":    1.0,
+            "tier_size_mult":     1.0,
+            # ── Spread behaviour ──
+            "spread_bps_mult":    1.10,  # wider base spread (earn more per fill)
+            "spread_step_mult":   1.20,  # wider requote threshold (let offers ride)
+            # ── Risk / inventory ──
+            "position_mult":      0.75,  # tighter position CB (trip sooner)
+            "skew_mult":          0.75,  # gentler inventory rebalancing
+            # ── Safety buffers ──
+            "spare_adj":         +1,     # +1 spare per active tier
+            "coin_prep_adj":     +0.5,   # more coin-prep buffer (floor enforced at 2.0 max)
         },
         "balanced": {
-            # EXISTING
-            "inner_tier_mult":    1.0,
-            "max_offers_mult":    1.0,
-            "coin_prep_adj":      0.0,
-            "spread_step_mult":   1.0,
+            # Baseline — everything at 1.0
             "capital_mult":       1.0,
-            # NEW
-            "spread_bps_mult":    1.0,
+            "max_offers_mult":    1.0,
+            "inner_tier_mult":    1.0,
             "tier_size_mult":     1.0,
-            "spare_adj":          0,
+            "spread_bps_mult":    1.0,
+            "spread_step_mult":   1.0,
             "position_mult":      1.0,
             "skew_mult":          1.0,
+            "spare_adj":          0,
+            "coin_prep_adj":      0.0,
         },
         "aggressive": {
-            # Aggressive = more market PRESENCE, not bigger individual bets.
-            # capital_mult 0.80 × max_offers_mult 1.2 = 96% of balanced total XCH,
-            # so aggressive stays within the same wallet budget but runs 20% more
-            # offers.  Per-offer sizes are ~20% smaller than balanced — correct for
-            # a high-fill-rate profile where turnover matters more than bet size.
-            "inner_tier_mult":    1.0,   # no extra size inflation — capital_mult handles sizing
-            "max_offers_mult":    1.2,   # 20% more offers = wider market presence
-            "coin_prep_adj":      0.0,   # keep standard multiplier — more fills needs same buffer
-            "spread_step_mult":   0.85,  # tighter requote threshold (stay closer to mid)
-            "capital_mult":       0.80,  # 80% per-offer × 1.2 offers ≈ 96% of balanced total
-            "spread_bps_mult":    0.92,  # tighter base spread = more competitive, more fills
-            "tier_size_mult":     1.0,   # sizing fully handled by capital_mult above
-            "spare_adj":         +1,     # high fill rate burns coins fast — needs rapid replenishment
-            "position_mult":      1.25,  # allow larger inventory swings before circuit breaker
-            "skew_mult":          1.25,  # rebalance back to neutral more aggressively
+            # ── Capital / sizing (IDENTITY — all 1.0) ──
+            "capital_mult":       1.0,
+            "max_offers_mult":    1.0,
+            "inner_tier_mult":    1.0,
+            "tier_size_mult":     1.0,
+            # ── Spread behaviour ──
+            "spread_bps_mult":    0.92,  # tighter base spread (more competitive)
+            "spread_step_mult":   0.85,  # tighter requote threshold (chase price)
+            # ── Risk / inventory ──
+            "position_mult":      1.25,  # looser position CB (allow larger swings)
+            "skew_mult":          1.25,  # harder inventory rebalancing
+            # ── Safety buffers ──
+            "spare_adj":          0,     # baseline spares
+            "coin_prep_adj":      0.0,   # baseline coin-prep buffer
         },
     }
     _rp = _RISK_PROFILES.get(str(risk_profile).lower().strip(), _RISK_PROFILES["balanced"])
@@ -5764,7 +6228,7 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
     print(f"[SMART_DEFAULTS v2] Risk profile: {_risk_profile_name}")
     # ─────────────────────────────────────────────────────────────────────────
 
-    from decimal import Decimal, ROUND_HALF_UP
+    from decimal import Decimal
     from market_data_collector import collect_all_market_data, analyze_market_data
 
     asset_id = _active_cat.get("asset_id") or (cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else "")
@@ -5776,27 +6240,86 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
         return jsonify({"error": "No trading pair selected"})
 
     print(f"\n[SMART_DEFAULTS v2] === Gathering 30 days of market data ===")
-    log_event("info", "smart_defaults", "Smart Defaults v2: gathering 30 days of market data")
+    log_event("info", "smart_defaults", "Smart Settings: gathering 30 days of market data")
     messages = []
 
     # ---- 1. Wallet balances (same as v1 — always needed) ----
+    # F62 (2026-04-09): use UNCONFIRMED (projected post-pending) balance.
+    #
+    # History:
+    #  • V1 used `spendable_balance` which excluded coins locked in active
+    #    offers. Running Smart Settings while trading sized the ladder for
+    #    half the wallet.
+    #  • F62 first moved to `confirmed_wallet_balance` (full post-pending
+    #    balance) so the ladder sizes against the whole wallet.
+    #  • But confirmed_wallet_balance DROPS temporarily when a self-tx is
+    #    pending (e.g. during a coin-prep combine). If the user reruns
+    #    Smart Settings while a combine is in-flight, confirmed has spent
+    #    the old coins but the new output isn't confirmed yet → a 15-20%
+    #    temporary dip → Smart Settings computes smaller tier sizes →
+    #    persisted to .env → next coin prep run creates a crippled ladder.
+    #
+    # Using `unconfirmed_wallet_balance` (confirmed + pending_change) is
+    # stable during self-transactions: the combine tx pays 80 XCH back to
+    # the wallet as pending change, so unconfirmed stays ~81 XCH throughout
+    # even when confirmed drops to 66. That's the right number for sizing.
+    #
+    # The variable name stays `xch_spendable` / `cat_spendable` to avoid
+    # a sprawling rename, but it now holds the projected post-pending total.
     xch_spendable = 0
     cat_spendable = 0
     has_wallet = False
+    _pending_tx_count = 0
     try:
         from wallet import get_wallet_balance, WALLET_ID_XCH
         xr = get_wallet_balance(WALLET_ID_XCH)
         if xr and xr.get("success"):
             wb = xr.get("wallet_balance") or {}
-            xch_spendable = _safe_float(wb.get("spendable_balance", 0)) / 1e12
+            # Prefer unconfirmed (confirmed + pending); fall back to
+            # confirmed, then spendable, for wallet backends that don't
+            # report all three fields.
+            _raw_total = _safe_float(wb.get("unconfirmed_wallet_balance", 0))
+            if _raw_total <= 0:
+                _raw_total = _safe_float(wb.get("confirmed_wallet_balance", 0))
+            if _raw_total <= 0:
+                _raw_total = _safe_float(wb.get("spendable_balance", 0))
+            xch_spendable = _raw_total / 1e12
+            # F62 (2026-04-09): track pending tx count so we can WARN
+            # the user (or the GUI) if Smart Settings is running during
+            # in-flight wallet operations. Both confirmed and unconfirmed
+            # are subject to transient inconsistency mid-tx.
+            _pending_tx_count += int(wb.get("pending_coin_removal_count", 0) or 0)
             has_wallet = True
         cr = get_wallet_balance(cat_wid)
         if cr and cr.get("success"):
             wb = cr.get("wallet_balance") or {}
-            cat_spendable = _safe_float(wb.get("spendable_balance", 0)) / (10 ** decimals)
+            _raw_total = _safe_float(wb.get("unconfirmed_wallet_balance", 0))
+            if _raw_total <= 0:
+                _raw_total = _safe_float(wb.get("confirmed_wallet_balance", 0))
+            if _raw_total <= 0:
+                _raw_total = _safe_float(wb.get("spendable_balance", 0))
+            cat_spendable = _raw_total / (10 ** decimals)
+            _pending_tx_count += int(wb.get("pending_coin_removal_count", 0) or 0)
         if has_wallet:
-            messages.append(f"Wallet: {xch_spendable:.2f} XCH")
-            print(f"[SMART_DEFAULTS v2] Wallet: {xch_spendable:.4f} XCH, {cat_spendable:.0f} CAT")
+            messages.append(f"Wallet: {xch_spendable:.2f} XCH (total)")
+            print(f"[SMART_DEFAULTS v2] Wallet (total): {xch_spendable:.4f} XCH, {cat_spendable:.0f} CAT")
+            # F62 (2026-04-09): warn loudly if there are in-flight wallet
+            # transactions. Even using `unconfirmed_wallet_balance`, the
+            # balance can still be briefly inconsistent between submission
+            # and inclusion. Running Smart Settings during a pending
+            # combine/split is the classic cause of "inflated" tier sizes
+            # that then fail at coin prep time.
+            if _pending_tx_count > 0:
+                warn_msg = (
+                    f"WARNING: {_pending_tx_count} pending wallet tx(s) in flight. "
+                    f"Smart Settings results may be off — wait ~30s for the wallet "
+                    f"to settle and re-run, or coin prep may fail."
+                )
+                messages.append(warn_msg)
+                print(f"[SMART_DEFAULTS v2] {warn_msg}")
+                log_event("warning", "smart_defaults_pending_tx",
+                          f"Smart Settings ran during {_pending_tx_count} pending tx(s); "
+                          f"recommend waiting for wallet to settle.")
     except Exception as e:
         print(f"[SMART_DEFAULTS v2] Wallet fetch failed: {e}")
         messages.append("Wallet: not available")
@@ -6311,36 +6834,41 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
     if 0 < pool_xch < 100:
         coin_prep_headroom_pct = min(20, coin_prep_headroom_pct + 3)
 
-    # ═══ TIER SPARE COUNTS ═══
+    # ═══ TIER SPARE COUNTS (F62) ═══
     # How many backup prepared coins to keep per tier.
-    # Fill rate drives inner spares (inner tier fills most often);
-    # outer/extreme tiers rarely fill so fewer spares are needed.
-    # Spare counts: spare-first philosophy — always have enough backup coins to
-    # survive a fill cluster without going dark on any tier.
-    # Rule of thumb: inner needs ≥1 spare per active inner offer; outer tiers
-    # fill rarely but at least 1 spare keeps the full ladder intact after a sweep.
+    # Fill rate drives the absolute counts; position-inner always gets the
+    # biggest buffer because inner offers sit closest to mid and fill first.
+    #
+    # Under reverse-buy (the default), these counts flow to:
+    #   _sell_spare_inner  = _spare_inner   → CAT inner size (position inner on sell side)
+    #   _buy_spare_extreme = _spare_inner   → XCH extreme size (position inner on buy side)
+    # So bumping `_spare_inner` adds spares to the most-active tier on BOTH sides.
+    #
+    # Ratios are monotonic inner > mid > outer > extreme, matching the fill
+    # frequency gradient. Absolute values are ~2× the pre-F62 defaults so a
+    # fresh-deploy ladder doesn't immediately trip the coin-health alarm.
     if fills_per_day > 10:
-        _spare_inner   = 4   # Very active: fills arrive faster than coin prep
-        _spare_mid     = 3
+        _spare_inner   = 15  # Very active: fills arrive faster than coin prep
+        _spare_mid     = 8
+        _spare_outer   = 4
+        _spare_extreme = 2
+    elif fills_per_day > 3:
+        _spare_inner   = 10  # Active: large cluster buffer, heavy inner bias
+        _spare_mid     = 5
+        _spare_outer   = 3
+        _spare_extreme = 2
+    elif fills_per_day > 0.5:
+        _spare_inner   = 7   # Moderate: meaningful buffer, inner-weighted
+        _spare_mid     = 4
         _spare_outer   = 2
         _spare_extreme = 1
-    elif fills_per_day > 3:
-        _spare_inner   = 3   # Active: covers typical fill cluster (was 2)
-        _spare_mid     = 2   # (was 1)
-        _spare_outer   = 1
-        _spare_extreme = 1   # At least 1 — keeps full ladder intact (was 0)
-    elif fills_per_day > 0.5:
-        _spare_inner   = 2   # Moderate: at least 2 inner spares (was 1)
-        _spare_mid     = 1
-        _spare_outer   = 1   # (was 0)
-        _spare_extreme = 0
     else:
-        # Quiet / no-data: 1 spare per active tier so a single fill never
-        # leaves the ladder empty while coin prep catches up.
-        _spare_inner   = 1
-        _spare_mid     = 1   # (was 0)
-        _spare_outer   = 0
-        _spare_extreme = 0
+        # Quiet / no-data: still keep a solid inner buffer so back-to-back
+        # fills never leave the most-active tier empty while coin prep runs.
+        _spare_inner   = 5
+        _spare_mid     = 3
+        _spare_outer   = 1
+        _spare_extreme = 1
 
     # ── RISK PROFILE: spare coin adjustment ────────────────────────────────────
     # Conservative adds +1 spare to each active tier (more TX safety buffer
@@ -6351,6 +6879,19 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
         if _spare_mid   > 0: _spare_mid   = max(0, _spare_mid   + _rp["spare_adj"])
         if _spare_outer > 0: _spare_outer = max(0, _spare_outer + _rp["spare_adj"])
         if _spare_extreme > 0: _spare_extreme = max(0, _spare_extreme + _rp["spare_adj"])
+
+    # ═══ F63 (2026-04-10): PRICE SHOCK SPARE FLOOR ═══
+    # During a full-ladder requote (price move), the bot needs enough spare
+    # coins to create the first wave of replacements BEFORE any old offers
+    # are cancelled. Floor: 50% of each tier's live count.
+    import math as _math_spare
+    # Note: _target_n is set later after capital plan. These spares are
+    # computed from the market-activity _market_n estimate which drives
+    # tier count decisions. The actual tier counts (_smart_n_*) are set
+    # after the capital plan, so we apply the floor AGAIN after they're
+    # finalized — see the second F63 block below the capital plan.
+    # For now, just mark that the shock floor should be applied.
+    _apply_shock_floor = True
 
     # ═══ COIN PREP MULTIPLIER ═══
     # Calculated later, after the capital plan — needs _smart_trade_size and _smart_max_buy.
@@ -6424,16 +6965,13 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
         _fee_coin_size = float(getattr(cfg, "FEE_COIN_SIZE_XCH", Decimal("0.001")))
         _smart_fee_xch = float(getattr(cfg, "TRANSACTION_FEE_XCH", Decimal("0.000001")))
 
-    # ═══ Capital Allocation — percentage-based, scales from 1 XCH to thousands ═══
+    # ═══ Capital Allocation — reserve-first, scales from 1 XCH to thousands ═══
     # Reserve-first: everything sized from what the user is willing to risk.
-    # No hardcoded thresholds — all allocation is a percentage of available capital
-    # so the strategy is equally valid at any wallet size.
-    # xch_reserve / cat_reserve arrive as percentages (e.g. 25 = 25%).
-    # Convert to absolute amounts before deducting from spendable.
-    _xch_reserve_pct = max(0.0, min(100.0, float(xch_reserve or 0)))
-    _cat_reserve_pct = max(0.0, min(100.0, float(cat_reserve or 0)))
-    _xch_reserve = xch_spendable * (_xch_reserve_pct / 100.0)
-    _cat_reserve = cat_spendable * (_cat_reserve_pct / 100.0)
+    # xch_reserve / cat_reserve arrive as ABSOLUTE amounts from the frontend
+    # (XCH and tokens respectively — the reserve input fields hold absolute values,
+    # not percentages).  Cap at spendable so a large reserve never goes negative.
+    _xch_reserve = min(xch_spendable, max(0.0, float(xch_reserve or 0)))
+    _cat_reserve = min(cat_spendable, max(0.0, float(cat_reserve or 0)))
     _avail_xch = max(0.0, xch_spendable - _xch_reserve)
     _avail_cat = max(0.0, cat_spendable - _cat_reserve)
 
@@ -6459,30 +6997,121 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
     _fee_pool_xch     = _fee_coin_size * _fee_prep_count
 
     _sniper_pool_raw   = _avail_xch * _SNIPER_PCT
-    # Prep count scales with fill rate: more fills = faster sniper coin burn = need more ready
+    # Sniper offers are expendable probes — keep them at Dexie's minimum
+    # displayable size (0.01 XCH) so they show up on the book without wasting
+    # capital. The pool carries many cheap coins rather than fewer large ones.
+    _SNIPER_MIN_SIZE_XCH = 0.01
+    _smart_sniper_size = _SNIPER_MIN_SIZE_XCH
+
+    # Prep count: more fills = faster sniper coin burn = need more ready.
+    # Cap scales with the sniper pool so we never prep more than the pool
+    # can fund at the fixed minimum size.
     if fills_per_day > 10:
         _sniper_max_prep = 30
     elif fills_per_day > 3:
         _sniper_max_prep = 25
     else:
         _sniper_max_prep = 20
-    _smart_sniper_prep = max(5, min(_sniper_max_prep, int(_sniper_pool_raw / max(0.001, _fee_coin_size * 2))))
-    _smart_sniper_size = max(0.001, round(_sniper_pool_raw / max(1, _smart_sniper_prep), 4))
-    _sniper_pool_xch   = _smart_sniper_size * _smart_sniper_prep
+    _pool_max_prep = int(_sniper_pool_raw / max(0.0001, _smart_sniper_size))
+    _smart_sniper_prep = max(5, min(_sniper_max_prep, _pool_max_prep))
+    _sniper_pool_xch   = round(_smart_sniper_size * _smart_sniper_prep, 4)
 
-    _trading_xch = max(0.0, _avail_xch - _fee_pool_xch - _sniper_pool_xch)
-    _trading_pct = round(_trading_xch / _avail_xch * 100, 1) if _avail_xch > 0 else 0.0
+    # ── Bottleneck-driven capital allocation ─────────────────────────────────
+    # The bot is symmetric: every buy needs XCH, every sell needs CAT.
+    # Whichever side has less spending power (in XCH-equivalent terms) is
+    # the bottleneck — use ALL of the smaller side (after fees/sniper pools
+    # are carved off), carve 10% for a topup buffer, and the remaining 90%
+    # becomes the trading budget.
+    #
+    # Tim's mental model:
+    #   1. Subtract the user's reserve (do not touch).
+    #   2. Bottleneck = min(post-pools XCH, avail CAT × mid_price).
+    #   3. Carve 10% off the bottleneck for the topup buffer (large unbroken
+    #      coins the topup worker splits when a tier runs short).
+    #   4. Remaining 90% = trading budget per side (symmetric).
+    #
+    # NOTE: do NOT pre-shrink the CAT side by a "prep overhead" factor here.
+    # The capital-plan solver below (_solve_base_cat) already accounts for
+    # headroom + spare overhead when it sizes the ladder, and the CAT
+    # feasibility clamp at the end scales tier sizes down if coin prep
+    # overshoots. Applying overhead HERE just flips the bottleneck the wrong
+    # way (e.g. treating 113 XCH-worth of CAT as 71) and leaves huge amounts
+    # of capital stranded in the topup buffer.
+    _post_pools_xch = max(0.0, _avail_xch - _fee_pool_xch - _sniper_pool_xch)
+    if mid_price and mid_price > 0 and _avail_cat > 0:
+        _cat_xch_equiv = round(_avail_cat * mid_price, 4)
+        _bottleneck_xch = min(_post_pools_xch, _cat_xch_equiv)
+        _cat_limited_trading = (_cat_xch_equiv < _post_pools_xch)
+    else:
+        _cat_xch_equiv = None
+        _bottleneck_xch = _post_pools_xch
+        _cat_limited_trading = False
+    # Kept for downstream message formatting — same value as bottleneck when
+    # CAT is binding, else matches the raw XCH equivalent.
+    _cat_xch_capacity = _cat_xch_equiv
+
+    # F62 (2026-04-09): topup buffer percentage computed fresh from market
+    # activity, NOT read from cfg. Smart Settings is supposed to recompute
+    # every field from scratch — the topup pool should behave like every
+    # other slider on the page. Reading `cfg.TOPUP_POOL_PCT` was letting
+    # a stale 0.10 from an earlier Smart Settings run silently override
+    # the new recommendation.
+    #
+    # Scale with fill rate: busier markets burn spare coins faster, so a
+    # bigger reserve buys more autonomous runtime between refreshes.
+    # Quiet markets can run leaner and put more capital into the trading
+    # ladder. The band is 15–25% so the trading capacity always sits
+    # comfortably above 75% of avail.
+    if fills_per_day > 10:
+        _TOPUP_BUFFER_PCT = 0.25   # Very active: 25% — fast cluster burn
+    elif fills_per_day > 3:
+        _TOPUP_BUFFER_PCT = 0.20   # Active: 20% — ~2 days of autonomous runtime
+    elif fills_per_day > 0.5:
+        _TOPUP_BUFFER_PCT = 0.15   # Moderate: 15% — standard buffer
+    else:
+        _TOPUP_BUFFER_PCT = 0.15   # Quiet: 15% — minimum healthy buffer
+    _topup_buffer_reserve = round(_bottleneck_xch * _TOPUP_BUFFER_PCT, 4)
+    if _topup_buffer_reserve > _bottleneck_xch:
+        _topup_buffer_reserve = round(_bottleneck_xch, 4)
+
+    # F55 (2026-04-09): Initialise the FINAL topup buffer value upfront so
+    # the API response always has a real number even when the capital plan
+    # branch below didn't run (insufficient capital). It's recomputed inside
+    # the main capital plan as offers are sized, then bumped by the 2× largest
+    # tier guard.
+    _topup_buffer_xch = _topup_buffer_reserve
+
+    # Remaining 90% becomes the trading budget — same value on both sides
+    # so the ladder is perfectly symmetric and coin prep fits on both sides.
+    _trading_xch = max(0.0, round(_bottleneck_xch - _topup_buffer_reserve, 4))
+
+    # F62 (2026-04-09): save independent per-side budgets so the asymmetric
+    # sizing block at the end of the capital plan can solve each side from
+    # its own pool. The main plan still runs with the symmetric `_trading_xch`
+    # (which uses the smaller of the two budgets) for backward compat with
+    # the existing clamps — those output a SELL-side-safe base_size. F62
+    # then overrides the BUY side with its own max, independently.
+    _orig_xch_budget = max(0.0, round(_post_pools_xch - _topup_buffer_reserve, 4))
+    if _cat_xch_equiv is not None and _cat_xch_equiv > 0:
+        _cat_topup_reserve_xch_equiv = round(_cat_xch_equiv * _TOPUP_BUFFER_PCT, 4)
+        _orig_cat_budget_xch = max(0.0, round(_cat_xch_equiv - _cat_topup_reserve_xch_equiv, 4))
+    else:
+        _cat_topup_reserve_xch_equiv = 0.0
+        _orig_cat_budget_xch = 0.0
 
     # ── Market activity drives offer count ──
     # Capital determines SIZES; market activity determines how many offers to maintain.
+    # 3× wider distribution: the same total XCH per tier is spread across 3× more
+    # price slots, so each individual offer is ~1/3 the size but populates more
+    # of the book. Total XCH deployed per tier is unchanged.
     if fills_per_day > 10:
-        _market_n = 20
+        _market_n = 60
     elif fills_per_day > 3:
-        _market_n = 15
+        _market_n = 45
     elif fills_per_day > 0.5:
-        _market_n = 12
+        _market_n = 36
     else:
-        _market_n = 8
+        _market_n = 24
 
     # Hard cap: never more offers than the minimum floor can support
     # (uses 2.5 as an approximate capital factor before tier selection)
@@ -6492,14 +7121,15 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
     # ── Pool impact cap ──
     # If the user's capital is large vs the pool, takers face high slippage on outer
     # offers — cap depth so the ladder stays effective.
+    # Caps are also scaled 3× to match the wider distribution goal.
     _pool_note = ""
     if pool_xch > 0 and _trading_xch > 0:
         _pool_ratio = _trading_xch / pool_xch
         if _pool_ratio > 0.5:
-            _target_n  = max(2, min(_target_n, 8))
+            _target_n  = max(2, min(_target_n, 24))
             _pool_note = "pool-dominated"
         elif _pool_ratio > 0.2:
-            _target_n  = max(2, min(_target_n, 12))
+            _target_n  = max(2, min(_target_n, 36))
             _pool_note = "pool-aware"
 
     # ── RISK PROFILE: capital deployment ──────────────────────────────────────
@@ -6511,34 +7141,14 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
     if _rp["capital_mult"] != 1.0:
         _trading_xch = max(0.0, round(_trading_xch * _rp["capital_mult"], 4))
 
-    # ── Spare-first capital allocation ──────────────────────────────────────────
-    # Reserve a portion of trading capital so spare coins are funded first.
-    # Active offers use only the fraction below; the freed capital raises the
-    # coin_prep_multiplier automatically — more spares prepped without any
-    # explicit spare budget calculation needed.
-    # More active markets burn through spares faster → reserve more.
-    if fills_per_day > 10:
-        _offer_fraction = 0.72   # Very active: 28% freed → aggressive spare buffer
-    elif fills_per_day > 3:
-        _offer_fraction = 0.78   # Active: 22% freed
-    elif fills_per_day > 0.5:
-        _offer_fraction = 0.83   # Normal: 17% freed
-    else:
-        _offer_fraction = 0.88   # Quiet: 12% freed (lower spare urgency)
-    _trading_xch = max(0.0, round(_trading_xch * _offer_fraction, 4))
+    # NOTE: CAT-limited bottleneck handling now lives in the bottleneck-driven
+    # capital allocation block above (uses _PREP_OVERHEAD to account for
+    # headroom + spare coin overhead). Do NOT re-clamp _trading_xch here — that
+    # would override the overhead-adjusted capacity with the raw CAT XCH
+    # equivalent and re-introduce the over-allocation bug.
 
-    # ── CAT-limited: cap trading capital to match CAT balance ──────────────────
-    # When CAT is worth less (in XCH) than the trading budget, offer sizes are
-    # computed from XCH capacity → sell-side coin prep needs more tokens than the
-    # wallet holds (even with reduced n_sell, the large inner-tier coins exhaust
-    # the balance).  The correct fix is to size BOTH sides for the smaller value
-    # so offers are equally deep, coin prep is always fundable, and the extra XCH
-    # stays in the topup buffer where the bot can draw on it during active fills.
-    _cat_limited_trading = False
-    _cat_xch_equiv = round(_avail_cat * mid_price, 4) if (mid_price and mid_price > 0 and _avail_cat > 0) else None
-    if _cat_xch_equiv is not None and _cat_xch_equiv < _trading_xch:
-        _cat_limited_trading = True
-        _trading_xch = _cat_xch_equiv
+    # Trading pct computed here so it reflects the definitive value (post-CAT-limit).
+    _trading_pct = round(_trading_xch / _avail_xch * 100, 1) if _avail_xch > 0 else 0.0
 
     # ── Market regime → tier size multipliers ──
     # Sizes are relative to base_size (mid tier = 1×).
@@ -6607,9 +7217,45 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
     _total_cd = sum(_cd) or 1.0
     _count_dist = tuple(c / _total_cd for c in _cd)
 
-    # Final capital factor with confirmed tiers
+    # Final capital factor with confirmed tiers.
+    # NOTE (2026-04-07): removed legacy × 2.0 multiplier.  The × 2 assumed the
+    # trading budget was shared between buy and sell sides, but buy offers lock
+    # XCH and sell offers lock CAT — each side drains its own wallet, so the
+    # full _trading_xch belongs to the buy side (and full _avail_cat to sell).
+    # Previously ~50% of the XCH budget went unused on the XCH side.
     _TIER_AVG = sum(d * m for d, m in zip(_count_dist, _size_mults))
-    _TIER_CAPITAL_FACTOR = round(_TIER_AVG * 2.0, 4)
+    _TIER_CAPITAL_FACTOR = round(_TIER_AVG, 4)
+
+    # Reverse-buy effective factor.  When BUY_LADDER_REVERSED is on the GUI
+    # swaps the buy-side count distribution (inner↔extreme, mid↔outer) so the
+    # densest counts move to the smallest-size positions.  Effective buy
+    # weighting therefore uses count_dist applied in reverse against size_mults.
+    # In normal mode this collapses to the same value as _TIER_AVG.
+    _buy_ladder_reversed = bool(getattr(cfg, "BUY_LADDER_REVERSED", False))
+    _BUY_TIER_AVG = (
+        sum(_count_dist[3 - i] * _size_mults[i] for i in range(4))
+        if _buy_ladder_reversed else _TIER_AVG
+    )
+    _BUY_TIER_FACTOR = round(_BUY_TIER_AVG, 4)
+
+    # Spare overhead (in base_size units): prepared spare coins live outside
+    # active offers but still consume capital.  Include them in the divisor so
+    # base_size × (active + spares + headroom) ≈ side budget exactly.
+    # Sell-side spares stay in size order; buy-side spares are display-swapped
+    # under reverse buy so the heaviest spare lands on the smallest size.
+    _SPARE_OVERHEAD = (
+        _spare_inner   * _size_mults[0] +
+        _spare_mid     * _size_mults[1] +
+        _spare_outer   * _size_mults[2] +
+        _spare_extreme * _size_mults[3]
+    )
+    _BUY_SPARE_OVERHEAD = (
+        sum((
+            _spare_inner, _spare_mid, _spare_outer, _spare_extreme
+        )[3 - i] * _size_mults[i] for i in range(4))
+        if _buy_ladder_reversed else _SPARE_OVERHEAD
+    )
+    _CP_HEADROOM_MULT = 1.0 + (coin_prep_headroom_pct / 100.0)
 
     # ── Defaults ──
     _smart_max_buy   = int(getattr(cfg, "MAX_ACTIVE_BUY_OFFERS",  5) or 5)
@@ -6626,41 +7272,79 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
     _capital_plan    = {}
 
     if _avail_xch > 0 and _trading_xch >= (_MIN_OFFER_XCH * 2) and _target_n > 0:
-        # Derive base size from trading capital
-        _base_size = _trading_xch / (_target_n * _TIER_CAPITAL_FACTOR)
+        # Derive base size from trading capital — includes active + spares + headroom.
+        # Two budgets:
+        #   buy:  _trading_xch ≥ (n*_BUY_TIER_FACTOR  + _BUY_SPARE_OVERHEAD) * HEADROOM * base
+        #   sell: _avail_cat   ≥ (n*_TIER_CAPITAL_FACTOR + _SPARE_OVERHEAD) * HEADROOM * (base/mid_price)
+        # In normal mode buy/sell collapse to the same divisor.  In reverse-buy
+        # mode the buy-side count distribution is flipped so its weighted sum
+        # is much smaller — base can grow until the sell-side CAT budget binds.
+        def _solve_base_xch(n):
+            _den = max(1e-9, (n * _BUY_TIER_FACTOR + _BUY_SPARE_OVERHEAD) * _CP_HEADROOM_MULT)
+            return _trading_xch / _den
 
-        # Enforce minimum floor — reduce n if needed
+        def _solve_base_cat(n):
+            if not (mid_price and mid_price > 0 and _avail_cat > 0):
+                return float("inf")
+            _den = max(1e-9, (n * _TIER_CAPITAL_FACTOR + _SPARE_OVERHEAD) * _CP_HEADROOM_MULT)
+            return (_avail_cat * mid_price) / _den
+
+        def _solve_base(n):
+            return min(_solve_base_xch(n), _solve_base_cat(n))
+
+        _base_size = _solve_base(_target_n)
+
+        # Enforce minimum floor — reduce n if needed.
         if _base_size < _MIN_OFFER_XCH:
-            _target_n  = max(2, int(_trading_xch / (_MIN_OFFER_XCH * _TIER_CAPITAL_FACTOR)))
-            _base_size = _trading_xch / max(1, _target_n * _TIER_CAPITAL_FACTOR)
+            # Binding side: whichever solver gives the smaller base.
+            _xch_units = _trading_xch / (_MIN_OFFER_XCH * _CP_HEADROOM_MULT)
+            _n_xch     = int((_xch_units - _BUY_SPARE_OVERHEAD) / max(1e-9, _BUY_TIER_FACTOR))
+            if mid_price and mid_price > 0 and _avail_cat > 0:
+                _cat_units = (_avail_cat * mid_price) / (_MIN_OFFER_XCH * _CP_HEADROOM_MULT)
+                _n_cat     = int((_cat_units - _SPARE_OVERHEAD) / max(1e-9, _TIER_CAPITAL_FACTOR))
+                _target_n  = max(2, min(_n_xch, _n_cat))
+            else:
+                _target_n  = max(2, _n_xch)
+            _base_size = _solve_base(_target_n)
 
+        # XCH-backed buy capacity at the trial base size.
         _n_buy = _target_n
+        if _base_size > 0:
+            _xch_units_avail = _trading_xch / _base_size
+            _n_buy = max(0, int(
+                (_xch_units_avail / _CP_HEADROOM_MULT - _BUY_SPARE_OVERHEAD)
+                / max(1e-9, _BUY_TIER_FACTOR)
+            ))
+            _n_buy = max(1, min(_target_n, _n_buy))
 
-        # CAT side: check available CAT can support n_sell at same depth
+        # CAT-backed sell capacity at the trial base size.
         _n_sell = _target_n
-        if mid_price and mid_price > 0 and _avail_cat > 0:
+        if mid_price and mid_price > 0 and _avail_cat > 0 and _base_size > 0:
             _cat_base = _base_size / mid_price
             if _cat_base > 0:
-                _n_sell = max(0, int(_avail_cat / (_cat_base * _TIER_CAPITAL_FACTOR)))
+                _cat_units_avail = _avail_cat / _cat_base
+                _n_sell = max(0, int(
+                    (_cat_units_avail / _CP_HEADROOM_MULT - _SPARE_OVERHEAD)
+                    / max(1e-9, _TIER_CAPITAL_FACTOR)
+                ))
         elif _avail_cat <= 0:
             _n_sell = 0
 
-        # Symmetric — same depth on both sides (initial check with pre-n_final base_size)
+        # Symmetric — same depth on both sides
         _n_final = max(1, min(_n_buy, _n_sell)) if _n_sell > 0 else max(1, _n_buy)
 
-        # Recalculate base size with agreed n.
-        # IMPORTANT: reducing _n_final below _target_n makes _base_size LARGER
-        # (fewer offers × same total XCH = bigger per-offer size).  The initial
-        # _n_sell check used the smaller _target_n base_size; the larger final
-        # base_size means CAT may still be insufficient.  Re-verify here.
-        _base_size = max(_MIN_OFFER_XCH,
-                         round(_trading_xch / max(1, _n_final * _TIER_CAPITAL_FACTOR), 4))
+        # Recalculate base size with agreed n (uses the binding constraint).
+        _base_size = max(_MIN_OFFER_XCH, round(_solve_base(_n_final), 4))
 
         # Re-check CAT capacity against the definitive final base_size.
         if mid_price and mid_price > 0 and _base_size > 0:
             _cat_per_offer_final = _base_size / mid_price
             if _cat_per_offer_final > 0:
-                _n_sell = max(0, int(_avail_cat / (_cat_per_offer_final * _TIER_CAPITAL_FACTOR)))
+                _cat_units_avail = _avail_cat / _cat_per_offer_final
+                _n_sell = max(0, int(
+                    (_cat_units_avail / _CP_HEADROOM_MULT - _SPARE_OVERHEAD)
+                    / max(1e-9, _TIER_CAPITAL_FACTOR)
+                ))
         _n_sell_cap = _n_sell  # definitive CAT-backed sell capacity
 
         # Distribute offers across tiers; mid absorbs rounding remainder
@@ -6713,12 +7397,138 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
             _smart_outer   = max(_MIN_OFFER_XCH, round(_smart_outer   * _tsm, 4)) if _smart_outer   > 0 else 0.0
             _smart_extreme = max(_MIN_OFFER_XCH, round(_smart_extreme * _tsm, 4)) if _smart_extreme > 0 else 0.0
 
+        # F63 (2026-04-10): apply price shock spare floor now that tier
+        # counts are finalized. Each tier gets at least ceil(live×0.5) spares
+        # so the rolling wave requote can start its first batch immediately.
+        if _apply_shock_floor:
+            _pre_shock = (_spare_inner, _spare_mid, _spare_outer, _spare_extreme)
+            _spare_inner   = max(_spare_inner,   _math_spare.ceil(_smart_n_inner   * 0.5)) if _smart_n_inner   > 0 else _spare_inner
+            _spare_mid     = max(_spare_mid,     _math_spare.ceil(_smart_n_mid     * 0.5)) if _smart_n_mid     > 0 else _spare_mid
+            _spare_outer   = max(_spare_outer,   _math_spare.ceil(_smart_n_outer   * 0.5)) if _smart_n_outer   > 0 else _spare_outer
+            _spare_extreme = max(_spare_extreme, _math_spare.ceil(_smart_n_extreme * 0.5)) if _smart_n_extreme > 0 else _spare_extreme
+            _post_shock = (_spare_inner, _spare_mid, _spare_outer, _spare_extreme)
+            if _pre_shock != _post_shock:
+                print(f"[SMART_DEFAULTS] Price shock spare floor applied: "
+                      f"inner {_pre_shock[0]}->{_post_shock[0]}, "
+                      f"mid {_pre_shock[1]}->{_post_shock[1]}, "
+                      f"outer {_pre_shock[2]}->{_post_shock[2]}, "
+                      f"extreme {_pre_shock[3]}->{_post_shock[3]}")
+
         # Hard cap _smart_max_sell to what the available CAT can actually fund.
         # Risk-profile adjustments (max_offers_mult) may have pushed _smart_max_sell
         # above _n_sell_cap; clamp it back down.  _n_sell_cap was computed against
         # the final base_size so this is the definitive, accurate limit.
         if _smart_max_sell > _n_sell_cap:
             _smart_max_sell = _n_sell_cap
+
+        # ── PRICE SHOCK SPARE BUFFER (Fix G, 2026-04-10) ──────────────────
+        # During a price shock the entire one-side ladder gets requoted.
+        # The rolling wave needs at least 50% of each tier's live count
+        # available as spare coins so replacement offers can start creating
+        # immediately without waiting for coin prep.  Take the MAX of
+        # (fill-rate spares, price-shock spares) for each tier.
+        import math as _math_g
+        _shock_inner   = _math_g.ceil(_smart_n_inner   * 0.5)
+        _shock_mid     = _math_g.ceil(_smart_n_mid     * 0.5)
+        _shock_outer   = _math_g.ceil(_smart_n_outer   * 0.5)
+        _shock_extreme = _math_g.ceil(_smart_n_extreme * 0.5)
+        if _shock_inner > _spare_inner:
+            log_event("info", "smart_spare_shock_buffer",
+                      f"Spare inner raised from {_spare_inner} to "
+                      f"{_shock_inner} for price shock resilience")
+            _spare_inner = _shock_inner
+        if _shock_mid > _spare_mid:
+            log_event("info", "smart_spare_shock_buffer",
+                      f"Spare mid raised from {_spare_mid} to "
+                      f"{_shock_mid} for price shock resilience")
+            _spare_mid = _shock_mid
+        if _shock_outer > _spare_outer and _smart_n_outer > 0:
+            log_event("info", "smart_spare_shock_buffer",
+                      f"Spare outer raised from {_spare_outer} to "
+                      f"{_shock_outer} for price shock resilience")
+            _spare_outer = _shock_outer
+        if _shock_extreme > _spare_extreme and _smart_n_extreme > 0:
+            log_event("info", "smart_spare_shock_buffer",
+                      f"Spare extreme raised from {_spare_extreme} to "
+                      f"{_shock_extreme} for price shock resilience")
+            _spare_extreme = _shock_extreme
+
+        # ── COIN-PREP CAT FEASIBILITY CLAMP ────────────────────────────────
+        # The capital-plan solver may have been run when the token balance was
+        # higher (or the price was higher), so the recommended tier sizes can
+        # exceed what the current CAT balance can actually support for coin
+        # prep.  Replicate the JS formula exactly so the settings we emit are
+        # guaranteed to pass the coin-prep feasibility check in the frontend:
+        #
+        #   totalCatForCoinPrep = sum_tier:
+        #       (n_live + n_spare) × round(tier_size_xch / mid_price × headroom_mult)
+        #
+        # If the total exceeds avail_cat, scale ALL tier sizes down by the
+        # ratio (avail_cat / total), then re-floor at _MIN_OFFER_XCH.
+        if mid_price and mid_price > 0 and _avail_cat > 0:
+            _cp_hm = 1.0 + (coin_prep_headroom_pct / 100.0)
+            _tier_live_spare_size = [
+                (_smart_n_inner,   _spare_inner,   _smart_inner),
+                (_smart_n_mid,     _spare_mid,     _smart_mid),
+            ]
+            if _max_tiers >= 3 and _smart_outer > 0:
+                _tier_live_spare_size.append((_smart_n_outer, _spare_outer, _smart_outer))
+            if _max_tiers >= 4 and _smart_extreme > 0:
+                _tier_live_spare_size.append((_smart_n_extreme, _spare_extreme, _smart_extreme))
+            # Use the actual configured spares the frontend will build with.
+            # PREVIOUSLY this also took max() against (live × 3) as a "what if
+            # the user is on the recommended 2:1 spare template" defensive
+            # check, but that doubled the CAT requirement and triggered a
+            # ~50% scale-down even when the user had a much smaller custom
+            # spare template (e.g. 11 spares for 24 live). The recommended
+            # spare snap already lives in the frontend Recommended button —
+            # if the user clicks it the spare counts arrive here updated, so
+            # the defensive max is never needed.
+            _total_cat_prep = sum(
+                (_nl + _ns) * round((_sx / mid_price) * _cp_hm)
+                for _nl, _ns, _sx in _tier_live_spare_size
+            )
+            # F55 (2026-04-09): the frontend's coin-prep total includes
+            # sniper CAT and the topup-pool CAT alongside the trading
+            # tiers. If we let trading tiers eat 85% of avail_cat, and
+            # then sniper + topup take their share on top, the frontend
+            # sum can exceed avail_cat and fire a critical "Coin prep
+            # impossible" warning even though Smart Settings just signed
+            # off. Carve those holders OUT of the budget here so the
+            # trading-tier clamp leaves room for them.
+            _sniper_cat_prep = (
+                round((_smart_sniper_size / mid_price) * _cp_hm) * _smart_sniper_prep
+                if mid_price > 0 else 0
+            )
+            _topup_cat_prep = round(_avail_cat * _TOPUP_BUFFER_PCT)
+            _cat_budget = max(
+                0.0,
+                _avail_cat * 0.85 - _sniper_cat_prep - _topup_cat_prep
+            )
+            if _total_cat_prep > _cat_budget:
+                _cat_scale = _cat_budget / _total_cat_prep   # < 1.0
+                _pre_scale_inner = _smart_inner
+                _smart_inner   = max(_MIN_OFFER_XCH, round(_smart_inner   * _cat_scale, 4))
+                _smart_mid     = max(_MIN_OFFER_XCH, round(_smart_mid     * _cat_scale, 4))
+                _smart_outer   = (max(_MIN_OFFER_XCH, round(_smart_outer   * _cat_scale, 4))
+                                  if _smart_outer   > 0 else 0.0)
+                _smart_extreme = (max(_MIN_OFFER_XCH, round(_smart_extreme * _cat_scale, 4))
+                                  if _smart_extreme > 0 else 0.0)
+                # _base_size is the reference "mid" size from which all tiers derive.
+                # Scale it by the same ratio so the multiplier structure is preserved.
+                _base_size = round(_base_size * _cat_scale, 4)
+                _smart_trade_size = _base_size
+                messages.append(
+                    f"Sell offer sizes scaled down {(1-_cat_scale)*100:.0f}% "
+                    f"({_pre_scale_inner:.4f} → {_smart_inner:.4f} XCH inner) "
+                    f"so the {_smart_max_sell} sell offers fit your CAT balance. "
+                    f"Coin prep would have needed ~{_total_cat_prep:,.0f} tokens, "
+                    f"budget is {_cat_budget:,.0f} (85% of {_avail_cat:,.0f} available)."
+                )
+                print(f"[SMART_DEFAULTS] CAT prep clamp triggered: scale={_cat_scale:.3f}, "
+                      f"was {_total_cat_prep:,.0f} tokens, budget {_cat_budget:,.0f} "
+                      f"(85% of {_avail_cat:,.0f} avail)")
+        # ── END COIN-PREP CAT FEASIBILITY CLAMP ────────────────────────────
 
         _cat_limited = bool(_n_sell_cap < _n_buy and mid_price and mid_price > 0)
         _strategy = (
@@ -6733,14 +7543,10 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
         )
         # Topup buffer: XCH NOT deployed into active offers.
         # This is the "topup pool" — large unbroken coins the topup worker
-        # splits when a tier runs short. Formula:
-        #   available XCH  (after configured reserve)
-        #   − fee pool      (already prepared as fee coins)
-        #   − sniper pool   (already prepared as sniper coins)
-        #   − trading XCH   (already prepared as trading-sized coins)
-        # What's left stays as 1–2 large reserve coins ready for splits.
-        # Anything below 2× the largest tier size means topup cannot
-        # replenish a full ladder pass without another split first.
+        # splits when a tier runs short.  We ALREADY carved out
+        # _topup_buffer_reserve before computing _trading_xch, so the unused
+        # XCH here equals (avail − fees − sniper − trading), which is the
+        # reserved buffer plus any rounding crumbs.
         _topup_buffer_xch = max(0.0, round(
             _avail_xch - _fee_pool_xch - _sniper_pool_xch - _trading_xch, 4))
         _largest_tier_xch = max(
@@ -6750,6 +7556,23 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
             _smart_extreme if _smart_extreme > 0 else 0.0,
             float(_MIN_OFFER_XCH),
         )
+        # Aim for ≥2× the largest tier so the topup worker can split a full
+        # replacement coin AND still have something to feed into the next
+        # split.  If the 10% reservation isn't enough, top it up by reducing
+        # _trading_xch (we already know base sizes — we just shrink the
+        # pool, not the per-offer sizes, since the formula is fixed).
+        _target_buffer = round(max(_topup_buffer_xch, _largest_tier_xch * 2), 4)
+        # Don't let the buffer eat the entire trading budget — cap at 25% of
+        # post-pools XCH so we always keep most capital working.
+        _max_buffer_allowed = round(_post_pools_xch * 0.25, 4)
+        if _target_buffer > _max_buffer_allowed:
+            _target_buffer = _max_buffer_allowed
+        if _target_buffer > _topup_buffer_xch:
+            _extra_needed = round(_target_buffer - _topup_buffer_xch, 4)
+            if _extra_needed > 0 and _trading_xch > _extra_needed:
+                _trading_xch = round(_trading_xch - _extra_needed, 4)
+                _topup_buffer_xch = round(_topup_buffer_xch + _extra_needed, 4)
+                _trading_pct = round(_trading_xch / _avail_xch * 100, 1) if _avail_xch > 0 else 0.0
         _topup_buffer_adequate = _topup_buffer_xch >= _largest_tier_xch * 2
         if _topup_buffer_adequate:
             messages.append(
@@ -6795,11 +7618,15 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
             _tier_msg += f" / extreme {_n_extreme}×{_smart_extreme:.4f}"
         messages.append(_tier_msg + " XCH")
         if _cat_limited_trading and _cat_xch_equiv is not None:
-            _xch_saved = round(_avail_xch * _rp["capital_mult"] * _offer_fraction - _cat_xch_equiv, 2)
+            # F55 (2026-04-09): drop the duplicate "X XCH stays in topup buffer"
+            # number — it was computed differently from `_topup_buffer_xch`
+            # above and produced a contradictory second figure in the same
+            # log. The single source of truth is the "Topup buffer:" message
+            # at line 7370 (uses _topup_buffer_xch — the final adjusted value).
             messages.append(
                 f"CAT balance ({_avail_cat:.0f} tokens ≈ {_cat_xch_equiv:.2f} XCH) is smaller than XCH "
-                f"trading budget — offer sizes reduced to match so coin prep is fundable. "
-                f"{max(0.0, _xch_saved):.2f} XCH stays in topup buffer."
+                f"trading budget — offer sizes matched to CAT value. "
+                f"Unused XCH is held in the topup buffer above."
             )
     else:
         _capital_plan = {
@@ -6903,6 +7730,418 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
                     f"(small wallet — {_trading_xch:.4f} XCH trading capital)"
                 )
 
+    # ═══ BUY-SIDE REVERSAL (reverse-buy ladder only) ═════════════════════
+    # Smart Settings computes _smart_n_*/_spare_* in SIZE-indexed semantics:
+    # the largest count goes on the largest coin size (size_inner). That is
+    # correct for the SELL side (slot inner = inner SIZE = most-active slot
+    # = should have the most offers). For the BUY side under BUY_LADDER_REVERSED
+    # the intent flips: slot inner uses the smallest coin (extreme SIZE) so the
+    # most-active slot also needs the most offers, which means the largest
+    # count should go on the SMALLEST coin size.
+    #
+    # The frontend then swaps inner↔extreme / mid↔outer when populating the
+    # BUY_*_TIER_COUNT inputs (line 15433 in bot_gui.html), and the launcher's
+    # _flip_tiers swaps them back when building the coin-size pool. Net effect:
+    # whatever goes into buy_inner_tier_count ends up at coin SIZE inner in the
+    # launcher's pool. To put the largest count on the SMALLEST coin we must
+    # emit buy_inner_tier_count = _smart_n_extreme (smallest), and so on.
+    #
+    # Without this reversal the launcher builds a pool where the largest count
+    # multiplies the largest coin size — exploding the XCH pool ~2× and causing
+    # the worker's emergency feasibility scaler to drop tiers mid-prep.
+    if _buy_ladder_reversed:
+        _buy_n_inner   = _smart_n_extreme
+        _buy_n_mid     = _smart_n_outer
+        _buy_n_outer   = _smart_n_mid
+        _buy_n_extreme = _smart_n_inner
+        _buy_spare_inner   = _spare_extreme
+        _buy_spare_mid     = _spare_outer
+        _buy_spare_outer   = _spare_mid
+        _buy_spare_extreme = _spare_inner
+    else:
+        _buy_n_inner   = _smart_n_inner
+        _buy_n_mid     = _smart_n_mid
+        _buy_n_outer   = _smart_n_outer
+        _buy_n_extreme = _smart_n_extreme
+        _buy_spare_inner   = _spare_inner
+        _buy_spare_mid     = _spare_mid
+        _buy_spare_outer   = _spare_outer
+        _buy_spare_extreme = _spare_extreme
+
+    # ═══ HARD FEASIBILITY CHECK (mirror the launcher's pool formula) ═════
+    # Compute the exact XCH pool the launcher will request, accounting for
+    # the frontend swap + launcher flip + coin-size sizing. If the proposed
+    # ladder doesn't fit the wallet's actual buy budget, scale ALL tier
+    # sizes down so the launcher never has to invoke its emergency
+    # auto-scaler (which silently drops tiers and confuses the user).
+    #
+    # The launcher's effective formula (after frontend swap → env → _flip_tiers)
+    # collapses to: pool = sum_i((live[size_i] + spare[size_i]) × size_xch[i]) × headroom
+    # where size_xch[i] = base_size × size_mults[i] = _smart_inner/_smart_mid/etc.
+    if _smart_inner > 0:
+        # Position counts as the env will hold them (after frontend swap)
+        if _buy_ladder_reversed:
+            _env_buy_inner   = _buy_n_extreme + _buy_spare_extreme  # frontend swap puts buy_extreme→BUY_INNER
+            _env_buy_mid     = _buy_n_outer   + _buy_spare_outer
+            _env_buy_outer   = _buy_n_mid     + _buy_spare_mid
+            _env_buy_extreme = _buy_n_inner   + _buy_spare_inner
+        else:
+            _env_buy_inner   = _buy_n_inner   + _buy_spare_inner
+            _env_buy_mid     = _buy_n_mid     + _buy_spare_mid
+            _env_buy_outer   = _buy_n_outer   + _buy_spare_outer
+            _env_buy_extreme = _buy_n_extreme + _buy_spare_extreme
+        # Launcher flip: position → coin SIZE
+        if _buy_ladder_reversed:
+            _size_inner_total   = _env_buy_extreme   # slot extreme uses inner size
+            _size_mid_total     = _env_buy_outer
+            _size_outer_total   = _env_buy_mid
+            _size_extreme_total = _env_buy_inner
+        else:
+            _size_inner_total   = _env_buy_inner
+            _size_mid_total     = _env_buy_mid
+            _size_outer_total   = _env_buy_outer
+            _size_extreme_total = _env_buy_extreme
+        _buy_pool_xch = (
+            _size_inner_total   * _smart_inner
+            + _size_mid_total     * _smart_mid
+            + _size_outer_total   * _smart_outer
+            + _size_extreme_total * _smart_extreme
+        ) * _CP_HEADROOM_MULT
+        # Budget the launcher will see: avail XCH minus the carve-outs
+        # (fee pool + sniper pool + topup buffer).
+        # F55 (2026-04-09): the topup buffer must be excluded from the
+        # launcher budget — it is XCH HELD as unsplit reserve coins, not
+        # capital available for trading-tier coin prep. Previously the
+        # 10% topup buffer wasn't subtracted, so the launcher tried to
+        # prep tier coins worth 95% of post_pools_xch on top of holding
+        # the 10% topup buffer = 105% of post_pools_xch total. The
+        # frontend's coin-prep preview correctly summed the parts and
+        # threw a "Coin prep impossible" critical warning even though
+        # Smart Settings claimed the plan fit.
+        _launcher_buy_budget = max(0.0,
+            _avail_xch - _fee_pool_xch - _sniper_pool_xch - _topup_buffer_xch)
+        # F57 (2026-04-09): reduced from 5% to 2% safety margin so Smart
+        # Settings can deploy more of the wallet's actual capacity. The 5%
+        # margin was over-conservative — `_avail_xch` already excludes the
+        # user's reserve and the topup buffer, both of which absorb any
+        # transient locked-coin / rounding noise. The 2% margin is enough
+        # to handle wallet RPC quantization at the mojo level.
+        _launcher_buy_budget *= 0.98
+        if _buy_pool_xch > _launcher_buy_budget and _buy_pool_xch > 0:
+            _buy_scale = _launcher_buy_budget / _buy_pool_xch
+            _pre_inner = _smart_inner
+            _smart_inner   = max(_MIN_OFFER_XCH, round(_smart_inner   * _buy_scale, 4))
+            _smart_mid     = max(_MIN_OFFER_XCH, round(_smart_mid     * _buy_scale, 4))
+            _smart_outer   = (max(_MIN_OFFER_XCH, round(_smart_outer   * _buy_scale, 4))
+                              if _smart_outer   > 0 else 0.0)
+            _smart_extreme = (max(_MIN_OFFER_XCH, round(_smart_extreme * _buy_scale, 4))
+                              if _smart_extreme > 0 else 0.0)
+            _smart_trade_size = round(_smart_trade_size * _buy_scale, 4)
+            messages.append(
+                f"Buy ladder sizes scaled down {(1-_buy_scale)*100:.0f}% "
+                f"({_pre_inner:.4f} → {_smart_inner:.4f} XCH inner) "
+                f"so coin prep + topup buffer fits the wallet. "
+                f"Unscaled buy pool would have been {_buy_pool_xch:.2f} XCH; "
+                f"budget after fees, sniper and topup buffer is {_launcher_buy_budget:.2f} XCH."
+            )
+            print(f"[SMART_DEFAULTS] Buy pool clamp triggered: scale={_buy_scale:.3f}, "
+                  f"was {_buy_pool_xch:.2f} XCH, budget {_launcher_buy_budget:.2f} XCH "
+                  f"(reverse-buy={_buy_ladder_reversed})")
+
+    # ═══ TIER-AWARE "TIGHT ALLOCATION" GUARD (F57 2026-04-09) ════════════
+    # The GUI's checkReserveWarnings() now (post-F57) computes the SUM of
+    # tier_count × tier_size across all four tiers — the true XCH the buy
+    # ladder will lock — and warns if `tier_sum + reserve > 0.9 × balance`.
+    #
+    # Smart Settings has to keep the same total below that bar, otherwise
+    # the warning fires the moment the GUI form re-validates after Smart
+    # Settings populates it. Anchor against the ACTUAL ladder sum (not the
+    # base × max_buy flat overcount that the previous F56 used) so we can
+    # use the wallet's full capacity instead of leaving 30%+ idle.
+    #
+    # Reserve-percentage handling:
+    #   • 0%   → 90%   proportional clamp using the actual tier sum;
+    #                  trade size always stays positive
+    #   • ≥ 90%        math is impossible (any offer trips the warning) →
+    #                  drop buy offers entirely so the warning is correctly
+    #                  suppressed (only fires when max_buy > 0)
+    if (xch_spendable > 0 and _smart_max_buy > 0
+            and "_smart_trade_size" in dir() and _smart_trade_size > 0):
+        _tier_warning_budget = max(0.0, 0.9 * xch_spendable - _xch_reserve)
+        # 2% safety margin — leaves room for rounding noise after the GUI
+        # populates the form. The previous 12% margin was over-conservative
+        # because it assumed the GUI used the flat overcount; with F57 the
+        # GUI uses the same actual sum we compute here, so we can target
+        # much closer to the true threshold.
+        _safe_tier_budget = _tier_warning_budget * 0.98
+
+        # F57c (2026-04-09): compute the BUY-side live ladder XCH.
+        #
+        # The clamp exists to keep the GUI "Tight allocation" warning quiet.
+        # That warning checks buy_ladder + xch_reserve ≤ 0.9 × balance — so
+        # we need the BUY-side sum here, not the sell-side sum.
+        #
+        # Under reverse-buy, the buy ladder is NOT symmetric with the sell
+        # ladder in XCH terms — the buy side uses MANY small coins at the
+        # most-active positions (position inner/mid) and FEW large coins
+        # at the least-active positions (position extreme). That means the
+        # total XCH is LESS than the sell side's CAT-equivalent.
+        #
+        # Correct pairing under reverse-buy:
+        #   position inner (count = 42%)  uses SIZE extreme  (smallest coin)
+        #   position mid   (count = 30%)  uses SIZE outer
+        #   position outer (count = 20%)  uses SIZE mid
+        #   position extreme (count = 8%) uses SIZE inner    (largest coin)
+        #
+        # Without reverse-buy the pairing is the identity (position inner
+        # uses size inner, etc.) so the two branches give the same sum.
+        #
+        # Previous versions of this clamp used the sell-side sum
+        # (_smart_n_inner × _smart_inner + ...) as if it were the buy sum.
+        # That made it clamp at a number roughly 2× larger than the real
+        # buy capacity on typical tokens, which starved the ladder of ~15
+        # XCH of avail capital under reverse-buy.
+        if _buy_ladder_reversed:
+            _ladder_sum = (
+                _smart_n_inner   * _smart_extreme +  # pos inner × size extreme
+                _smart_n_mid     * _smart_outer   +  # pos mid   × size outer
+                _smart_n_outer   * _smart_mid     +  # pos outer × size mid
+                _smart_n_extreme * _smart_inner      # pos extreme × size inner
+            )
+        else:
+            _ladder_sum = (
+                _smart_n_inner   * _smart_inner   +
+                _smart_n_mid     * _smart_mid     +
+                _smart_n_outer   * _smart_outer   +
+                _smart_n_extreme * _smart_extreme
+            )
+
+        # Practical floor: a buy offer below this XCH is below Dexie's display
+        # threshold and not worth a taker's fee.
+        _PRACTICAL_MIN_BASE = max(_MIN_OFFER_XCH * 2, 0.01)
+
+        if _tier_warning_budget <= 0:
+            # Reserve is at or above 90% of the wallet — no positive trade
+            # size lets the warning stay quiet. Drop buy offers entirely so
+            # the warning correctly does not fire (it only checks max_buy > 0).
+            _pre_max_buy = _smart_max_buy
+            _smart_max_buy = 0
+            messages.append(
+                f"Reserve ({_xch_reserve:.2f} XCH) is ≥ 90% of total wallet. "
+                f"Buy offers dropped to 0 — the wallet has no headroom for "
+                f"buy-side allocation. Lower the reserve to enable buying."
+            )
+            print(f"[SMART_DEFAULTS] Reserve ≥ 90% of wallet: dropped buy offers "
+                  f"({_pre_max_buy} → 0). reserve={_xch_reserve:.2f}, "
+                  f"xch_spendable={xch_spendable:.2f}")
+        elif _ladder_sum > _safe_tier_budget and _safe_tier_budget > 0 and _ladder_sum > 0:
+            _tier_scale = _safe_tier_budget / _ladder_sum
+            _pre_tier_inner = _smart_inner if _smart_inner > 0 else _smart_trade_size
+            _new_trade_size = round(_smart_trade_size * _tier_scale, 4)
+
+            # If the proposed trade size would push the inner tier below the
+            # practical floor, reduce max_buy instead so the remaining offers
+            # can stay at a usable size.
+            if _new_trade_size < _PRACTICAL_MIN_BASE and _PRACTICAL_MIN_BASE > 0:
+                _new_max_buy = max(1, int(_safe_tier_budget / _PRACTICAL_MIN_BASE))
+                _pre_max_buy = _smart_max_buy
+                _smart_max_buy = _new_max_buy
+                _smart_trade_size = round(_PRACTICAL_MIN_BASE, 4)
+                if _smart_inner   > 0: _smart_inner   = round(_smart_trade_size * 1.5, 4)
+                if _smart_mid     > 0: _smart_mid     = round(_smart_trade_size * 1.0, 4)
+                if _smart_outer   > 0: _smart_outer   = round(_smart_trade_size * 0.5, 4)
+                if _smart_extreme > 0: _smart_extreme = round(_smart_trade_size * 0.2, 4)
+                messages.append(
+                    f"High reserve ({_xch_reserve:.2f} XCH) — buy offers reduced "
+                    f"from {_pre_max_buy} to {_smart_max_buy} so each remaining "
+                    f"offer stays at a practical {_smart_trade_size:.4f} XCH."
+                )
+                print(f"[SMART_DEFAULTS] Tier-sum clamp (max_buy reduction): "
+                      f"max_buy {_pre_max_buy}→{_smart_max_buy}, "
+                      f"trade_size→{_smart_trade_size:.4f} XCH, "
+                      f"safe_budget={_safe_tier_budget:.2f} XCH")
+            else:
+                _smart_trade_size = _new_trade_size
+                if _smart_inner   > 0: _smart_inner   = max(_MIN_OFFER_XCH, round(_smart_inner   * _tier_scale, 4))
+                if _smart_mid     > 0: _smart_mid     = max(_MIN_OFFER_XCH, round(_smart_mid     * _tier_scale, 4))
+                if _smart_outer   > 0: _smart_outer   = max(_MIN_OFFER_XCH, round(_smart_outer   * _tier_scale, 4))
+                if _smart_extreme > 0: _smart_extreme = max(_MIN_OFFER_XCH, round(_smart_extreme * _tier_scale, 4))
+                messages.append(
+                    f"Tier sizes scaled {(1-_tier_scale)*100:.0f}% "
+                    f"({_pre_tier_inner:.4f} → {_smart_inner:.4f} XCH inner) "
+                    f"so the buy ladder + reserve stays under 90% of wallet."
+                )
+                print(f"[SMART_DEFAULTS] Tier-sum clamp: scale={_tier_scale:.3f}, "
+                      f"ladder_sum={_ladder_sum:.2f} XCH, safe_budget={_safe_tier_budget:.2f} XCH "
+                      f"(0.98 × ({0.9*xch_spendable:.2f} − {_xch_reserve:.2f}))")
+
+            # Recompute trading_pct for the response to reflect the trim.
+            # trading_xch = the ACTUAL buy-side ladder sum (reverse-buy aware).
+            try:
+                if _buy_ladder_reversed:
+                    _trading_xch = round(
+                        _smart_n_inner   * _smart_extreme +
+                        _smart_n_mid     * _smart_outer   +
+                        _smart_n_outer   * _smart_mid     +
+                        _smart_n_extreme * _smart_inner,
+                        4)
+                else:
+                    _trading_xch = round(
+                        _smart_n_inner   * _smart_inner   +
+                        _smart_n_mid     * _smart_mid     +
+                        _smart_n_outer   * _smart_outer   +
+                        _smart_n_extreme * _smart_extreme,
+                        4)
+                _trading_pct = round(_trading_xch / _avail_xch * 100, 1) if _avail_xch > 0 else 0.0
+                if "_capital_plan" in dir() and isinstance(_capital_plan, dict):
+                    _capital_plan["trading_xch"] = _trading_xch
+                    _capital_plan["trading_pct"] = _trading_pct
+            except Exception:
+                pass
+        else:
+            # Already inside the budget — just refresh trading_xch in the
+            # capital plan to reflect the actual ladder sum (more honest
+            # number than the old "_trading_xch as base × max_buy estimate").
+            try:
+                _trading_xch = round(_ladder_sum, 4)
+                _trading_pct = round(_trading_xch / _avail_xch * 100, 1) if _avail_xch > 0 else 0.0
+                if "_capital_plan" in dir() and isinstance(_capital_plan, dict):
+                    _capital_plan["trading_xch"] = _trading_xch
+                    _capital_plan["trading_pct"] = _trading_pct
+            except Exception:
+                pass
+
+    # ═══ F62 (2026-04-09): PER-SIDE TIER SIZES ════════════════════════════
+    # Up to this point `_smart_inner` / `_smart_mid` / `_smart_outer` /
+    # `_smart_extreme` have been symmetric values shared between buy and
+    # sell ladders (the CAT clamp, tight guard etc. all treat them as one
+    # set). Under reverse-buy with a CAT-binding clamp, that symmetric
+    # sizing shrinks the buy-side to half its actual capacity and leaves
+    # huge amounts of XCH idle in the wallet.
+    #
+    # F62 runs AFTER all existing clamps complete. It:
+    #   1. Treats the existing _smart_* values as the SELL-side output
+    #      (which is correct — the CAT clamp sized them for the CAT budget)
+    #   2. Computes an INDEPENDENT buy base_size from the saved
+    #      _orig_xch_budget so the BUY side fully consumes its own balance
+    #   3. Emits position-semantic BUY_*_SIZE_XCH and SELL_*_SIZE_XCH fields
+    #      alongside the legacy shared fields (kept in sync with SELL for
+    #      backward compat with anything that hasn't been migrated to the
+    #      per-side helpers yet)
+    #
+    # Guards: the HARD FEASIBILITY CHECK and TIGHT ALLOCATION GUARD above
+    # both check the buy pool against _smart_inner (sell values). Under
+    # F62, _smart_buy_* may be LARGER than _smart_inner, so the guard
+    # above was checking a smaller number than the actual buy pool. That
+    # means the guard is LENIENT under F62. We must re-verify here with
+    # the actual buy sizes before accepting the solution.
+    _smart_buy_inner = _smart_inner
+    _smart_buy_mid = _smart_mid
+    _smart_buy_outer = _smart_outer
+    _smart_buy_extreme = _smart_extreme
+    _smart_sell_inner = _smart_inner
+    _smart_sell_mid = _smart_mid
+    _smart_sell_outer = _smart_outer
+    _smart_sell_extreme = _smart_extreme
+    if (_orig_xch_budget > 0 and _n_final > 0 and _smart_inner > 0
+            and _avail_xch > 0):
+        # Solve for the biggest base that fits the XCH budget. The existing
+        # `_solve_base_xch` uses `count_dist`-based `_BUY_TIER_FACTOR`
+        # which is derived from the fractional target distribution
+        # (0.42/0.30/0.20/0.08). After rounding to integer counts
+        # (15/11/7/3), the ACTUAL ladder uses a slightly different tier
+        # factor (0.6167 vs 0.614 for the typical n=36 case). That 0.4%
+        # gap propagates to a ~0.17 XCH overshoot vs budget. Solving from
+        # the ACTUAL integer counts eliminates the rounding gap and
+        # guarantees the prep total stays at or below `_orig_xch_budget`.
+        if _buy_ladder_reversed:
+            # Reverse-buy: position inner uses smallest mult, etc.
+            _buy_live_coeff = (
+                _smart_n_inner   * _size_mults[3] +
+                _smart_n_mid     * _size_mults[2] +
+                _smart_n_outer   * _size_mults[1] +
+                _smart_n_extreme * _size_mults[0]
+            )
+            # Buy spare overhead uses position-semantic counts too
+            _buy_spare_coeff = (
+                _spare_inner   * _size_mults[3] +
+                _spare_mid     * _size_mults[2] +
+                _spare_outer   * _size_mults[1] +
+                _spare_extreme * _size_mults[0]
+            )
+        else:
+            _buy_live_coeff = (
+                _smart_n_inner   * _size_mults[0] +
+                _smart_n_mid     * _size_mults[1] +
+                _smart_n_outer   * _size_mults[2] +
+                _smart_n_extreme * _size_mults[3]
+            )
+            _buy_spare_coeff = (
+                _spare_inner   * _size_mults[0] +
+                _spare_mid     * _size_mults[1] +
+                _spare_outer   * _size_mults[2] +
+                _spare_extreme * _size_mults[3]
+            )
+        _buy_denom = max(1e-9, (_buy_live_coeff + _buy_spare_coeff) * _CP_HEADROOM_MULT)
+        # Apply a tiny safety margin (0.5%) to absorb downstream rounding
+        # of individual tier sizes — base × mult gets rounded to 4 dp per
+        # tier, and accumulating those errors can still push the total
+        # ~0.02 XCH above the theoretical max otherwise.
+        _buy_base_max = (_orig_xch_budget * 0.995) / _buy_denom
+        _buy_base_max = max(_MIN_OFFER_XCH, _buy_base_max)
+
+        # Position-semantic sizes: under reverse-buy, buy position inner
+        # (tightest, closest to mid) uses the SMALLEST multiplier (0.25×),
+        # buy position extreme (widest) uses the LARGEST (1.8×). Without
+        # reverse-buy it matches the sell layout.
+        if _buy_ladder_reversed:
+            _smart_buy_inner   = max(_MIN_OFFER_XCH, round(_buy_base_max * _size_mults[3], 4))
+            _smart_buy_mid     = max(_MIN_OFFER_XCH, round(_buy_base_max * _size_mults[2], 4))
+            _smart_buy_outer   = max(_MIN_OFFER_XCH, round(_buy_base_max * _size_mults[1], 4))
+            _smart_buy_extreme = max(_MIN_OFFER_XCH, round(_buy_base_max * _size_mults[0], 4))
+        else:
+            _smart_buy_inner   = max(_MIN_OFFER_XCH, round(_buy_base_max * _size_mults[0], 4))
+            _smart_buy_mid     = max(_MIN_OFFER_XCH, round(_buy_base_max * _size_mults[1], 4))
+            _smart_buy_outer   = max(_MIN_OFFER_XCH, round(_buy_base_max * _size_mults[2], 4))
+            _smart_buy_extreme = max(_MIN_OFFER_XCH, round(_buy_base_max * _size_mults[3], 4))
+
+        # Sell side: existing _smart_* values (already CAT-clamped correctly)
+        _smart_sell_inner   = _smart_inner
+        _smart_sell_mid     = _smart_mid
+        _smart_sell_outer   = _smart_outer
+        _smart_sell_extreme = _smart_extreme
+
+        # Recompute the actual live buy-ladder XCH so trading_xch /
+        # trading_pct reflect the TRUE deployment (not the old sell-side
+        # ladder sum).
+        if _buy_ladder_reversed:
+            _buy_live_xch = (
+                _smart_n_inner   * _smart_buy_inner   +
+                _smart_n_mid     * _smart_buy_mid     +
+                _smart_n_outer   * _smart_buy_outer   +
+                _smart_n_extreme * _smart_buy_extreme
+            )
+        else:
+            _buy_live_xch = (
+                _smart_n_inner   * _smart_buy_inner   +
+                _smart_n_mid     * _smart_buy_mid     +
+                _smart_n_outer   * _smart_buy_outer   +
+                _smart_n_extreme * _smart_buy_extreme
+            )
+        _trading_xch = round(_buy_live_xch, 4)
+        _trading_pct = round(_trading_xch / _avail_xch * 100, 1) if _avail_xch > 0 else 0.0
+        if "_capital_plan" in dir() and isinstance(_capital_plan, dict):
+            _capital_plan["trading_xch"] = _trading_xch
+            _capital_plan["trading_pct"] = _trading_pct
+            _capital_plan["buy_base_size"] = round(_buy_base_max, 4)
+            _capital_plan["sell_base_size"] = round(_base_size, 4)
+        messages.append(
+            f"F62 asymmetric sizing: buy ladder = "
+            f"{_buy_live_xch:.2f} XCH live ({_trading_pct:.0f}% of avail), "
+            f"buy base {_buy_base_max:.4f} vs sell base {_base_size:.4f}"
+        )
+    # ═══ END PER-SIDE TIER SIZES ══════════════════════════════════════════
+
     # ═══ Build response ═══
     result = {
         # Smart Pricing
@@ -6944,12 +8183,56 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
         "mid_tier_spare_count":   _spare_mid,
         "outer_tier_spare_count": _spare_outer,
         "extreme_tier_spare_count": _spare_extreme,
+        # Per-side spares (V4): buy side uses the reversed values when
+        # BUY_LADDER_REVERSED is on so the frontend swap → launcher flip chain
+        # places the densest spare pool at the smallest coin SIZE (which under
+        # reverse-buy lives at the most-active slot inner). Sell side keeps
+        # the standard size-indexed spares (largest spare on largest size, since
+        # sell slot inner = inner SIZE).
+        "buy_inner_tier_spare_count":   _buy_spare_inner,
+        "buy_mid_tier_spare_count":     _buy_spare_mid,
+        "buy_outer_tier_spare_count":   _buy_spare_outer,
+        "buy_extreme_tier_spare_count": _buy_spare_extreme,
+        "sell_inner_tier_spare_count": _spare_inner,
+        "sell_mid_tier_spare_count":   _spare_mid,
+        "sell_outer_tier_spare_count": _spare_outer,
+        "sell_extreme_tier_spare_count": _spare_extreme,
 
         # Transaction Fees (Coinset-estimated or existing values)
         "transaction_fee_mode": "auto",
         "transaction_fee_xch": _smart_fee_xch,
         "fee_coin_size_xch": _fee_coin_size,
         "fee_prep_count": _fee_prep_count,
+
+        # F49 (2026-04-09): two-tier reserve — topup pool allocation
+        # F55 (2026-04-09): use the FINAL adjusted `_topup_buffer_xch`
+        # rather than the raw 10%-of-bottleneck value. The two diverged
+        # whenever CAT was the bottleneck or the 2× largest-tier floor
+        # bumped the buffer up — leaving the GUI form input showing
+        # one number while the log message reported a different one.
+        #
+        # `xch_reserve` / `cat_reserve` above are the user's untouchable
+        # hard floor (set in step 1 of settings). The topup pool is the
+        # working allocation Smart Settings carves out of the remaining
+        # balance for the coin-splitting worker to consume. After all
+        # adjustments it equals (avail − fees − sniper − trading), which
+        # captures both the original 10% slice AND any XCH stranded by
+        # a CAT-side bottleneck.
+        #
+        # The frontend writes these to .env on save; `cfg.update()`
+        # clears the session spend counter whenever either value
+        # changes, so a fresh Smart Settings run always gets a fresh
+        # budget.
+        "topup_pool_pct": _TOPUP_BUFFER_PCT,
+        "topup_pool_xch": round(_topup_buffer_xch, 4) if _topup_buffer_xch > 0 else 0,
+        # CAT side: 10% of the user's available CAT (per-side computation,
+        # matches the user's "10% of remaining" design intent). Capped at
+        # avail so it never exceeds what they actually have.
+        "topup_pool_cat": (
+            round(min(_avail_cat, _avail_cat * _TOPUP_BUFFER_PCT), 3)
+            if _avail_cat > 0
+            else 0
+        ),
 
         # Ladder Strategy
         # Reverse buy ladder is always recommended — it limits XCH exposure by placing
@@ -6960,14 +8243,44 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
         "max_active_buy": _smart_max_buy,
         "max_active_sell": _smart_max_sell,
         "default_trade_xch": round(_smart_trade_size, 4) if _smart_trade_size > 0 else None,
+        # Legacy single-shared size fields (kept in sync with the SELL
+        # side so pre-F62 callers continue to work).
         "inner_size_xch": _smart_inner if _smart_inner > 0 else None,
         "mid_size_xch": _smart_mid if _smart_mid > 0 else None,
         "outer_size_xch": _smart_outer if _smart_outer > 0 else None,
         "extreme_size_xch": _smart_extreme if _smart_extreme > 0 else None,
+        # F62 (2026-04-09): per-side tier sizes. Position-semantic on both
+        # sides — BUY_INNER_SIZE_XCH is what position inner buys spend,
+        # SELL_INNER_SIZE_XCH is what position inner sells spend. Under
+        # reverse-buy, the BUY values are naturally smaller at position
+        # inner (tight side) and larger at position extreme (wide side)
+        # because Smart Settings computes them directly from the XCH
+        # budget without any shared solver constraint.
+        "buy_inner_size_xch":   _smart_buy_inner   if _smart_buy_inner   > 0 else None,
+        "buy_mid_size_xch":     _smart_buy_mid     if _smart_buy_mid     > 0 else None,
+        "buy_outer_size_xch":   _smart_buy_outer   if _smart_buy_outer   > 0 else None,
+        "buy_extreme_size_xch": _smart_buy_extreme if _smart_buy_extreme > 0 else None,
+        "sell_inner_size_xch":   _smart_sell_inner   if _smart_sell_inner   > 0 else None,
+        "sell_mid_size_xch":     _smart_sell_mid     if _smart_sell_mid     > 0 else None,
+        "sell_outer_size_xch":   _smart_sell_outer   if _smart_sell_outer   > 0 else None,
+        "sell_extreme_size_xch": _smart_sell_extreme if _smart_sell_extreme > 0 else None,
         "inner_tier_count": _smart_n_inner if _smart_n_inner > 0 else None,
         "mid_tier_count": _smart_n_mid if _smart_n_mid > 0 else None,
         "outer_tier_count": _smart_n_outer if _smart_n_outer >= 0 else None,
         "extreme_tier_count": _smart_n_extreme if _smart_n_extreme >= 0 else None,
+        # Per-side live counts (V4): buy side uses the reversed values when
+        # BUY_LADDER_REVERSED is on so the densest count lands at the smallest
+        # coin SIZE (slot inner under reverse-buy). The frontend then performs
+        # its inner↔extreme swap to convert these size-indexed values into
+        # position-indexed BUY_*_TIER_COUNT inputs.
+        "buy_inner_tier_count":   _buy_n_inner   if _buy_n_inner   > 0 else None,
+        "buy_mid_tier_count":     _buy_n_mid     if _buy_n_mid     > 0 else None,
+        "buy_outer_tier_count":   _buy_n_outer   if _buy_n_outer   >= 0 else None,
+        "buy_extreme_tier_count": _buy_n_extreme if _buy_n_extreme >= 0 else None,
+        "sell_inner_tier_count": _smart_n_inner if _smart_n_inner > 0 else None,
+        "sell_mid_tier_count": _smart_n_mid if _smart_n_mid > 0 else None,
+        "sell_outer_tier_count": _smart_n_outer if _smart_n_outer >= 0 else None,
+        "sell_extreme_tier_count": _smart_n_extreme if _smart_n_extreme >= 0 else None,
         "_capital_plan": _capital_plan,
 
         # Bot Operations
@@ -7024,7 +8337,7 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
           f"Requote: {_bps_to_pct(requote_bps)}, "
           f"Quality: {quality_score}% ===\n")
     log_event("success", "smart_defaults",
-              f"Smart Defaults v2: Spread {_bps_to_pct(base_spread_bps)}, "
+              f"Smart Settings: Spread {_bps_to_pct(base_spread_bps)}, "
               f"Requote {_bps_to_pct(requote_bps)}, "
               f"Quality {quality_score}% ({quality_label})",
               {"version": 2, "base_spread_bps": base_spread_bps, "requote_bps": requote_bps,
@@ -7044,7 +8357,10 @@ def api_db_backup():
     """Create a database backup."""
     try:
         path = backup_database()
-        return jsonify({"status": "backed_up", "path": path})
+        # Return only the filename, not the full filesystem path, to
+        # avoid leaking the user's directory structure to the GUI.
+        filename = os.path.basename(path) if path else ""
+        return jsonify({"status": "backed_up", "filename": filename})
     except Exception as e:
         return _api_error(e, request.path)
 
@@ -7158,6 +8474,11 @@ def _get_dexie_pairs() -> list:
                     "asset_id": ticker.get("base_id", ""),
                     "price": float(ticker.get("current_avg_price", 0) or 0),
                     "volume_24h": float(ticker.get("target_volume", 0) or 0),
+                    # Extra market stats — surfaced in token snapshot on pair select
+                    "vol_7d_xch":   float(ticker.get("target_volume_7d",  0) or 0),
+                    "vol_30d_xch":  float(ticker.get("target_volume_30d", 0) or 0),
+                    "price_high_7d": float(ticker.get("high_7d",  0) or 0),
+                    "price_low_7d":  float(ticker.get("low_7d",   0) or 0),
                 })
 
         pairs.sort(key=lambda x: x["volume_24h"], reverse=True)
@@ -7166,6 +8487,60 @@ def _get_dexie_pairs() -> list:
     except Exception as e:
         print(f"[CATS] Failed to fetch Dexie pairs: {e}")
         return []
+
+
+@app.route("/api/token_overview")
+def api_token_overview():
+    """Return description + website for a token from Dexie v1/assets.
+    Called once when the user selects a trading pair on the dashboard.
+    Searches up to the first 3 pages (300 assets) to find a match.
+    ?dexie_asset_id=<64-char-id>
+    """
+    dexie_asset_id = (request.args.get("dexie_asset_id") or "").strip().lower()
+    if not dexie_asset_id:
+        return jsonify({"success": False, "description": "", "website": ""})
+    try:
+        dexie_base = getattr(cfg, "DEXIE_API_BASE", "https://api.dexie.space")
+        for page in range(1, 4):
+            resp = _req.get(
+                f"{dexie_base}/v1/assets",
+                params={"page": page, "page_size": 100},
+                timeout=8,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            assets = data.get("assets", [])
+            for asset in assets:
+                if asset.get("id", "").lower() == dexie_asset_id:
+                    return jsonify({
+                        "success": True,
+                        "description": asset.get("description", ""),
+                        "website": asset.get("website", ""),
+                    })
+            # If fewer assets than page_size returned, no point fetching more
+            if len(assets) < 100:
+                break
+        return jsonify({"success": True, "description": "", "website": ""})
+    except Exception as e:
+        print(f"[TOKEN_OVERVIEW] Failed for {dexie_asset_id[:12]}: {e}")
+        return jsonify({"success": False, "description": "", "website": "", "error": str(e)})
+
+
+@app.route("/api/dexie/v3-pairs")
+def api_dexie_v3_pairs():
+    """F38 (2026-04-08): expose Dexie v3 pairs (with summary stats) to the GUI.
+
+    Used by the pair selector to show real volume / last-price / activity
+    instead of just "this CAT exists in your wallet".
+    """
+    global bot
+    if not bot or not getattr(bot, "dexie_manager", None):
+        return jsonify({"pairs": [], "error": "bot not initialised"}), 503
+    try:
+        pairs = bot.dexie_manager.fetch_v3_pairs() or []
+        return jsonify({"pairs": pairs, "count": len(pairs)})
+    except Exception as e:
+        return _api_error(e, request.path)
 
 
 @app.route("/api/cats")
@@ -7177,6 +8552,9 @@ def api_cats():
     2. Fetch ALL Dexie trading pairs
     3. Match by asset_id → get real ticker_id from Dexie (e.g. "SBX_XCH")
     4. Return matched CATs as "ready", unmatched wallet CATs separately
+    5. F38 (2026-04-08): also enrich each matched CAT with v3 pair stats
+       (last_price, base_volume_24h, target_volume_24h) when available
+       so the pair selector can sort/filter by trading activity.
     """
     cats = []
     try:
@@ -7210,6 +8588,26 @@ def api_cats():
         dexie_pairs = _get_dexie_pairs()
         print(f"[CATS] Found {len(dexie_pairs)} Dexie pairs")
 
+        # F38 (2026-04-08): also fetch v3 pairs cache so we can enrich
+        # each matched CAT with last_price + 24h volume from the live
+        # v3 surface. Falls back gracefully if v3 is unavailable.
+        v3_by_ticker: Dict[str, Dict] = {}
+        try:
+            global bot
+            if bot and getattr(bot, "dexie_manager", None):
+                v3_pairs = bot.dexie_manager.fetch_v3_pairs() or []
+                for vp in v3_pairs:
+                    try:
+                        tid = str(vp.get("ticker_id") or vp.get("ticker") or "").upper()
+                        if tid:
+                            v3_by_ticker[tid] = vp
+                    except Exception:
+                        continue
+                if v3_by_ticker:
+                    print(f"[CATS] Enriched with {len(v3_by_ticker)} v3 pair stats")
+        except Exception as _v3_err:
+            print(f"[CATS] v3 enrichment skipped: {_v3_err}")
+
         # Step 3: Match wallet CATs against Dexie pairs by asset_id
         matched_count = 0
         for pair in dexie_pairs:
@@ -7227,16 +8625,40 @@ def api_cats():
             if wallet_info:
                 matched_count += 1
                 print(f"[CATS] Matched: {pair['name']} ({pair['ticker_id']}) in wallet {wallet_info['wallet_id']}")
+                # Use the Dexie base_id (full 64-char) for the icon URL.
+                # Sage wallet returns a 32-char truncated ID which icons.dexie.space
+                # does not recognise (returns a grey 404 placeholder).
+                # IMPORTANT: icons.dexie.space serves .webp ONLY — .png returns
+                # a 1140-byte grey placeholder (404).
+                dexie_asset_id = pair.get("asset_id", "") or wallet_info["asset_id"]
+                icon_url = (f"https://icons.dexie.space/{dexie_asset_id}.webp"
+                            if dexie_asset_id else "")
+                # F38: pull v3 stats if available (last_price, 24h volumes)
+                _v3 = v3_by_ticker.get(pair["ticker_id"].upper(), {})
                 cats.append({
                     "asset_id": wallet_info["asset_id"],
+                    "dexie_asset_id": dexie_asset_id,
+                    "icon_url": icon_url,
                     "name": pair["name"],
                     "ticker": pair["ticker_id"].replace("_XCH", ""),
                     "ticker_id": pair["ticker_id"],  # Real Dexie ticker e.g. "SBX_XCH"
                     "wallet_id": wallet_info["wallet_id"],
                     "decimals": 3,
                     "category": "ready",
-                    "volume_24h": pair.get("volume_24h", 0),
-                    "price": pair.get("price", 0),
+                    "volume_24h":    pair.get("volume_24h", 0),
+                    "price":         pair.get("price", 0),
+                    "vol_7d_xch":    pair.get("vol_7d_xch", 0),
+                    "vol_30d_xch":   pair.get("vol_30d_xch", 0),
+                    "price_high_7d": pair.get("price_high_7d", 0),
+                    "price_low_7d":  pair.get("price_low_7d", 0),
+                    # F38: v3 enrichment fields (None when not available)
+                    "v3_last_price":      _v3.get("last_price"),
+                    "v3_base_volume":     _v3.get("base_volume"),
+                    "v3_target_volume":   _v3.get("target_volume"),
+                    "v3_high":            _v3.get("high"),
+                    "v3_low":             _v3.get("low"),
+                    "v3_bid":             _v3.get("bid"),
+                    "v3_ask":             _v3.get("ask"),
                 })
 
         print(f"[CATS] Matched {matched_count} wallet CATs with Dexie pairs")
@@ -7287,19 +8709,59 @@ def api_cats():
 @app.route("/api/cat/select", methods=["POST"])
 def api_cat_select():
     """Select active CAT token — stores wallet_id so balance lookups work."""
-    data = request.get_json() or {}
+    data = request.get_json()
+    if not isinstance(data, dict):
+        return jsonify({"success": False, "error": "Invalid request body"}), 400
     asset_id = data.get("asset_id", "")
     wallet_id = data.get("wallet_id")
     name = data.get("name", "")
     decimals = data.get("decimals", 3)
     ticker_id = data.get("ticker_id", "")
 
-    _active_cat["asset_id"] = asset_id
-    _active_cat["name"] = name
-    _active_cat["decimals"] = int(decimals) if decimals else 3
-    _active_cat["ticker_id"] = ticker_id
-    if wallet_id is not None:
-        _active_cat["wallet_id"] = int(wallet_id)
+    # Validate asset_id format (64 lowercase hex chars) BEFORE writing to
+    # .env. Blocks a malformed or arbitrarily-long string from corrupting
+    # the configuration.
+    if asset_id:
+        asset_id = str(asset_id).strip()
+        if len(asset_id) != 64 or not all(c in '0123456789abcdefABCDEF' for c in asset_id):
+            return jsonify({
+                "success": False,
+                "error": "CAT asset_id must be exactly 64 hex characters",
+            }), 400
+        asset_id = asset_id.lower()
+    # Defensive caps on other user-controlled strings
+    if name and len(str(name)) > 128:
+        return jsonify({"success": False, "error": "CAT name too long"}), 400
+    if ticker_id and len(str(ticker_id)) > 64:
+        return jsonify({"success": False, "error": "Ticker ID too long"}), 400
+    if decimals is not None:
+        try:
+            decimals = int(decimals)
+            if decimals < 0 or decimals > 18:
+                return jsonify({"success": False, "error": "Invalid decimals"}), 400
+        except (ValueError, TypeError):
+            return jsonify({"success": False, "error": "Invalid decimals"}), 400
+
+    # Safety: never change the trading pair while the bot is running.
+    # Switching mid-run would cause offers to be created for the wrong token
+    # until the next loop cycle (and even then, stale offers stay on the book).
+    try:
+        if bot is not None and bot.is_running():
+            return jsonify({
+                "success": False,
+                "error": "Stop the bot before changing the trading pair. "
+                         "Switching CAT mid-run would cause offers for the wrong token."
+            }), 409
+    except Exception:
+        pass
+
+    with _active_cat_lock:
+        _active_cat["asset_id"] = asset_id
+        _active_cat["name"] = name
+        _active_cat["decimals"] = int(decimals) if decimals else 3
+        _active_cat["ticker_id"] = ticker_id
+        if wallet_id is not None:
+            _active_cat["wallet_id"] = int(wallet_id)
 
     # Persist to .env so it survives restarts
     # NOTE: CAT_WALLET_ID is NOT saved — it's assigned dynamically by
@@ -7409,7 +8871,11 @@ def api_settings_defaults():
 @app.route("/api/settings/validate", methods=["POST"])
 def api_settings_validate():
     """Validate config settings before saving."""
-    data = request.get_json() or {}
+    data = request.get_json(silent=True)
+
+    if not isinstance(data, dict):
+
+        return jsonify({"success": False, "error": "Invalid request body"}), 400
     errors = []
     warnings = []
 
@@ -8511,55 +9977,164 @@ def api_coin_prep_trigger():
                 trade_xch = str(getattr(cfg, "DEFAULT_TRADE_XCH", "0.5"))
 
                 if getattr(cfg, "TIER_ENABLED", False):
-                    # Tier-aware coin prep: different sizes per tier
-                    max_per_side = max(max_buy, max_sell)
-                    coin_multiplier = _prep_coin_multiplier
-                    tier_sizes = {
-                        "inner": getattr(cfg, "INNER_SIZE_XCH", Decimal("1.0")),
-                        "mid": getattr(cfg, "MID_SIZE_XCH", Decimal("0.5")),
-                        "outer": getattr(cfg, "OUTER_SIZE_XCH", Decimal("0.25")),
-                        "extreme": getattr(cfg, "EXTREME_SIZE_XCH", Decimal("0.1")),
+                    # Tier-aware coin prep with PER-SIDE counts. Buy ladder is XCH-funded
+                    # (BUY_*_TIER_COUNT + spares); sell ladder is CAT-funded (SELL_*_TIER_COUNT
+                    # + spares). The worker uses these independently, so asymmetric ladders
+                    # (e.g. 3 buy inner + 10 sell inner) prep the right number of coins on
+                    # each side instead of forcing both sides to the larger value.
+                    #
+                    # F62 (2026-04-09): tier SIZES are also per-side now. XCH
+                    # coins use buy sizes; CAT coins use sell sizes. When the
+                    # per-side fields aren't set the helpers fall back to the
+                    # legacy shared sizes with reverse-buy flipping.
+                    #
+                    # F62b (2026-04-09): the worker's tier_counts come from
+                    # `_flip_tiers(buy_position_counts, side="buy")` below,
+                    # which are SIZE-INDEXED (under reverse-buy, buy position
+                    # inner → size extreme slot). So the sizes dict we hand
+                    # the worker must ALSO be size-indexed, otherwise the
+                    # count × size product multiplies mismatched pairs and
+                    # blows up the pool by 2x. Apply the reverse-buy flip to
+                    # the size dict so it's consistent with the counts.
+                    from config import get_buy_tier_size_xch, get_sell_tier_size_xch
+                    # Launcher is in a separate function from Smart Settings,
+                    # so `_buy_ladder_reversed` isn't in scope — read directly
+                    # from config here.
+                    _buy_ladder_reversed = bool(getattr(cfg, "BUY_LADDER_REVERSED", False))
+                    # Position-semantic buy sizes (from per-side helpers):
+                    _buy_inner_pos = Decimal(str(get_buy_tier_size_xch("inner")   or getattr(cfg, "INNER_SIZE_XCH", Decimal("1.0"))))
+                    _buy_mid_pos   = Decimal(str(get_buy_tier_size_xch("mid")     or getattr(cfg, "MID_SIZE_XCH", Decimal("0.5"))))
+                    _buy_outer_pos = Decimal(str(get_buy_tier_size_xch("outer")   or getattr(cfg, "OUTER_SIZE_XCH", Decimal("0.25"))))
+                    _buy_extr_pos  = Decimal(str(get_buy_tier_size_xch("extreme") or getattr(cfg, "EXTREME_SIZE_XCH", Decimal("0.1"))))
+                    if _buy_ladder_reversed:
+                        # Under reverse-buy, SIZE inner (biggest XCH coin) is
+                        # used by POSITION extreme, and SIZE extreme (smallest)
+                        # is used by POSITION inner. Flip to match the
+                        # size-indexed counts.
+                        _buy_tier_sizes = {
+                            "inner":   _buy_extr_pos,  # size inner slot = pos extreme size (biggest)
+                            "mid":     _buy_outer_pos,
+                            "outer":   _buy_mid_pos,
+                            "extreme": _buy_inner_pos, # size extreme slot = pos inner size (smallest)
+                        }
+                    else:
+                        _buy_tier_sizes = {
+                            "inner":   _buy_inner_pos,
+                            "mid":     _buy_mid_pos,
+                            "outer":   _buy_outer_pos,
+                            "extreme": _buy_extr_pos,
+                        }
+                    # Sell side is never flipped — sell positions always map
+                    # to their same-named size tier.
+                    _sell_tier_sizes = {
+                        "inner":   Decimal(str(get_sell_tier_size_xch("inner")   or getattr(cfg, "INNER_SIZE_XCH", Decimal("1.0")))),
+                        "mid":     Decimal(str(get_sell_tier_size_xch("mid")     or getattr(cfg, "MID_SIZE_XCH", Decimal("0.5")))),
+                        "outer":   Decimal(str(get_sell_tier_size_xch("outer")   or getattr(cfg, "OUTER_SIZE_XCH", Decimal("0.25")))),
+                        "extreme": Decimal(str(get_sell_tier_size_xch("extreme") or getattr(cfg, "EXTREME_SIZE_XCH", Decimal("0.1")))),
                     }
-                    tier_counts = get_weighted_tier_prep_counts(
-                        max_per_side,
-                        coin_multiplier,
-                        tier_sizes_xch=tier_sizes,
-                    )
+                    # Kept for backward compat with code below that reads
+                    # `tier_sizes` as a single dict (it'll be the max of both
+                    # sides, used only for the worker's legacy --tier-sizes
+                    # arg). The per-side values also flow via new CLI args.
+                    tier_sizes = {
+                        k: max(_buy_tier_sizes.get(k, Decimal("0")),
+                               _sell_tier_sizes.get(k, Decimal("0")))
+                        for k in ("inner", "mid", "outer", "extreme")
+                    }
+
+                    def _tier_count(prefix, tier):
+                        live = int(getattr(cfg, f"{prefix}_{tier.upper()}_TIER_COUNT", 0) or 0)
+                        spare = int(getattr(cfg, f"{prefix}_{tier.upper()}_TIER_SPARE_COUNT", 0) or 0)
+                        return max(0, live + spare)
+
+                    # ── Slot-position counts as configured by the user ──────
+                    # These describe how many BUY/SELL offers sit at each
+                    # ladder POSITION (inner=closest to mid, extreme=furthest).
+                    buy_position_counts = {
+                        "inner":   _tier_count("BUY", "inner"),
+                        "mid":     _tier_count("BUY", "mid"),
+                        "outer":   _tier_count("BUY", "outer"),
+                        "extreme": _tier_count("BUY", "extreme"),
+                    }
+                    sell_position_counts = {
+                        "inner":   _tier_count("SELL", "inner"),
+                        "mid":     _tier_count("SELL", "mid"),
+                        "outer":   _tier_count("SELL", "outer"),
+                        "extreme": _tier_count("SELL", "extreme"),
+                    }
+
+                    # ── Translate slot positions → coin SIZE counts ─────────
+                    # The coin prep allocates coins by SIZE, not by position.
+                    # When BUY_LADDER_REVERSED is on, a buy slot at the
+                    # "extreme" position uses an INNER-sized coin, etc. The
+                    # flip helper applies that mapping (no-op when reversal
+                    # is off, and always a no-op for the sell side). This
+                    # makes the live ladder settings the SINGLE SOURCE OF
+                    # TRUTH for both prep and offer creation.
+                    from coin_manager import flip_position_tiers_to_coin_size_tiers as _flip_tiers
+                    xch_tier_counts = _flip_tiers(buy_position_counts, side="buy")
+                    cat_tier_counts = _flip_tiers(sell_position_counts, side="sell")
+
+                    # Sniper needs BOTH sides: buy snipers lock XCH coins, sell snipers
+                    # lock CAT coins. preferred_tier="sniper" strict on both sides, so a
+                    # missing CAT sniper pool silently kills sell-side probes and leaves
+                    # the ladder anchored to one-sided probe data only. Fees are XCH-only.
                     sniper_count = int(getattr(cfg, "SNIPER_PREP_COUNT", 0) or 0)
                     sniper_size = Decimal(str(getattr(cfg, "SNIPER_SIZE_XCH", "0") or "0"))
                     if getattr(cfg, "SNIPER_ENABLED", False) and sniper_count > 0 and sniper_size > 0:
-                        tier_counts["sniper"] = sniper_count
-                    cat_total_coins = sum(tier_counts.values())
+                        xch_tier_counts["sniper"] = sniper_count
+                        cat_tier_counts["sniper"] = sniper_count
+                        tier_sizes["sniper"] = sniper_size
+
                     fee_status = get_fee_settings_snapshot()
                     fee_count = int(fee_status.get("fee_prep_count", 0) or 0)
                     fee_size = Decimal(str(fee_status.get("fee_coin_size_xch", "0") or "0"))
                     if fee_status.get("fee_pool_enabled") and fee_count > 0 and fee_size > 0:
-                        tier_counts["fees"] = fee_count
-                    total_coins = sum(tier_counts.values())
-
-                    if "sniper" in tier_counts:
-                        tier_sizes["sniper"] = sniper_size
-                    if "fees" in tier_counts:
+                        xch_tier_counts["fees"] = fee_count
                         tier_sizes["fees"] = fee_size
+
+                    # Drop zero entries so the worker log stays clean
+                    xch_tier_counts = {k: v for k, v in xch_tier_counts.items() if v > 0}
+                    cat_tier_counts = {k: v for k, v in cat_tier_counts.items() if v > 0}
+
+                    xch_total_coins = sum(xch_tier_counts.values())
+                    cat_total_coins = sum(cat_tier_counts.values())
+                    total_coins = xch_total_coins + cat_total_coins
+
                     tier_sizes_str = ",".join(f"{tier}={size}" for tier, size in tier_sizes.items())
-                    tier_counts_str = ",".join(f"{k}={v}" for k, v in tier_counts.items())
+                    xch_counts_str = ",".join(f"{k}={v}" for k, v in xch_tier_counts.items())
+                    cat_counts_str = ",".join(f"{k}={v}" for k, v in cat_tier_counts.items())
+                    # F62 (2026-04-09): also build per-side size strings.
+                    # Sniper/fees stay in the combined `tier_sizes` dict;
+                    # only the four trading tiers differ between buy and sell.
+                    _buy_sizes_for_cli = dict(_buy_tier_sizes)
+                    _sell_sizes_for_cli = dict(_sell_tier_sizes)
+                    # Add sniper/fees from the combined dict (same on both sides)
+                    if "sniper" in tier_sizes:
+                        _buy_sizes_for_cli["sniper"] = tier_sizes["sniper"]
+                        _sell_sizes_for_cli["sniper"] = tier_sizes["sniper"]
+                    if "fees" in tier_sizes:
+                        _buy_sizes_for_cli["fees"] = tier_sizes["fees"]
+                        # fees is XCH-only, don't add to sell
+                    buy_sizes_str  = ",".join(f"{t}={s}" for t, s in _buy_sizes_for_cli.items())
+                    sell_sizes_str = ",".join(f"{t}={s}" for t, s in _sell_sizes_for_cli.items())
 
                     cmd = [
                         "python", worker_path,
-                        "--xch-target", str(total_coins),
-                        "--tier-sizes", tier_sizes_str,
-                        "--tier-counts", tier_counts_str,
+                        "--xch-target", str(xch_total_coins),
                         "--cat-target", str(cat_total_coins),
+                        "--tier-sizes", tier_sizes_str,       # legacy shared (kept for back-compat)
+                        "--buy-tier-sizes", buy_sizes_str,    # F62: XCH coin sizes (for buy offers)
+                        "--sell-tier-sizes", sell_sizes_str,  # F62: CAT coin sizes (for sell offers, in XCH equiv)
+                        "--tier-counts-xch", xch_counts_str,
+                        "--tier-counts-cat", cat_counts_str,
                         "--prep-headroom-pct", str(getattr(cfg, "COIN_PREP_HEADROOM_PCT", Decimal("10"))),
                         "--run-id", run_id,
                     ]
-                    tier_detail = " + ".join(
-                        f"{c} {t} × "
-                        f"{(fee_size if t == 'fees' else getattr(cfg, f'{t.upper()}_SIZE_XCH', '?'))}"
-                        for t, c in tier_counts.items() if c > 0
-                    )
                     log_event("info", "coin_prep_config",
-                              f"GUI tier coin prep: {total_coins} coins = {tier_detail} "
+                              f"GUI tier coin prep (per-side): "
+                              f"XCH={xch_total_coins} {xch_counts_str} | "
+                              f"CAT={cat_total_coins} {cat_counts_str} "
                               f"(+{getattr(cfg, 'COIN_PREP_HEADROOM_PCT', Decimal('10'))}% headroom)")
                 else:
                     # Uniform coin prep — uses _prep_coin_multiplier from request context
@@ -8595,8 +10170,6 @@ def api_coin_prep_trigger():
                 # and PID for lifecycle management
                 _coin_prep_proc = proc
                 _coin_prep_state["pid"] = proc.pid
-                global _coin_prep_console_hwnd
-                _coin_prep_console_hwnd = None
                 _console_state["coin_prep_visible"] = False
 
                 log_event("info", "coin_prep_started",
@@ -8698,123 +10271,35 @@ def api_coin_prep_reset():
 # ---------------------------------------------------------------------------
 
 _console_state = {"main_visible": False, "coin_prep_visible": False}
-_main_console_hwnd = None
-_coin_prep_console_hwnd = None
-
-
-# ---------------------------------------------------------------------------
-# Windows Console Helpers (V1 parity)
-# ---------------------------------------------------------------------------
-
-def _get_main_console_hwnd():
-    """Get the main console window handle (Windows only)."""
-    global _main_console_hwnd
-    if _main_console_hwnd:
-        return _main_console_hwnd
-    try:
-        if sys.platform == "win32":
-            import ctypes
-            _main_console_hwnd = ctypes.windll.kernel32.GetConsoleWindow()
-            return _main_console_hwnd
-    except Exception:
-        pass
-    return None
-
-
-def _set_window_visible(hwnd, visible: bool):
-    """Show or hide a window by handle (Windows only)."""
-    try:
-        if sys.platform == "win32" and hwnd:
-            import ctypes
-            SW_SHOW = 5
-            SW_HIDE = 0
-            ctypes.windll.user32.ShowWindow(hwnd, SW_SHOW if visible else SW_HIDE)
-            return True
-    except Exception:
-        pass
-    return False
-
-
-def _find_window_by_pid(pid):
-    """Find a console window belonging to a specific process (Windows only)."""
-    try:
-        if sys.platform != "win32":
-            return None
-        import ctypes
-        from ctypes import wintypes
-
-        user32 = ctypes.windll.user32
-        EnumWindows = user32.EnumWindows
-        GetWindowThreadProcessId = user32.GetWindowThreadProcessId
-        WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-
-        found_hwnd = [None]
-
-        def callback(hwnd, lParam):
-            pid_out = wintypes.DWORD()
-            GetWindowThreadProcessId(hwnd, ctypes.byref(pid_out))
-            if pid_out.value == pid:
-                found_hwnd[0] = hwnd
-                return False  # Stop enumeration
-            return True
-
-        EnumWindows(WNDENUMPROC(callback), 0)
-        return found_hwnd[0]
-    except Exception:
-        return None
 
 
 @app.route("/api/console/status")
 def api_console_status():
-    """Get console window visibility state."""
+    """Legacy — the external console popup was removed 2026-04-06.
+
+    The GUI now uses the in-app Logs view (sidebar → Logs) instead of
+    toggling a separate console window. Kept as a stable-shaped no-op
+    so any stale clients don't error out.
+    """
     return jsonify({
-        "main_visible": _console_state.get("main_visible", False),
-        "coin_prep_visible": _console_state.get("coin_prep_visible", False),
+        "main_visible": False,
+        "coin_prep_visible": False,
         "coin_prep_running": _coin_prep_state.get("running", False),
-        "platform": sys.platform
+        "platform": sys.platform,
+        "deprecated": True,
     })
 
 
 @app.route("/api/console/toggle", methods=["POST"])
 def api_console_toggle():
-    """Toggle console window visibility (V1 parity — actual Windows show/hide)."""
-    global _coin_prep_console_hwnd
-    data = request.get_json() or {}
-    which = data.get("which") or data.get("console", "main")
-
-    if which == "main":
-        hwnd = _get_main_console_hwnd()
-        if not hwnd:
-            return jsonify({"success": False, "error": "Console window not found (not Windows?)"})
-        new_state = not _console_state.get("main_visible", False)
-        if _set_window_visible(hwnd, new_state):
-            _console_state["main_visible"] = new_state
-            return jsonify({"success": True, "visible": new_state})
-        return jsonify({"success": False, "error": "Failed to toggle window"})
-
-    elif which == "coin_prep":
-        # Try to find the coin prep worker's console window
-        hwnd = _coin_prep_console_hwnd
-
-        # If no stored handle, try to find it from the subprocess PID
-        if not hwnd and _coin_prep_state.get("pid"):
-            hwnd = _find_window_by_pid(_coin_prep_state["pid"])
-            if hwnd:
-                _coin_prep_console_hwnd = hwnd
-
-        if hwnd:
-            new_state = not _console_state.get("coin_prep_visible", False)
-            if _set_window_visible(hwnd, new_state):
-                _console_state["coin_prep_visible"] = new_state
-                return jsonify({"success": True, "visible": new_state})
-            return jsonify({"success": False, "error": "Failed to toggle coin prep window"})
-
-        return jsonify({
-            "success": False,
-            "error": "Coin prep console is disabled — use the in-app logs or superlog instead",
-        })
-
-    return jsonify({"success": False, "error": "Unknown console target"})
+    """Legacy — external console popup was eliminated to remove the
+    'closing the console kills the bot' footgun. Clients should use
+    the in-app Logs view instead."""
+    return jsonify({
+        "success": False,
+        "deprecated": True,
+        "error": "The external console has been removed — use the in-app Logs view (sidebar → Logs)",
+    })
 
 
 
@@ -8863,7 +10348,11 @@ def api_wallets_detect():
 @app.route("/api/wallets/switch", methods=["POST"])
 def api_wallets_switch():
     """Switch the active wallet backend (requires restart to take effect)."""
-    data = request.get_json() or {}
+    data = request.get_json(silent=True)
+
+    if not isinstance(data, dict):
+
+        return jsonify({"success": False, "error": "Invalid request body"}), 400
     new_type = data.get("wallet_type", "").strip().lower()
     if new_type not in ("chia", "sage"):
         return jsonify({"success": False, "error": "Invalid wallet type. Use 'chia' or 'sage'."})
@@ -9068,7 +10557,17 @@ def api_logs_download():
         if os.path.exists(tauri_stdout):
             log_texts["logs/tauri_backend_stdout_tail.log"] = _read_text_tail(tauri_stdout)
 
-        run_logs = glob.glob(os.path.join(_APP_ROOT, "bot_superlog_*.log"))
+        # Look for superlog files in the user data dir first (the
+        # canonical location), then fall back to the install dir for
+        # pre-migration dev installs.
+        try:
+            from user_paths import log_dir as _user_log_dir
+            _log_dirs = [_user_log_dir(), _APP_ROOT]
+        except Exception:
+            _log_dirs = [_APP_ROOT]
+        run_logs = []
+        for _ld in _log_dirs:
+            run_logs.extend(glob.glob(os.path.join(_ld, "bot_superlog_*.log")))
         if run_logs:
             latest_run_log = max(run_logs, key=os.path.getmtime)
             log_texts["logs/latest_run_superlog_tail.log"] = _read_text_tail(latest_run_log)
@@ -9076,7 +10575,7 @@ def api_logs_download():
 
         bundle_name = "bot_debug_bundle_" + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S") + ".zip"
         readme = "\n".join([
-            "Chia Market Maker debug bundle",
+            "CATalyst debug bundle",
             "",
             "Included:",
             "- manifest.json: bundle metadata",
@@ -9239,6 +10738,54 @@ def api_doctor():
                         "checks": []}), 500
 
 
+@app.route("/api/config/history")
+def api_config_history():
+    """F26 (2026-04-08): expose the config change audit trail.
+
+    Query params:
+        limit: max rows (default 50, max 500)
+        key: filter to a specific config key
+        since_hours: only return rows from the last N hours
+    """
+    try:
+        from database import get_config_history
+        limit = max(1, min(500, int(request.args.get("limit", 50) or 50)))
+        key = request.args.get("key") or None
+        since_hours = request.args.get("since_hours")
+        since_hours_int = int(since_hours) if since_hours else None
+        rows = get_config_history(limit=limit, key=key, since_hours=since_hours_int)
+        return jsonify({"rows": rows, "count": len(rows)})
+    except Exception as e:
+        return _api_error(e, request.path)
+
+
+@app.route("/api/self-test")
+def api_self_test():
+    """F18 (2026-04-08): expose the startup self-test results to the GUI.
+
+    Returns the self-test results captured at the last bot startup, OR
+    runs a fresh self-test if force=1 is passed. The GUI can show the
+    user what services are down and what features will be missing.
+    """
+    try:
+        global bot
+        force = request.args.get("force", "").lower() in ("1", "true", "yes")
+        if force and bot:
+            try:
+                bot._run_startup_self_test()
+            except Exception as e:
+                return jsonify({"error": f"self-test failed: {e}"}), 500
+        results = getattr(bot, "_startup_self_test_results", {}) if bot else {}
+        all_ok = all(r.get("ok", False) for r in results.values()
+                     if not r.get("skipped", False))
+        return jsonify({
+            "all_ok": all_ok,
+            "results": results,
+        })
+    except Exception as e:
+        return _api_error(e, request.path)
+
+
 @app.route("/api/config/validate")
 def api_config_validate():
     """Validate current config and return issues.
@@ -9278,8 +10825,7 @@ def api_config_export_env():
             ]),
             ("Price Safety & Limits", [
                 "HARD_MIN_PRICE_XCH", "HARD_MAX_PRICE_XCH",
-                "MAX_MID_MOVE_BPS", "DYNAMIC_LIMIT_PCT",
-                "MAX_STEP_CHANGE_FRACTION",
+                "DYNAMIC_LIMIT_PCT", "MAX_STEP_CHANGE_FRACTION",
             ]),
             ("Smart Pricing - Dynamic Spreads", [
                 "DYNAMIC_SPREAD_ENABLED", "BASE_SPREAD_BPS",
@@ -9295,8 +10841,16 @@ def api_config_export_env():
                 "OUTER_SIZE_XCH", "EXTREME_SIZE_XCH",
                 "INNER_TIER_COUNT", "MID_TIER_COUNT",
                 "OUTER_TIER_COUNT", "EXTREME_TIER_COUNT",
+                "BUY_INNER_TIER_COUNT", "BUY_MID_TIER_COUNT",
+                "BUY_OUTER_TIER_COUNT", "BUY_EXTREME_TIER_COUNT",
+                "SELL_INNER_TIER_COUNT", "SELL_MID_TIER_COUNT",
+                "SELL_OUTER_TIER_COUNT", "SELL_EXTREME_TIER_COUNT",
                 "INNER_TIER_SPARE_COUNT", "MID_TIER_SPARE_COUNT",
                 "OUTER_TIER_SPARE_COUNT", "EXTREME_TIER_SPARE_COUNT",
+                "BUY_INNER_TIER_SPARE_COUNT", "BUY_MID_TIER_SPARE_COUNT",
+                "BUY_OUTER_TIER_SPARE_COUNT", "BUY_EXTREME_TIER_SPARE_COUNT",
+                "SELL_INNER_TIER_SPARE_COUNT", "SELL_MID_TIER_SPARE_COUNT",
+                "SELL_OUTER_TIER_SPARE_COUNT", "SELL_EXTREME_TIER_SPARE_COUNT",
             ]),
             ("Market Intelligence", [
                 "COMPETITOR_AWARE_ENABLED", "DBX_MAX_SPREAD_BPS",
@@ -9316,7 +10870,7 @@ def api_config_export_env():
             ]),
         ]
 
-        lines = ["# Chia Market Maker — exported settings", "# Generated by bot GUI export", ""]
+        lines = ["# CATalyst — exported settings", "# Generated by bot GUI export", ""]
         emitted = set()
 
         for section_name, keys in sections:
@@ -9468,7 +11022,11 @@ def api_chia_start_with_fingerprint():
     """Start Chia with a user-selected fingerprint."""
     try:
         import chia_node
-        data = request.get_json() or {}
+        data = request.get_json(silent=True)
+
+        if not isinstance(data, dict):
+
+            return jsonify({"success": False, "error": "Invalid request body"}), 400
         fingerprint = str(data.get("fingerprint", "")).strip()
         if not fingerprint or not fingerprint.isdigit():
             return jsonify({"success": False, "error": "Invalid fingerprint"}), 400
@@ -9488,7 +11046,9 @@ def api_sage_setup_certs():
     """
     try:
         import chia_node
-        data = request.get_json() or {}
+        data = request.get_json()
+        if not isinstance(data, dict):
+            return jsonify({"success": False, "error": "Invalid request body"}), 400
 
         cert_path = data.get("cert_path", "").strip()
         key_path = data.get("key_path", "").strip()
@@ -9507,11 +11067,60 @@ def api_sage_setup_certs():
                              "Please provide the path manually.",
                 }), 404
 
+        # ── Safety: only accept paths inside a known Sage data directory ──
+        # This prevents a local attacker (or compromised .env) from pointing
+        # the bot at an arbitrary TLS cert elsewhere on the filesystem.
+        def _is_inside_allowed_sage_dir(path: str) -> bool:
+            try:
+                real = os.path.realpath(path)
+            except Exception:
+                return False
+            allowed_roots = []
+            # Windows: %APPDATA%\com.rigidnetwork.sage\ssl\
+            if sys.platform == "win32":
+                appdata = os.environ.get("APPDATA")
+                if appdata:
+                    allowed_roots.append(os.path.realpath(
+                        os.path.join(appdata, "com.rigidnetwork.sage")
+                    ))
+            # macOS: ~/Library/Application Support/com.rigidnetwork.sage/
+            elif sys.platform == "darwin":
+                allowed_roots.append(os.path.realpath(
+                    os.path.expanduser("~/Library/Application Support/com.rigidnetwork.sage")
+                ))
+            # Linux: ~/.local/share/com.rigidnetwork.sage/
+            else:
+                allowed_roots.append(os.path.realpath(
+                    os.path.expanduser("~/.local/share/com.rigidnetwork.sage")
+                ))
+            # Also allow paths inside the bot's own directory (for bundled certs)
+            allowed_roots.append(os.path.realpath(os.path.dirname(os.path.abspath(__file__))))
+            for root in allowed_roots:
+                if real == root or real.startswith(root + os.sep):
+                    return True
+            return False
+
+        if not _is_inside_allowed_sage_dir(cert_path):
+            log_event("warning", "sage_cert_path_rejected",
+                      f"Rejected cert_path outside allowed Sage data dir: {cert_path}")
+            return jsonify({
+                "success": False,
+                "error": "Cert path must be inside the Sage wallet data directory. "
+                         "Leave the field blank to auto-detect.",
+            }), 400
+
         if not os.path.isfile(cert_path):
             log_event("warning", "sage_cert_missing", f"Cert not found: {cert_path}")
             return jsonify({"success": False, "error": "Certificate file not found at the specified path"}), 400
         if not key_path:
             key_path = cert_path.replace(".crt", ".key")
+        if not _is_inside_allowed_sage_dir(key_path):
+            log_event("warning", "sage_key_path_rejected",
+                      f"Rejected key_path outside allowed Sage data dir: {key_path}")
+            return jsonify({
+                "success": False,
+                "error": "Key path must be inside the Sage wallet data directory.",
+            }), 400
         if not os.path.isfile(key_path):
             log_event("warning", "sage_key_missing", f"Key not found: {key_path}")
             return jsonify({"success": False, "error": "Key file not found at the expected path"}), 400
@@ -9520,10 +11129,14 @@ def api_sage_setup_certs():
         os.environ["SAGE_CERT_PATH"] = cert_path
         os.environ["SAGE_KEY_PATH"] = key_path
         try:
-            env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+            try:
+                from user_paths import env_file as _env_file
+                env_path = _env_file()
+            except Exception:
+                env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
             lines = []
             if os.path.isfile(env_path):
-                with open(env_path, "r") as f:
+                with open(env_path, "r", encoding="utf-8") as f:
                     lines = f.readlines()
             # Update or append each key
             for key, val in [("SAGE_CERT_PATH", cert_path), ("SAGE_KEY_PATH", key_path)]:
@@ -9535,7 +11148,7 @@ def api_sage_setup_certs():
                         break
                 if not found:
                     lines.append(f"{key}={val}\n")
-            with open(env_path, "w") as f:
+            with open(env_path, "w", encoding="utf-8") as f:
                 f.writelines(lines)
         except Exception as env_err:
             print(f"[Sage] Warning: could not update .env: {env_err}")
@@ -9587,7 +11200,11 @@ def api_spacescan_setup():
     POST {"api_key": ""}     → clears key, falls back to Free tier
     POST {"skip": true}      → marks setup as seen, stays on Free tier
     """
-    data = request.get_json() or {}
+    data = request.get_json(silent=True)
+
+    if not isinstance(data, dict):
+
+        return jsonify({"success": False, "error": "Invalid request body"}), 400
 
     # "Skip" — user chose Free tier knowingly
     if data.get("skip"):
@@ -9598,11 +11215,14 @@ def api_spacescan_setup():
     api_key = data.get("api_key", "").strip()
 
     if api_key:
-        # Validate the key by making a test call
+        # Validate the key by making a test call.
+        # Uses the well-known Chia null address so we never disclose any
+        # real user address to Spacescan during key verification.
+        _NULL_XCH_ADDRESS = "xch1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqs0wd5zg"
         try:
             import requests as _req
             test_resp = _req.get(
-                "https://pro-api.spacescan.io/address/xch-balance/xch1raq84pknzte375kze2z3lapscwet5g3q9qqkse8cmnmp5yr40zcsntdcm9",
+                f"https://pro-api.spacescan.io/address/xch-balance/{_NULL_XCH_ADDRESS}",
                 headers={"Accept": "application/json", "x-api-key": api_key},
                 timeout=10,
             )
@@ -9638,7 +11258,7 @@ def api_spacescan_setup():
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def _graceful_shutdown(signum, frame):
+def _graceful_shutdown(signum, _frame):
     """Handle Ctrl+C or terminal close — stop bot cleanly before exit."""
     sig_name = signal.Signals(signum).name if hasattr(signal, 'Signals') else str(signum)
     print(f"\n🛑 Received {sig_name} — shutting down gracefully...", flush=True)

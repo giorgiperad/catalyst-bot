@@ -227,9 +227,10 @@ print()
 print("--- Test 4: /address/xch-balance ---")
 
 wallet_addr = get_wallet_address()
-# Use a known Chia address if we don't have one configured
-test_addr = wallet_addr or "xch1k6mv3caj73akwp0ygpqhjpat20mu3akc3f6xdrc5ahcqkynl7ejq2z74n3"
-addr_source = "from config" if wallet_addr else "test address"
+# Use the Chia null address as a throwaway fallback so we don't
+# disclose any real address to Spacescan during testing.
+test_addr = wallet_addr or "xch1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqs0wd5zg"
+addr_source = "from config" if wallet_addr else "null address fallback"
 
 time.sleep(2)
 resp, ms = timed_request(f"{base_url}/address/xch-balance/{test_addr}", headers)

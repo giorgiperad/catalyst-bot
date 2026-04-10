@@ -23,9 +23,33 @@ from typing import Optional
 
 
 # ---------------------------------------------------------------------------
-# Load .env from the project directory
+# Load .env from the user data directory (writable across install types).
+#
+# The user data dir lives under %APPDATA% (Windows), ~/Library/Application
+# Support (macOS), or ~/.local/share (Linux).  user_paths.py handles
+# first-launch migration from the legacy install-dir location, so
+# existing dev installs keep working transparently.
 # ---------------------------------------------------------------------------
-_ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+try:
+    from user_paths import env_file as _env_file, install_dir as _install_dir
+    _ENV_PATH = _env_file()
+    # If the user data .env doesn't exist yet but a template does in the
+    # install dir, seed the data-dir .env from .env.example so first-run
+    # users start with sensible defaults.
+    if not os.path.exists(_ENV_PATH):
+        _example = os.path.join(_install_dir(), ".env.example")
+        if os.path.isfile(_example):
+            try:
+                import shutil as _shutil
+                _shutil.copy2(_example, _ENV_PATH)
+            except Exception as _copy_err:
+                print(f"[config] Could not seed .env from .env.example: {_copy_err}", flush=True)
+except Exception as _e:
+    # Fallback: legacy behaviour if user_paths import fails during an
+    # unusual dev setup.  Should never happen in a packaged build.
+    print(f"[config] user_paths unavailable ({_e}); falling back to install dir", flush=True)
+    _ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+
 load_dotenv(_ENV_PATH)
 
 
@@ -85,7 +109,9 @@ class Config:
     """
 
     def __init__(self):
-        self._lock = threading.Lock()
+        # RLock so update() can hold the lock across set_key() + reload(),
+        # and reload() can still re-acquire from the same thread.
+        self._lock = threading.RLock()
         self.reload()
 
     def reload(self):
@@ -95,23 +121,24 @@ class Config:
             lock.acquire()
         try:
             self._reload_inner()
+            # Re-apply user-local secrets under the same lock so other threads
+            # never see partially-applied config (reloaded from .env but secrets
+            # not yet applied).
+            try:
+                import user_secrets as _user_secrets
+                _user_secrets.apply_to_config(self)
+            except Exception:
+                pass
+            # Run config validation and cache the result so the API and GUI can
+            # surface errors/warnings immediately after any reload.
+            try:
+                from config_validator import validate_config
+                self._validation_report = validate_config(self)
+            except Exception:
+                self._validation_report = None
         finally:
             if lock:
                 lock.release()
-        # Re-apply user-local secrets after every reload so they aren't wiped
-        # by .env values (SPACESCAN_API_KEY is blank in .env by design).
-        try:
-            import user_secrets as _user_secrets
-            _user_secrets.apply_to_config(self)
-        except Exception:
-            pass
-        # Run config validation and cache the result so the API and GUI can
-        # surface errors/warnings immediately after any reload.
-        try:
-            from config_validator import validate_config
-            self._validation_report = validate_config(self)
-        except Exception:
-            self._validation_report = None
 
     def _reload_inner(self):
         """Internal reload — called under lock."""
@@ -191,16 +218,23 @@ class Config:
         _legacy_max = _decimal("MAX_MID", "0") if _str("MAX_MID") else Decimal("0")
         self.HARD_MIN_PRICE_XCH = _hard_min if _hard_min > 0 else _legacy_min
         self.HARD_MAX_PRICE_XCH = _hard_max if _hard_max > 0 else _legacy_max
-        self.MAX_STEP_CHANGE_FRACTION = _decimal("MAX_STEP_CHANGE_FRACTION", "0")
-        self.MIN_MID = _decimal("MIN_MID", "0") if _str("MIN_MID") else None
-        self.MAX_MID = _decimal("MAX_MID", "0") if _str("MAX_MID") else None
-        self.MAX_MID_MOVE_BPS = _decimal("MAX_MID_MOVE_BPS", "500")
+        # MAX_STEP_CHANGE_FRACTION: reject single-fetch jumps larger than
+        # this fraction (e.g. 0.10 = 10%). Set to 0 to disable. Default
+        # raised from 0 → 0.10 on 2026-04-08: with the dynamic band at ±50%
+        # the step guard was the only line of defence against a corrupted
+        # Tibet response inside the band, and leaving it disabled meant a
+        # fat-finger price could trigger emergency requoting at the bad
+        # value. 10% is wide enough to allow normal market gaps but blocks
+        # garbage data; reduce in .env if your market is more volatile.
+        self.MAX_STEP_CHANGE_FRACTION = _decimal("MAX_STEP_CHANGE_FRACTION", "0.10")
 
         # ----- Offer Management -----
         # GUI writes MAX_ACTIVE_BUY; old .env may have MAX_ACTIVE_BUY_OFFERS.
         # GUI key takes priority (it's what the user actually sets).
-        self.MAX_ACTIVE_BUY_OFFERS = _int("MAX_ACTIVE_BUY") or _int("MAX_ACTIVE_BUY_OFFERS", 0)
-        self.MAX_ACTIVE_SELL_OFFERS = _int("MAX_ACTIVE_SELL") or _int("MAX_ACTIVE_SELL_OFFERS", 0)
+        # GUI writes MAX_ACTIVE_BUY; old .env may have MAX_ACTIVE_BUY_OFFERS.
+        # Use _str() to distinguish "key not set" from "key set to 0".
+        self.MAX_ACTIVE_BUY_OFFERS = _int("MAX_ACTIVE_BUY") if _str("MAX_ACTIVE_BUY") else _int("MAX_ACTIVE_BUY_OFFERS", 0)
+        self.MAX_ACTIVE_SELL_OFFERS = _int("MAX_ACTIVE_SELL") if _str("MAX_ACTIVE_SELL") else _int("MAX_ACTIVE_SELL_OFFERS", 0)
         self.OFFER_EXPIRY_SECS = _int("OFFER_EXPIRY_SECS", 86400)  # 24 hours — safety net only
         self.OFFER_STAGGER_SECS = _int("OFFER_STAGGER_SECS", 10)  # Stagger to avoid mass-expiry
         self.OFFER_REFRESH_BEFORE = _int("OFFER_REFRESH_BEFORE", 1800)  # Refresh 30 min before expiry (settle time)
@@ -208,15 +242,73 @@ class Config:
 
         # ----- Requoting -----
         self.AUTO_REQUOTE = _bool("AUTO_REQUOTE", True)
-        self.REQUOTE_BPS = _decimal("REQUOTE_BPS", "0")
+        # REQUOTE_BPS: minimum price drift (in bps) before a side gets
+        # requoted. Acts as hysteresis on the offer_manager.should_requote
+        # gate to prevent every-cycle churn from sub-bp Tibet ticks.
+        # Default raised from 0 → 30 on 2026-04-08: 0 meant any drift at
+        # all triggered a requote, which combined with the 90s loop and
+        # 60s cooldown produced repeated requotes during stable markets.
+        # 30 bps (~0.3%) leaves room for slow drift, while AMM_DRIFT_REQUOTE_BPS
+        # (default 80) catches faster moves that need an emergency requote.
+        self.REQUOTE_BPS = _decimal("REQUOTE_BPS", "30")
         self.REQUOTE_COOLDOWN_SECS = _int("REQUOTE_COOLDOWN_SECS", 60)
         self.REQUOTE_BATCH_SIZE = _int("REQUOTE_BATCH_SIZE", 5)
         self.REQUOTE_COIN_FREE_WAIT = _int("REQUOTE_COIN_FREE_WAIT", 5)
 
         # ----- Reserves -----
+        #
+        # Two-tier reserve system (F49, 2026-04-09):
+        #
+        # (1) USER RESERVE — XCH_RESERVE / CAT_RESERVE
+        #     The "do not touch" floor set by the user in step 1 of
+        #     settings. The bot will refuse any coin split that would
+        #     drop the wallet below this amount. Acts as a hard safety
+        #     margin the user keeps no matter what.
+        #
+        # (2) TOPUP POOL — TOPUP_POOL_XCH / TOPUP_POOL_CAT
+        #     Working budget set by Smart Settings as a fraction of the
+        #     balance *after* the user reserve is subtracted. Default
+        #     10% of _avail_xch. This is what the topup worker is
+        #     allowed to split into new tier coins across a session.
+        #     Once the session spends more than this budget, topup
+        #     refuses further splits until Smart Settings re-allocates.
+        #
+        # Historical note: the coin classifier in coin_manager.py also
+        # has a bucket called "reserve" meaning "any coin large enough
+        # to split" — that is NOT a reserve in the user-facing sense,
+        # it's topup fuel. The user-facing "reserve" is always
+        # XCH_RESERVE / CAT_RESERVE. See coin_manager._classify_coins.
         self.XCH_RESERVE = _decimal("XCH_RESERVE", "0.03")
         # Support both new and legacy names
-        self.CAT_RESERVE = _decimal("CAT_RESERVE") or _decimal("MZ_RESERVE", "0")
+        self.CAT_RESERVE = _decimal("CAT_RESERVE") if _str("CAT_RESERVE") else _decimal("MZ_RESERVE", "0")
+
+        # Topup pool — percentage of (spendable - reserve) that Smart
+        # Settings allocates to the coin-splitting budget. Operators can
+        # override via .env; Smart Settings respects the current value.
+        # F60 (2026-04-09): raised default from 0.10 → 0.15. F57c tier
+        # sizes are ~38% larger, so a 10% pool only lasted ~1 day of
+        # fills before Smart Settings needed a manual refresh. 15% gives
+        # ~2 days of autonomous runtime while still leaving ~80% of
+        # avail capital in the trading ladder.
+        self.TOPUP_POOL_PCT = _decimal("TOPUP_POOL_PCT", "0.15")
+        # Absolute topup budgets — written by Smart Settings when it
+        # allocates the pool. A value of 0 means "no explicit budget,
+        # fall back to hard-reserve guard only."
+        self.TOPUP_POOL_XCH = _decimal("TOPUP_POOL_XCH", "0")
+        self.TOPUP_POOL_CAT = _decimal("TOPUP_POOL_CAT", "0")
+
+        # F51 (2026-04-09): cancel-all poll & retry tuning.
+        # The verification loop after cancel_offers_batch polls Sage for
+        # on-chain confirmation of submitted cancels. Poll interval is
+        # how often we check; max_wait is the first polling window
+        # (covers several blocks); retry_wait is the second window after
+        # we resubmit any cancels that are still stuck in ACTIVE state.
+        # Total max wait = CANCEL_MAX_WAIT_SECS + CANCEL_RETRY_WAIT_SECS.
+        # Defaults give ~150s which comfortably covers 5-8 Chia blocks at
+        # the target 18-52s per block cadence.
+        self.CANCEL_POLL_INTERVAL_SECS = _int("CANCEL_POLL_INTERVAL_SECS", 10)
+        self.CANCEL_MAX_WAIT_SECS = _int("CANCEL_MAX_WAIT_SECS", 90)
+        self.CANCEL_RETRY_WAIT_SECS = _int("CANCEL_RETRY_WAIT_SECS", 60)
 
         # ----- Coin Preparation -----
         self.ENABLE_COIN_PREP = _bool("ENABLE_COIN_PREP", False)
@@ -232,7 +324,10 @@ class Config:
         self.DEXIE_POST_ENABLED = _bool("DEXIE_POST_ENABLED", True)
         self.DEXIE_POST_TIMEOUT = _int("DEXIE_POST_TIMEOUT", 15)
         self.DEXIE_POST_RETRIES = _int("DEXIE_POST_RETRIES", 2)
-        self.DEXIE_POST_RETRY_SLEEP = float(_str("DEXIE_POST_RETRY_SLEEP", "1.5"))
+        try:
+            self.DEXIE_POST_RETRY_SLEEP = float(_str("DEXIE_POST_RETRY_SLEEP", "1.5"))
+        except (ValueError, TypeError):
+            self.DEXIE_POST_RETRY_SLEEP = 1.5
         self.MAX_POSTS_PER_LOOP = _int("MAX_POSTS_PER_LOOP", 30)
         self.BOT_TAG = _str("BOT_TAG", "CAT_MM_BOT")
 
@@ -247,7 +342,12 @@ class Config:
         self.AMM_POLL_INTERVAL_SECS = _int("AMM_POLL_INTERVAL_SECS", 30)
         # AMM_DRIFT_REQUOTE_BPS: if AMM price moves this far from our last
         # quoted mid-price, invalidate the Tibet cache to force a fresh requote.
-        self.AMM_DRIFT_REQUOTE_BPS = _decimal("AMM_DRIFT_REQUOTE_BPS", "40")
+        # Default raised from 40 → 80 on 2026-04-07: 40 was too tight for
+        # stable markets and triggered ~22 forced requotes in 12 minutes
+        # during the cascade. 80 bps (0.8%) lets minor AMM ticks ride out
+        # without invoking the requote machinery. The cooldown gate
+        # (REQUOTE_COOLDOWN_SECS) also rate-limits this trigger.
+        self.AMM_DRIFT_REQUOTE_BPS = _decimal("AMM_DRIFT_REQUOTE_BPS", "80")
         # ENABLE_AMM_BUFFER: when True, offers within AMM_BUFFER_BPS of the
         # AMM price are skipped — they would be instantly arbed by TibetSwap.
         self.ENABLE_AMM_BUFFER = _bool("ENABLE_AMM_BUFFER", False)
@@ -275,7 +375,12 @@ class Config:
         self.MAX_POSITION_XCH = _decimal("MAX_POSITION_XCH", "5.0")
 
         # ----- Dynamic Spreads (V2) -----
-        self.DYNAMIC_SPREAD_ENABLED = _bool("DYNAMIC_SPREAD_ENABLED", False)
+        # Default flipped from False → True on 2026-04-08: with this off,
+        # volatility scaling and pool-depth adjustment of spreads are inert
+        # and the bot quotes a flat BASE_SPREAD_BPS regardless of market
+        # conditions. The dashboard markets the bot as having "adaptive"
+        # spreads — that is only true when this is on.
+        self.DYNAMIC_SPREAD_ENABLED = _bool("DYNAMIC_SPREAD_ENABLED", True)
         self.BASE_SPREAD_BPS = _decimal("BASE_SPREAD_BPS", "0")
         self.MIN_SPREAD_BPS = _decimal("MIN_SPREAD_BPS", "300")
         self.MAX_SPREAD_BPS = _decimal("MAX_SPREAD_BPS", "3000")
@@ -301,14 +406,55 @@ class Config:
         self.MID_SIZE_XCH = _decimal("MID_SIZE_XCH", "0")
         self.OUTER_SIZE_XCH = _decimal("OUTER_SIZE_XCH", "0")
         self.EXTREME_SIZE_XCH = _decimal("EXTREME_SIZE_XCH", "0")
+        # F62 (2026-04-09): PER-SIDE tier sizes. These are POSITION-semantic
+        # (BUY_INNER_SIZE_XCH is the XCH committed per offer at the buy side's
+        # position inner, i.e. tightest to mid). Prior to F62 all size fields
+        # were shared and the bot used `BUY_LADDER_REVERSED` to flip the
+        # lookup at read time — which kept buy and sell symmetric in XCH
+        # terms and left huge amounts of capital idle under reverse-buy.
+        # With per-side sizes, Smart Settings produces two independent
+        # capital plans and writes them directly, so each side can fully
+        # consume its own balance minus reserve. Fall back to the shared
+        # legacy keys when per-side values are zero (upgrade path).
+        self.BUY_INNER_SIZE_XCH = _decimal("BUY_INNER_SIZE_XCH", "0")
+        self.BUY_MID_SIZE_XCH = _decimal("BUY_MID_SIZE_XCH", "0")
+        self.BUY_OUTER_SIZE_XCH = _decimal("BUY_OUTER_SIZE_XCH", "0")
+        self.BUY_EXTREME_SIZE_XCH = _decimal("BUY_EXTREME_SIZE_XCH", "0")
+        self.SELL_INNER_SIZE_XCH = _decimal("SELL_INNER_SIZE_XCH", "0")
+        self.SELL_MID_SIZE_XCH = _decimal("SELL_MID_SIZE_XCH", "0")
+        self.SELL_OUTER_SIZE_XCH = _decimal("SELL_OUTER_SIZE_XCH", "0")
+        self.SELL_EXTREME_SIZE_XCH = _decimal("SELL_EXTREME_SIZE_XCH", "0")
         self.INNER_TIER_COUNT = _int("INNER_TIER_COUNT", 0)
         self.MID_TIER_COUNT = _int("MID_TIER_COUNT", 0)
         self.OUTER_TIER_COUNT = _int("OUTER_TIER_COUNT", 0)
         self.EXTREME_TIER_COUNT = _int("EXTREME_TIER_COUNT", 0)
+        # Per-side live tier counts (V4): BUY_* shapes the buy ladder (XCH-funded),
+        # SELL_* shapes the sell ladder (CAT-funded). Fall back to the legacy
+        # single-shared keys above when per-side keys are not set, so existing
+        # configs keep working unchanged.
+        self.BUY_INNER_TIER_COUNT = _int("BUY_INNER_TIER_COUNT", str(self.INNER_TIER_COUNT))
+        self.BUY_MID_TIER_COUNT = _int("BUY_MID_TIER_COUNT", str(self.MID_TIER_COUNT))
+        self.BUY_OUTER_TIER_COUNT = _int("BUY_OUTER_TIER_COUNT", str(self.OUTER_TIER_COUNT))
+        self.BUY_EXTREME_TIER_COUNT = _int("BUY_EXTREME_TIER_COUNT", str(self.EXTREME_TIER_COUNT))
+        self.SELL_INNER_TIER_COUNT = _int("SELL_INNER_TIER_COUNT", str(self.INNER_TIER_COUNT))
+        self.SELL_MID_TIER_COUNT = _int("SELL_MID_TIER_COUNT", str(self.MID_TIER_COUNT))
+        self.SELL_OUTER_TIER_COUNT = _int("SELL_OUTER_TIER_COUNT", str(self.OUTER_TIER_COUNT))
+        self.SELL_EXTREME_TIER_COUNT = _int("SELL_EXTREME_TIER_COUNT", str(self.EXTREME_TIER_COUNT))
         self.INNER_TIER_SPARE_COUNT = _int("INNER_TIER_SPARE_COUNT", 0)
         self.MID_TIER_SPARE_COUNT = _int("MID_TIER_SPARE_COUNT", 0)
         self.OUTER_TIER_SPARE_COUNT = _int("OUTER_TIER_SPARE_COUNT", 0)
         self.EXTREME_TIER_SPARE_COUNT = _int("EXTREME_TIER_SPARE_COUNT", 0)
+        # Per-side spare counts (V4): BUY_* governs XCH (used to fund buy offers),
+        # SELL_* governs CAT (used to fund sell offers). When the legacy single-shared
+        # keys above are non-zero and per-side keys are not set, fall back to legacy.
+        self.BUY_INNER_TIER_SPARE_COUNT = _int("BUY_INNER_TIER_SPARE_COUNT", str(self.INNER_TIER_SPARE_COUNT))
+        self.BUY_MID_TIER_SPARE_COUNT = _int("BUY_MID_TIER_SPARE_COUNT", str(self.MID_TIER_SPARE_COUNT))
+        self.BUY_OUTER_TIER_SPARE_COUNT = _int("BUY_OUTER_TIER_SPARE_COUNT", str(self.OUTER_TIER_SPARE_COUNT))
+        self.BUY_EXTREME_TIER_SPARE_COUNT = _int("BUY_EXTREME_TIER_SPARE_COUNT", str(self.EXTREME_TIER_SPARE_COUNT))
+        self.SELL_INNER_TIER_SPARE_COUNT = _int("SELL_INNER_TIER_SPARE_COUNT", str(self.INNER_TIER_SPARE_COUNT))
+        self.SELL_MID_TIER_SPARE_COUNT = _int("SELL_MID_TIER_SPARE_COUNT", str(self.MID_TIER_SPARE_COUNT))
+        self.SELL_OUTER_TIER_SPARE_COUNT = _int("SELL_OUTER_TIER_SPARE_COUNT", str(self.OUTER_TIER_SPARE_COUNT))
+        self.SELL_EXTREME_TIER_SPARE_COUNT = _int("SELL_EXTREME_TIER_SPARE_COUNT", str(self.EXTREME_TIER_SPARE_COUNT))
 
         # ----- Coin Prep -----
         self.COIN_PREP_MULTIPLIER = _decimal("COIN_PREP_MULTIPLIER", "1.0")
@@ -329,6 +475,25 @@ class Config:
         self.TOPUP_SLOW_PCT = _int("TOPUP_SLOW_PCT", 20)        # Trigger at 20% spares on slow days
         self.TOPUP_NORMAL_PCT = _int("TOPUP_NORMAL_PCT", 30)     # Trigger at 30% spares normally
         self.TOPUP_BUSY_PCT = _int("TOPUP_BUSY_PCT", 50)         # Trigger at 50% spares on busy days
+        # Per-tier topup trigger percentages (V4). Overrides the global pace
+        # threshold above on a per-tier basis. The "starting pool size" for
+        # each tier comes from the live spare-count settings (source of truth),
+        # and the trigger fires when that tier's free spares drop below
+        # (pool_size * pct / 100). Inner tier has the biggest pool and gets
+        # hit most often, so it triggers earliest. Extreme tier has the
+        # smallest pool and is hit least often, so it tolerates the deepest
+        # drawdown before triggering prep. Percentages can still be scaled
+        # by the pace factor (busy/normal/slow) via TIER_TRIGGER_PACE_SCALE.
+        self.TIER_TRIGGER_PCT_INNER = _int("TIER_TRIGGER_PCT_INNER", 50)
+        self.TIER_TRIGGER_PCT_MID = _int("TIER_TRIGGER_PCT_MID", 40)
+        self.TIER_TRIGGER_PCT_OUTER = _int("TIER_TRIGGER_PCT_OUTER", 25)
+        self.TIER_TRIGGER_PCT_EXTREME = _int("TIER_TRIGGER_PCT_EXTREME", 15)
+        self.TIER_TRIGGER_PCT_SNIPER = _int("TIER_TRIGGER_PCT_SNIPER", 40)
+        self.TIER_TRIGGER_PCT_FEES = _int("TIER_TRIGGER_PCT_FEES", 30)
+        # If True, tier percentages are scaled by the pace factor
+        # (busy=1.4x, normal=1.0x, slow=0.7x). If False, pace is ignored and
+        # the per-tier base percentages are used exactly as configured.
+        self.TIER_TRIGGER_PACE_SCALE = _bool("TIER_TRIGGER_PACE_SCALE", True)
         # Trading pace thresholds (fills per hour)
         self.FILLS_PER_HOUR_BUSY = _int("FILLS_PER_HOUR_BUSY", 10)   # >10 fills/hr = busy
         self.FILLS_PER_HOUR_SLOW = _int("FILLS_PER_HOUR_SLOW", 2)    # <2 fills/hr = slow
@@ -376,7 +541,10 @@ class Config:
         self.SPLASH_SUBMIT_URL = _str("SPLASH_SUBMIT_URL", "http://localhost:4000")
         self.SPLASH_POST_RETRIES = _int("SPLASH_POST_RETRIES", 2)
         self.SPLASH_POST_TIMEOUT = _int("SPLASH_POST_TIMEOUT", 15)
-        self.SPLASH_POST_RETRY_SLEEP = float(_str("SPLASH_POST_RETRY_SLEEP", "1.5"))
+        try:
+            self.SPLASH_POST_RETRY_SLEEP = float(_str("SPLASH_POST_RETRY_SLEEP", "1.5"))
+        except (ValueError, TypeError):
+            self.SPLASH_POST_RETRY_SLEEP = 1.5
         self.SPLASH_RECEIVE_ENABLED = _bool("SPLASH_RECEIVE_ENABLED", True)
         self.SPLASH_RECEIVE_POLL_SECS = _int("SPLASH_RECEIVE_POLL_SECS", 5)
         self.SPLASH_RECEIVE_BATCH_SIZE = _int("SPLASH_RECEIVE_BATCH_SIZE", 10)
@@ -428,7 +596,12 @@ class Config:
         "ARB_ALERT_THRESHOLD_BPS",
         # Price safety
         "DYNAMIC_LIMIT_PCT", "HARD_MIN_PRICE_XCH", "HARD_MAX_PRICE_XCH",
-        "MAX_STEP_CHANGE_FRACTION", "MIN_MID", "MAX_MID", "MAX_MID_MOVE_BPS",
+        # MIN_MID / MAX_MID kept for Smart Settings clear-only path —
+        # they're legacy fallbacks for HARD_MIN/MAX_PRICE_XCH (see lines
+        # 217-220) and Smart Settings explicitly nulls them so the new
+        # rails take precedence. MAX_MID_MOVE_BPS removed 2026-04-08:
+        # the trading code never consumed it.
+        "MAX_STEP_CHANGE_FRACTION", "MIN_MID", "MAX_MID",
         # Offer management
         "MAX_ACTIVE_BUY", "MAX_ACTIVE_SELL",
         "MAX_ACTIVE_BUY_OFFERS", "MAX_ACTIVE_SELL_OFFERS",
@@ -437,8 +610,11 @@ class Config:
         # Requoting
         "AUTO_REQUOTE", "REQUOTE_BPS", "REQUOTE_COOLDOWN_SECS",
         "REQUOTE_BATCH_SIZE", "REQUOTE_COIN_FREE_WAIT",
-        # Reserves
+        # Reserves + topup pool (F49)
         "XCH_RESERVE", "CAT_RESERVE", "MZ_RESERVE",
+        "TOPUP_POOL_PCT", "TOPUP_POOL_XCH", "TOPUP_POOL_CAT",
+        # Cancel poll + retry tuning (F51)
+        "CANCEL_POLL_INTERVAL_SECS", "CANCEL_MAX_WAIT_SECS", "CANCEL_RETRY_WAIT_SECS",
         # Coin prep
         "ENABLE_COIN_PREP", "COIN_PREP_COOLDOWN_SECS",
         "XCH_TARGET_COINS", "XCH_COIN_SIZE",
@@ -470,12 +646,30 @@ class Config:
         # Tiered orders
         "TIER_ENABLED", "BUY_LADDER_REVERSED", "INNER_SIZE_XCH", "MID_SIZE_XCH",
         "OUTER_SIZE_XCH", "EXTREME_SIZE_XCH",
+        # F62 (2026-04-09): per-side tier sizes so buy and sell ladders
+        # can be sized independently from their own balances.
+        "BUY_INNER_SIZE_XCH", "BUY_MID_SIZE_XCH",
+        "BUY_OUTER_SIZE_XCH", "BUY_EXTREME_SIZE_XCH",
+        "SELL_INNER_SIZE_XCH", "SELL_MID_SIZE_XCH",
+        "SELL_OUTER_SIZE_XCH", "SELL_EXTREME_SIZE_XCH",
         "INNER_TIER_COUNT", "MID_TIER_COUNT",
         "OUTER_TIER_COUNT", "EXTREME_TIER_COUNT",
+        "BUY_INNER_TIER_COUNT", "BUY_MID_TIER_COUNT",
+        "BUY_OUTER_TIER_COUNT", "BUY_EXTREME_TIER_COUNT",
+        "SELL_INNER_TIER_COUNT", "SELL_MID_TIER_COUNT",
+        "SELL_OUTER_TIER_COUNT", "SELL_EXTREME_TIER_COUNT",
         "INNER_TIER_SPARE_COUNT", "MID_TIER_SPARE_COUNT",
         "OUTER_TIER_SPARE_COUNT", "EXTREME_TIER_SPARE_COUNT",
+        "BUY_INNER_TIER_SPARE_COUNT", "BUY_MID_TIER_SPARE_COUNT",
+        "BUY_OUTER_TIER_SPARE_COUNT", "BUY_EXTREME_TIER_SPARE_COUNT",
+        "SELL_INNER_TIER_SPARE_COUNT", "SELL_MID_TIER_SPARE_COUNT",
+        "SELL_OUTER_TIER_SPARE_COUNT", "SELL_EXTREME_TIER_SPARE_COUNT",
         # Adaptive coin management
         "TOPUP_SLOW_PCT", "TOPUP_NORMAL_PCT", "TOPUP_BUSY_PCT",
+        "TIER_TRIGGER_PCT_INNER", "TIER_TRIGGER_PCT_MID",
+        "TIER_TRIGGER_PCT_OUTER", "TIER_TRIGGER_PCT_EXTREME",
+        "TIER_TRIGGER_PCT_SNIPER", "TIER_TRIGGER_PCT_FEES",
+        "TIER_TRIGGER_PACE_SCALE",
         "FILLS_PER_HOUR_BUSY", "FILLS_PER_HOUR_SLOW",
         "RECONCILE_EVERY_N_LOOPS",
         # Sniper
@@ -520,15 +714,23 @@ class Config:
         "TIBET_PAIR_ID",
     }
 
-    def update(self, key: str, value: str) -> bool:
+    def update(self, key: str, value: str,
+               source: str = "api", note: str = "") -> bool:
         """Update a setting: writes to .env and refreshes in-memory value.
 
         Only keys in _UPDATABLE_KEYS can be modified via the API.
         Credentials, wallet URLs, and cert paths are blocked.
 
+        F26 (2026-04-08): added `source` and `note` parameters that
+        propagate to the config_history audit table. Callers should
+        pass meaningful sources like "gui_live_control",
+        "smart_settings", "api_settings_save", "smart_defaults_apply".
+
         Args:
             key: The setting name (e.g., 'SPREAD_BPS')
             value: The new value as a string
+            source: Where the change came from (audit trail)
+            note: Optional human-readable note
 
         Returns True if successful.
         """
@@ -542,21 +744,43 @@ class Config:
             return False
 
         try:
-            # Record old value for change tracking
-            old_value = str(getattr(self, key, ""))
+            # Hold the lock across the set_key → reload pair so two
+            # concurrent update() calls can't race each other through
+            # python-dotenv's non-atomic read-modify-write of .env.
+            with self._lock:
+                # Record old value for change tracking
+                old_value = str(getattr(self, key, ""))
 
-            # Write to .env file
-            set_key(_ENV_PATH, key, value)
+                # Write to .env file
+                set_key(_ENV_PATH, key, value)
 
-            # Reload all settings from disk
-            self.reload()
+                # Reload all settings from disk (RLock re-entry is fine)
+                self.reload()
 
-            # Record the change (import here to avoid circular import)
-            try:
-                from database import record_config_change
-                record_config_change(key, old_value, value)
-            except ImportError:
-                pass  # Database not available yet during early startup
+                # Record the change (import here to avoid circular import)
+                try:
+                    from database import record_config_change
+                    record_config_change(key, old_value, value, source=source, note=note)
+                except ImportError:
+                    pass  # Database not available yet during early startup
+
+                # F49 (2026-04-09): when Smart Settings writes new
+                # TOPUP_POOL_* values, reset the session spend counter
+                # so the fresh allocation gets its full budget. Without
+                # this, a new Smart Settings run would inherit stale
+                # spend from the previous session and the topup worker
+                # would refuse splits immediately.
+                try:
+                    if key in ("TOPUP_POOL_XCH", "TOPUP_POOL_CAT"):
+                        from database import set_setting as _set_setting
+                        spend_key = (
+                            "topup_pool_cat_spent_mojos"
+                            if key == "TOPUP_POOL_CAT"
+                            else "topup_pool_xch_spent_mojos"
+                        )
+                        _set_setting(spend_key, "0")
+                except Exception:
+                    pass  # DB may not be ready yet
 
             return True
         except Exception as e:
@@ -616,7 +840,9 @@ class Config:
                 f"LOOP_SECONDS={loop} is very long (>3600s) — book will be stale for >1 hour"
             )
 
-        # MAX_ACTIVE_BUY_OFFERS / MAX_ACTIVE_SELL_OFFERS: 1-50
+        # MAX_ACTIVE_BUY_OFFERS / MAX_ACTIVE_SELL_OFFERS
+        # Smart Defaults spreads the ladder widely (up to ~60 per side on
+        # busy markets), so the "very high" warning only fires above 150.
         for attr, label in [
             ("MAX_ACTIVE_BUY_OFFERS", "MAX_ACTIVE_BUY_OFFERS"),
             ("MAX_ACTIVE_SELL_OFFERS", "MAX_ACTIVE_SELL_OFFERS"),
@@ -626,9 +852,9 @@ class Config:
                 warnings.append(
                     f"{label}={val} — that side is disabled (no offers will be placed)"
                 )
-            elif val > 50:
+            elif val > 150:
                 warnings.append(
-                    f"{label}={val} is very high (>50) — large coin pools required, "
+                    f"{label}={val} is very high (>150) — large coin pools required, "
                     f"wallet RPC load will be high"
                 )
 
@@ -645,16 +871,18 @@ class Config:
                 f"fire after a 20%+ price move; stale offers may fill at bad prices"
             )
 
-        # XCH_RESERVE: warn if > 10 XCH (likely a misconfiguration)
+        # XCH_RESERVE: warn only on truly implausible values (typos). The old
+        # >10 XCH threshold was pure noise for medium wallets — Smart Settings
+        # routinely picks 15-25 XCH reserves when the user asks for a 20-25%
+        # hard floor on a 50-100 XCH wallet.
         reserve = self.XCH_RESERVE
         if reserve < Decimal("0"):
             errors.append(
                 f"XCH_RESERVE={reserve} is negative — invalid reserve value"
             )
-        elif reserve > Decimal("10"):
+        elif reserve > Decimal("100"):
             warnings.append(
-                f"XCH_RESERVE={reserve} XCH is large (>10) — verify this is intentional; "
-                f"most bots use 0.01-0.1 XCH as reserve"
+                f"XCH_RESERVE={reserve} XCH is very large (>100) — verify this is intentional"
             )
 
         # CAT_ASSET_ID: must be set and look like a valid 64-char hex string
@@ -668,6 +896,27 @@ class Config:
                 f"CAT_ASSET_ID='{asset_id[:20]}...' is not 64 hex characters — "
                 f"likely a misconfigured or truncated asset ID"
             )
+        else:
+            # Reject anything that isn't pure hex — stray characters would
+            # silently fail at RPC time with confusing errors.
+            asset_id_lower = asset_id.lower()
+            if any(c not in "0123456789abcdef" for c in asset_id_lower):
+                errors.append(
+                    f"CAT_ASSET_ID='{asset_id[:20]}...' contains non-hex characters — "
+                    f"must be 64 hex digits only"
+                )
+
+        # HARD_MIN_PRICE_XCH vs HARD_MAX_PRICE_XCH cross-check
+        try:
+            hmin = Decimal(str(getattr(self, "HARD_MIN_PRICE_XCH", 0) or 0))
+            hmax = Decimal(str(getattr(self, "HARD_MAX_PRICE_XCH", 0) or 0))
+            if hmin > 0 and hmax > 0 and hmin >= hmax:
+                errors.append(
+                    f"HARD_MIN_PRICE_XCH ({hmin}) is >= HARD_MAX_PRICE_XCH ({hmax}) — "
+                    f"all prices would be rejected; swap or adjust these values"
+                )
+        except (InvalidOperation, ValueError, TypeError):
+            pass
 
         return {"warnings": warnings, "errors": errors}
 
@@ -704,3 +953,85 @@ class Config:
 # Global config instance — import this everywhere
 # ---------------------------------------------------------------------------
 cfg = Config()
+
+
+# ---------------------------------------------------------------------------
+# Per-side tier size resolution (F62 — 2026-04-09)
+# ---------------------------------------------------------------------------
+# Callers should go through these helpers instead of reading INNER_SIZE_XCH
+# etc. directly. They encapsulate:
+#   1. Prefer the per-side field (BUY_*_SIZE_XCH / SELL_*_SIZE_XCH) when set
+#   2. Fall back to the shared legacy field (INNER_SIZE_XCH etc.)
+#   3. When falling back on the BUY side under BUY_LADDER_REVERSED, apply
+#      the reverse-buy flip so upgrading configs behave identically to
+#      pre-F62 until Smart Settings re-runs and writes the new fields.
+#
+# These are module-level functions so helpers in risk_manager / coin_manager /
+# offer_manager / api_server can share a single source of truth.
+
+_TIER_NAMES = ("inner", "mid", "outer", "extreme")
+_REVERSE_BUY_MAP = {
+    "inner":   "extreme",
+    "mid":     "outer",
+    "outer":   "mid",
+    "extreme": "inner",
+}
+
+
+def _legacy_tier_size(tier_name: str) -> Decimal:
+    """Read the legacy single-shared tier size (INNER_SIZE_XCH etc.)."""
+    attr = f"{tier_name.upper()}_SIZE_XCH"
+    return Decimal(str(getattr(cfg, attr, 0) or 0))
+
+
+def get_buy_tier_size_xch(tier_name: str) -> Decimal:
+    """Return the XCH committed per buy offer at the given position tier.
+
+    Prefers BUY_<tier>_SIZE_XCH; falls back to the shared legacy size with
+    BUY_LADDER_REVERSED flipping when the per-side field is zero.
+    """
+    tier = (tier_name or "").strip().lower()
+    if tier not in _TIER_NAMES:
+        return Decimal("0")
+    attr = f"BUY_{tier.upper()}_SIZE_XCH"
+    val = Decimal(str(getattr(cfg, attr, 0) or 0))
+    if val > 0:
+        return val
+    # Legacy fallback — apply reverse-buy flip if enabled
+    if getattr(cfg, "BUY_LADDER_REVERSED", False):
+        return _legacy_tier_size(_REVERSE_BUY_MAP[tier])
+    return _legacy_tier_size(tier)
+
+
+def get_sell_tier_size_xch(tier_name: str) -> Decimal:
+    """Return the XCH-equivalent committed per sell offer at the given position tier.
+
+    Prefers SELL_<tier>_SIZE_XCH; falls back to the shared legacy size.
+    Sell side is never flipped — reverse-buy only affects the buy ladder.
+    """
+    tier = (tier_name or "").strip().lower()
+    if tier not in _TIER_NAMES:
+        return Decimal("0")
+    attr = f"SELL_{tier.upper()}_SIZE_XCH"
+    val = Decimal(str(getattr(cfg, attr, 0) or 0))
+    if val > 0:
+        return val
+    return _legacy_tier_size(tier)
+
+
+def get_tier_sizes_for_side(side: str) -> dict:
+    """Return {tier: size_xch} for the given side ("buy" or "sell")."""
+    s = (side or "").strip().lower()
+    if s == "buy":
+        return {t: get_buy_tier_size_xch(t) for t in _TIER_NAMES}
+    return {t: get_sell_tier_size_xch(t) for t in _TIER_NAMES}
+
+
+def has_per_side_tier_sizes() -> bool:
+    """True if any per-side size field is set (i.e. F62 layout in use)."""
+    for t in _TIER_NAMES:
+        if Decimal(str(getattr(cfg, f"BUY_{t.upper()}_SIZE_XCH", 0) or 0)) > 0:
+            return True
+        if Decimal(str(getattr(cfg, f"SELL_{t.upper()}_SIZE_XCH", 0) or 0)) > 0:
+            return True
+    return False

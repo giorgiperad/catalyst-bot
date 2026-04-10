@@ -17,6 +17,7 @@ import os
 import json
 import sqlite3
 import threading
+import time
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from typing import Optional, List, Dict, Any
@@ -42,9 +43,18 @@ def norm_coin_id(cid: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Database path — sits next to the other project files
+# Database path — lives under the per-user data directory so the app works
+# when installed to a read-only location (e.g. C:\Program Files).
+# user_paths.py handles first-launch migration of legacy dev-layout DBs.
 # ---------------------------------------------------------------------------
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.db")
+try:
+    from user_paths import database_file as _db_file
+    DB_PATH = _db_file()
+except Exception as _e:
+    # Fallback for unusual dev setups.  In a packaged build this should
+    # never execute because user_paths.py is bundled alongside database.py.
+    print(f"[database] user_paths unavailable ({_e}); falling back to install dir", flush=True)
+    DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.db")
 
 
 # ---------------------------------------------------------------------------
@@ -163,13 +173,21 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 -- Config change history: track when settings change
+-- F26 (2026-04-08): re-introduced as a write+read audit trail for live
+-- config changes. Each row records WHO/WHAT/WHEN — useful for
+-- post-mortem investigation when something breaks after a settings
+-- change. The 'source' column distinguishes GUI/API/restart paths.
 CREATE TABLE IF NOT EXISTS config_history (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp       TEXT NOT NULL,
     key             TEXT NOT NULL,
     old_value       TEXT,
-    new_value       TEXT
+    new_value       TEXT,
+    source          TEXT,
+    note            TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_config_history_time ON config_history(timestamp);
+CREATE INDEX IF NOT EXISTS idx_config_history_key ON config_history(key);
 
 -- Coins table: tracks every coin the bot knows about
 -- Persistent record of what's available, locked, or spent
@@ -227,29 +245,6 @@ CREATE INDEX IF NOT EXISTS idx_splash_incoming_status ON splash_incoming_offers(
 CREATE INDEX IF NOT EXISTS idx_splash_incoming_time ON splash_incoming_offers(received_at);
 CREATE INDEX IF NOT EXISTS idx_splash_incoming_fp ON splash_incoming_offers(fingerprint);
 
--- Diagnostic snapshots — written by coin_diagnostic.py for live monitoring
-CREATE TABLE IF NOT EXISTS diagnostic_snapshots (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp       TEXT NOT NULL,
-    xch_free        INTEGER DEFAULT 0,
-    xch_locked      INTEGER DEFAULT 0,
-    cat_free        INTEGER DEFAULT 0,
-    cat_locked      INTEGER DEFAULT 0,
-    buy_offers      INTEGER DEFAULT 0,
-    sell_offers     INTEGER DEFAULT 0,
-    fill_count      INTEGER DEFAULT 0,
-    net_position    TEXT DEFAULT '0',
-    phantoms        INTEGER DEFAULT 0,
-    orphans         INTEGER DEFAULT 0,
-    lock_mismatches INTEGER DEFAULT 0,
-    status_mismatches INTEGER DEFAULT 0,
-    amount_mismatches INTEGER DEFAULT 0,
-    issue_summary   TEXT,
-    wallet_audit_ok INTEGER DEFAULT 1
-);
-
-CREATE INDEX IF NOT EXISTS idx_diag_snap_time ON diagnostic_snapshots(timestamp);
-
 -- Smart Defaults v2: Pool depth snapshots (build history over time)
 -- Stored every bot loop cycle so we can track pool growth/shrinkage
 CREATE TABLE IF NOT EXISTS pool_snapshots (
@@ -291,22 +286,30 @@ def init_database():
     # Migration: add 'boost' to tier CHECK constraint if the table was created
     # with an older schema. SQLite doesn't support ALTER CHECK, so we recreate
     # the table if the constraint is outdated.
+    #
+    # Detection: inspect the stored CREATE TABLE SQL from sqlite_master rather
+    # than doing a test INSERT. A test INSERT can hit "cannot start a transaction
+    # within a transaction" or leave the connection in an implicit transaction,
+    # and would also fail spuriously on other CHECK columns. Reading sqlite_master
+    # is read-only and side-effect free.
+    needs_boost_migration = False
     try:
-        # Test if 'boost' tier is allowed — if this fails, we need to migrate
-        conn.execute(
-            "INSERT INTO offers (trade_id, side, price_xch, size_xch, size_cat, "
-            "tier, cat_asset_id, created_at) "
-            "VALUES ('__migration_test__', 'buy', '0', '0', '0', 'boost', 'test', '')"
-        )
-        conn.execute("DELETE FROM offers WHERE trade_id='__migration_test__'")
-        conn.commit()
-    except sqlite3.IntegrityError:
-        # Old schema — recreate offers table with new constraint.
-        # Rollback the failed test INSERT before starting the migration transaction.
-        try:
-            conn.rollback()
-        except Exception:
-            pass
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='offers'"
+        ).fetchone()
+        if row and row[0]:
+            create_sql = row[0]
+            # If the stored CREATE TABLE for 'offers' does not mention 'boost'
+            # inside its tier CHECK, the old schema is in place and must be
+            # rebuilt. We look for the literal token 'boost' — cheap and safe
+            # because the schema is fully controlled by us.
+            if "'boost'" not in create_sql and '"boost"' not in create_sql:
+                needs_boost_migration = True
+    except Exception as detect_err:
+        log_event("warn", "db_migration",
+                  f"Could not inspect offers schema for boost-tier migration: {detect_err}")
+
+    if needs_boost_migration:
         try:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute("ALTER TABLE offers RENAME TO offers_old")
@@ -553,6 +556,30 @@ def init_database():
         log_event("info", "db_migration",
                   "Migrated fills table: added 'fee_mojos_xch' column for fee-aware PnL")
 
+    # F43 (2026-04-08): persist post-fill enrichment data to the fills
+    # table. Previously the F41/F42 enrichment was logged-only — now it
+    # writes structured columns so the data is queryable forever.
+    # All four columns are nullable so historical fills are unaffected.
+    _enrichment_cols = [
+        ("spent_block_height", "INTEGER"),
+        ("header_hash",        "TEXT"),
+        ("receive_coin_id",    "TEXT"),
+        ("receive_amount_mojos", "INTEGER"),
+    ]
+    for _col, _defn in _enrichment_cols:
+        try:
+            conn.execute(f"SELECT {_col} FROM fills LIMIT 1")
+        except sqlite3.OperationalError:
+            try:
+                conn.execute(f"ALTER TABLE fills ADD COLUMN {_col} {_defn}")
+                conn.commit()
+                log_event("info", "db_migration",
+                          f"Migrated fills table: added '{_col}' column for "
+                          f"post-fill block enrichment (F43)")
+            except Exception as _mig_err:
+                log_event("warning", "db_migration",
+                          f"Could not add fills.{_col}: {_mig_err}")
+
     # Migration: add fee_mojos_xch column to offers table.
     # Persists the exact fee attached to the offer at creation time.
     # Previously, fill recording used the current config fee (which can change)
@@ -566,6 +593,71 @@ def init_database():
         conn.commit()
         log_event("info", "db_migration",
                   "Migrated offers table: added 'fee_mojos_xch' column for per-offer fee tracking")
+
+    # F5 fix (2026-04-08): add UNIQUE index on fills.trade_id to prevent
+    # double-counting fills if detect_fills() ever fires twice for the same
+    # offer (e.g., race during a wallet sync glitch). The index is created
+    # idempotently and is a no-op if it already exists. If existing duplicate
+    # rows are present we log a warning and skip — operator can clean up
+    # manually rather than blocking startup.
+    try:
+        # First check whether the unique index is already in place (avoids
+        # the duplicate-row scan on every startup)
+        existing = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='index' AND name='uniq_fills_trade_id'"
+        ).fetchone()
+        if existing is None:
+            # Detect any existing duplicates before creating the constraint
+            dupes = conn.execute(
+                "SELECT trade_id, COUNT(*) AS n FROM fills "
+                "GROUP BY trade_id HAVING n > 1 LIMIT 5"
+            ).fetchall()
+            if dupes:
+                dupe_summary = ", ".join(
+                    f"{row['trade_id'][:16]}...×{row['n']}" for row in dupes
+                )
+                log_event("warning", "db_migration",
+                          f"Cannot add UNIQUE index uniq_fills_trade_id — "
+                          f"duplicate trade_ids already exist in fills "
+                          f"({len(dupes)}+ groups: {dupe_summary}). "
+                          f"Manual cleanup required. New fills are NOT "
+                          f"protected from double-counting until resolved.")
+            else:
+                conn.execute(
+                    "CREATE UNIQUE INDEX uniq_fills_trade_id "
+                    "ON fills(trade_id)"
+                )
+                conn.commit()
+                log_event("info", "db_migration",
+                          "Added UNIQUE index uniq_fills_trade_id on fills "
+                          "to prevent double-counted fills")
+    except Exception as uniq_err:
+        log_event("warning", "db_migration",
+                  f"Failed to add UNIQUE index on fills.trade_id: {uniq_err}")
+
+    # F26 (2026-04-08): config_history audit table — add source/note columns
+    # if upgrading from a pre-F26 schema. Both default to NULL.
+    try:
+        conn.execute("SELECT source FROM config_history LIMIT 1")
+    except sqlite3.OperationalError:
+        try:
+            conn.execute("ALTER TABLE config_history ADD COLUMN source TEXT")
+            conn.commit()
+            log_event("info", "db_migration",
+                      "Migrated config_history: added 'source' column")
+        except Exception:
+            pass
+    try:
+        conn.execute("SELECT note FROM config_history LIMIT 1")
+    except sqlite3.OperationalError:
+        try:
+            conn.execute("ALTER TABLE config_history ADD COLUMN note TEXT")
+            conn.commit()
+            log_event("info", "db_migration",
+                      "Migrated config_history: added 'note' column")
+        except Exception:
+            pass
 
     conn.commit()
     log_event("info", "database_init", "Database initialized successfully")
@@ -604,9 +696,14 @@ def _sqlite_ts(value) -> str:
 
 
 def _get_reconcile_tier_sizes_mojos(wallet_type: str) -> Dict[str, int]:
-    """Build tier sizes for reconcile-time auto-designation."""
+    """Build tier sizes for reconcile-time auto-designation.
+
+    F62 (2026-04-09): side-aware. XCH wallet uses buy tier sizes,
+    CAT wallet uses sell tier sizes. Falls back to legacy shared
+    fields via the per-side helpers when the per-side fields are zero.
+    """
     try:
-        from config import cfg as _cfg
+        from config import cfg as _cfg, get_buy_tier_size_xch, get_sell_tier_size_xch
         if not bool(getattr(_cfg, "TIER_ENABLED", False)):
             return {}
 
@@ -615,11 +712,14 @@ def _get_reconcile_tier_sizes_mojos(wallet_type: str) -> Dict[str, int]:
             headroom_pct = Decimal("0")
         prep_mult = Decimal("1") + (headroom_pct / Decimal("100"))
 
+        # XCH wallet funds BUY offers → use buy tier sizes.
+        # CAT wallet funds SELL offers → use sell tier sizes.
+        _get = get_sell_tier_size_xch if wallet_type == "cat" else get_buy_tier_size_xch
         tier_sizes_xch = {
-            "inner": Decimal(str(getattr(_cfg, "INNER_SIZE_XCH", 0) or 0)),
-            "mid": Decimal(str(getattr(_cfg, "MID_SIZE_XCH", 0) or 0)),
-            "outer": Decimal(str(getattr(_cfg, "OUTER_SIZE_XCH", 0) or 0)),
-            "extreme": Decimal(str(getattr(_cfg, "EXTREME_SIZE_XCH", 0) or 0)),
+            "inner":   Decimal(str(_get("inner") or 0)),
+            "mid":     Decimal(str(_get("mid") or 0)),
+            "outer":   Decimal(str(_get("outer") or 0)),
+            "extreme": Decimal(str(_get("extreme") or 0)),
         }
 
         sniper_enabled = bool(getattr(_cfg, "SNIPER_ENABLED", False))
@@ -1079,6 +1179,37 @@ def update_offer_lifecycle_state(trade_id: str, lifecycle_state: str) -> bool:
         return False
 
 
+# F21 (2026-04-08): lifecycle state machine observability counters.
+# Tracks how often noop transitions happen (signal didn't match the
+# current state) so we can spot misuse without making the FSM strict.
+# Strict mode (raise on noop) would break legacy callers; observation
+# mode is non-disruptive.
+_lifecycle_noop_counter: Dict[str, int] = {}
+_lifecycle_invalid_signal_counter: Dict[str, int] = {}
+_lifecycle_counter_lock = threading.Lock()
+
+
+def get_lifecycle_observability_stats() -> Dict[str, Dict[str, int]]:
+    """Return a snapshot of lifecycle FSM observability counters.
+
+    F21: useful for periodic logging or doctor reports. Counts noop
+    transitions (signal valid but not appropriate for current state)
+    and invalid signal names (caller passed something not in the enum).
+    """
+    with _lifecycle_counter_lock:
+        return {
+            "noop_transitions": dict(_lifecycle_noop_counter),
+            "invalid_signals": dict(_lifecycle_invalid_signal_counter),
+        }
+
+
+def reset_lifecycle_observability_stats() -> None:
+    """Reset the lifecycle observability counters (e.g. after logging)."""
+    with _lifecycle_counter_lock:
+        _lifecycle_noop_counter.clear()
+        _lifecycle_invalid_signal_counter.clear()
+
+
 def transition_offer(trade_id: str, signal: str):
     """Apply a lifecycle signal to an offer via the canonical FSM.
 
@@ -1086,6 +1217,10 @@ def transition_offer(trade_id: str, signal: str):
     offer_lifecycle.apply_signal(), writes the new state back, and
     returns the OfferTransition dataclass.  Returns None on any error
     (fail-open — callers must not block critical paths on this).
+
+    F21 (2026-04-08): observability counters track noop transitions
+    and invalid signals. The FSM stays fail-open (we don't raise on
+    bad inputs) but we count them so the operator can detect drift.
 
     Args:
         trade_id: The offer's trade_id.
@@ -1108,10 +1243,25 @@ def transition_offer(trade_id: str, signal: str):
         try:
             sig = OfferSignal(signal)
         except ValueError:
+            # F21: count invalid signal names per signal value
+            with _lifecycle_counter_lock:
+                _lifecycle_invalid_signal_counter[signal] = (
+                    _lifecycle_invalid_signal_counter.get(signal, 0) + 1
+                )
             return None
         transition = apply_signal(current_state, sig)
         if transition.new_state != current_state:
             update_offer_lifecycle_state(trade_id, str(transition.new_state))
+        else:
+            # F21: count noop transitions (state didn't change despite a
+            # valid signal). Key by "state→signal" so we can spot which
+            # combinations are misused.
+            if transition.action == "noop":
+                key = f"{current_state.value}→{sig.value}"
+                with _lifecycle_counter_lock:
+                    _lifecycle_noop_counter[key] = (
+                        _lifecycle_noop_counter.get(key, 0) + 1
+                    )
         return transition
     except Exception:
         return None
@@ -1444,6 +1594,8 @@ def batch_upsert_coins(coins: list, wallet_type: str = "xch") -> int:
     Returns number of coins successfully upserted.
     """
     count = 0
+    failures = 0
+    first_error: Optional[str] = None
     conn = get_connection()
     for c in coins:
         try:
@@ -1453,12 +1605,29 @@ def batch_upsert_coins(coins: list, wallet_type: str = "xch") -> int:
                 _skip_commit=True,
             )
             count += 1
-        except Exception:
-            pass
+        except Exception as e:
+            failures += 1
+            if first_error is None:
+                first_error = f"{type(e).__name__}: {e}"
     try:
         conn.commit()
-    except Exception:
-        pass
+    except Exception as e:
+        # Commit failure is worse than any individual upsert failure —
+        # the whole batch is lost. Log it so it's visible.
+        try:
+            log_event("error", "batch_upsert_commit_failed",
+                      f"batch_upsert_coins commit failed "
+                      f"({wallet_type}, {count} staged): {type(e).__name__}: {e}")
+        except Exception:
+            pass
+        return 0
+    if failures > 0:
+        try:
+            log_event("warning", "batch_upsert_partial_failure",
+                      f"batch_upsert_coins ({wallet_type}): {failures}/{len(coins)} "
+                      f"failed, first error: {first_error}")
+        except Exception:
+            pass
     return count
 
 
@@ -2709,13 +2878,110 @@ def record_fill(trade_id: str, side: str, price_xch: Decimal, size_xch: Decimal,
             pass
 
         return cursor.lastrowid
+    except sqlite3.IntegrityError as ie:
+        # F5 fix (2026-04-08): UNIQUE constraint on fills.trade_id may fire if
+        # two threads race past the SELECT pre-check above. Treat this as an
+        # idempotent success and return the already-recorded fill_id rather
+        # than -1, so the caller doesn't double-count.
+        #
+        # F8 fix (2026-04-08): the original fallback did a single SELECT and
+        # returned -1 if it failed. With long-running SQLite WAL contention,
+        # the fallback SELECT can itself fail transiently. We now retry the
+        # SELECT up to 3 times with brief backoff (0.05s, 0.10s, 0.20s)
+        # before giving up. -1 returns are also escalated to a CRITICAL
+        # rate-tracked alert (see _record_fill_returns_negative_one_alert
+        # at the module level — when we ever lose a fill from PnL we
+        # want a loud, fail-loud, fail-fast operator-visible signal).
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        for attempt, delay in enumerate((0, 0.05, 0.10, 0.20)):
+            if delay:
+                try:
+                    time.sleep(delay)
+                except Exception:
+                    pass
+            try:
+                row = conn.execute(
+                    "SELECT fill_id FROM fills WHERE trade_id=? "
+                    "ORDER BY fill_id DESC LIMIT 1",
+                    (trade_id,)
+                ).fetchone()
+                if row:
+                    log_event("info", "record_fill_race",
+                              f"UNIQUE constraint caught race for {trade_id[:16]}... "
+                              f"— returning existing fill_id {row['fill_id']}"
+                              + (f" (after {attempt} retries)" if attempt else ""))
+                    return int(row["fill_id"])
+            except Exception:
+                pass
+        # All retries failed — this is a SILENT FILL LOSS condition.
+        # Escalate via the per-hour rate alert in addition to the error log.
+        log_event("error", "fill_record_failed_critical",
+                  f"CRITICAL: failed to record fill for {trade_id} after "
+                  f"IntegrityError + 4 SELECT retries. Fill is silently lost "
+                  f"from PnL math. Original error: {ie}",
+                  data={"trade_id": trade_id, "side": side,
+                        "price_xch": str(price_xch), "size_xch": str(size_xch)})
+        return -1
     except Exception as e:
         try:
             conn.rollback()
         except Exception:
             pass
-        log_event("error", "db_error", f"Failed to record fill for {trade_id}: {e}")
+        log_event("error", "fill_record_failed_critical",
+                  f"CRITICAL: failed to record fill for {trade_id}: {e}",
+                  data={"trade_id": trade_id, "side": side,
+                        "price_xch": str(price_xch), "size_xch": str(size_xch)})
         return -1
+
+
+def update_fill_enrichment(fill_id: int,
+                           spent_block_height: Optional[int] = None,
+                           header_hash: Optional[str] = None,
+                           receive_coin_id: Optional[str] = None,
+                           receive_amount_mojos: Optional[int] = None) -> bool:
+    """Persist post-fill enrichment data to the fills table (F43, 2026-04-08).
+
+    Called by FillTracker._post_fill_enrichment after walking the
+    Coinset additions/removals chain. All four columns are nullable
+    so partial enrichment writes are fine — pass only what you know.
+
+    Returns True if at least one column was written, False otherwise.
+    """
+    if not fill_id or fill_id <= 0:
+        return False
+
+    updates: List[str] = []
+    params: List = []
+    if spent_block_height is not None:
+        updates.append("spent_block_height = ?")
+        params.append(int(spent_block_height))
+    if header_hash is not None:
+        updates.append("header_hash = ?")
+        params.append(str(header_hash))
+    if receive_coin_id is not None:
+        updates.append("receive_coin_id = ?")
+        params.append(str(receive_coin_id))
+    if receive_amount_mojos is not None:
+        updates.append("receive_amount_mojos = ?")
+        params.append(int(receive_amount_mojos))
+
+    if not updates:
+        return False
+
+    params.append(int(fill_id))
+    sql = f"UPDATE fills SET {', '.join(updates)} WHERE fill_id = ?"
+    try:
+        conn = get_connection()
+        conn.execute(sql, params)
+        conn.commit()
+        return True
+    except Exception as e:
+        log_event("warning", "fill_enrichment_persist_failed",
+                  f"Could not write enrichment for fill_id={fill_id}: {e}")
+        return False
 
 
 def backfill_verified_fills_from_offers(limit: int = 50,
@@ -2782,6 +3048,11 @@ def backfill_verified_fills_from_offers(limit: int = 50,
 
         remaining = max(int(limit) - len(repaired), 0)
         if remaining > 0:
+            # F48 (2026-04-09): preserve any verification_status starting
+            # with 'verified' — previously we only checked for exact
+            # equality with 'verified' which meant backfill markers like
+            # 'verified_backfill_f48' got silently overwritten, destroying
+            # audit provenance for manually-reconstructed fills.
             legacy_rows = conn.execute(
                 """SELECT f.fill_id, f.trade_id, f.side, f.price_xch, f.size_xch, f.size_cat,
                           COALESCE(o.filled_at, f.filled_at) AS effective_filled_at,
@@ -2789,7 +3060,7 @@ def backfill_verified_fills_from_offers(limit: int = 50,
                    FROM fills f
                    JOIN offers o ON o.trade_id = f.trade_id
                    WHERE o.status='filled'
-                     AND COALESCE(f.verification_status, 'legacy') != 'verified'
+                     AND COALESCE(f.verification_status, 'legacy') NOT LIKE 'verified%'
                    ORDER BY COALESCE(o.filled_at, f.filled_at) ASC
                    LIMIT ?""",
                 (remaining,),
@@ -3424,26 +3695,119 @@ def get_stats(cat_asset_id: str = None, since: str = None) -> Dict:
     return stats
 
 
-def cleanup_old_events(days: int = 7) -> int:
-    """Remove events older than the specified number of days.
+def record_config_change(key: str, old_value, new_value,
+                         source: str = "unknown", note: str = "") -> bool:
+    """F26 (2026-04-08): write+read audit trail for live config changes.
 
-    Prevents the events table from growing unbounded.
-    Returns the number of rows deleted.
+    Records the who/what/when of every config change so post-mortem
+    investigation has a definitive log when something breaks after a
+    settings tweak. Called from cfg.update() in config.py.
+
+    Args:
+        key: config key name (e.g. "BASE_SPREAD_BPS")
+        old_value: previous value (any type — coerced to str)
+        new_value: new value (any type — coerced to str)
+        source: where the change came from (e.g. "gui_live_control",
+                "smart_settings", "api", "startup")
+        note: optional human-readable explanation
     """
-    from datetime import timedelta
-    cutoff = _sqlite_ts(datetime.now(timezone.utc) - timedelta(days=days))
-
     try:
         conn = get_connection()
-        cursor = conn.execute("DELETE FROM events WHERE timestamp < ?", (cutoff,))
+        conn.execute(
+            """INSERT INTO config_history
+               (timestamp, key, old_value, new_value, source, note)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (_now(), str(key), str(old_value or ""), str(new_value or ""),
+             str(source or "unknown"), str(note or ""))
+        )
         conn.commit()
-        return cursor.rowcount
+        return True
     except Exception as e:
         try:
             conn.rollback()
         except Exception:
             pass
-        return 0
+        # Audit logging is best-effort — never block a config change on
+        # an audit failure. The change still happens, just unaudited.
+        log_event("debug", "config_audit_failed",
+                  f"Failed to write config_history row for {key}: {e}")
+        return False
+
+
+def get_config_history(limit: int = 100, key: str = None,
+                       since_hours: int = None) -> List[Dict]:
+    """Read recent config change audit rows.
+
+    F26 (2026-04-08). Used by the API endpoint that surfaces the audit
+    trail to the operator dashboard.
+
+    Args:
+        limit: max rows to return
+        key: filter to a specific config key (None = all keys)
+        since_hours: only return rows from the last N hours (None = all)
+    """
+    try:
+        conn = get_connection()
+        sql = "SELECT id, timestamp, key, old_value, new_value, source, note FROM config_history"
+        params = []
+        clauses = []
+        if key:
+            clauses.append("key = ?")
+            params.append(str(key))
+        if since_hours and since_hours > 0:
+            clauses.append("timestamp > datetime('now', ? )")
+            params.append(f"-{int(since_hours)} hours")
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(int(limit))
+        rows = conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+    except Exception:
+        return []
+
+
+def get_wal_size_mb() -> float:
+    """Return the current size of the SQLite WAL file in MB.
+
+    F22 (2026-04-08): WAL monitoring helper. The write-ahead log
+    grows when checkpoints can't keep up with writes (long-running
+    readers, busy writes). If left unchecked it can grow into the
+    GBs and cause slow startup + disk pressure.
+    """
+    try:
+        wal_path = DB_PATH + "-wal"
+        if not os.path.exists(wal_path):
+            return 0.0
+        return os.path.getsize(wal_path) / (1024 * 1024)
+    except Exception:
+        return 0.0
+
+
+def force_wal_checkpoint() -> bool:
+    """Force a WAL checkpoint with TRUNCATE mode.
+
+    Returns True on success, False on failure. Uses TRUNCATE mode
+    which drops the WAL file size to zero after the checkpoint
+    completes (vs PASSIVE which leaves the file at its high-water
+    mark). May briefly block other writers during the truncate.
+
+    F22 (2026-04-08).
+    """
+    try:
+        conn = get_connection()
+        result = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        # Result is (busy_count, log_pages, checkpointed_pages)
+        if result is not None:
+            log_event("debug", "wal_checkpoint",
+                      f"WAL checkpoint: busy={result[0]}, log_pages={result[1]}, "
+                      f"checkpointed={result[2]}")
+            return result[0] == 0  # 0 = no busy readers blocked us
+        return True
+    except Exception as e:
+        log_event("warning", "wal_checkpoint_failed",
+                  f"WAL checkpoint failed: {e}")
+        return False
 
 
 def cleanup_old_pool_snapshots(days: int = 30) -> int:
@@ -3490,24 +3854,62 @@ def backup_database(backup_path: str = None) -> str:
     """Create a backup of the database.
 
     Args:
-        backup_path: Where to save the backup. Defaults to bot_backup_YYYYMMDD.db
+        backup_path: Where to save the backup. Defaults to
+                     <data_dir>/backups/bot_backup_YYYYMMDD_HHMMSS.db
 
     Returns the path to the backup file.
     """
     if not backup_path:
         date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_path = os.path.join(
-            os.path.dirname(DB_PATH),
-            f"bot_backup_{date_str}.db"
-        )
+        try:
+            from user_paths import backups_dir
+            backup_dir = backups_dir()
+        except Exception:
+            backup_dir = os.path.dirname(DB_PATH)
+        backup_path = os.path.join(backup_dir, f"bot_backup_{date_str}.db")
 
     conn = get_connection()
     backup_conn = sqlite3.connect(backup_path)
-    conn.backup(backup_conn)
-    backup_conn.close()
+    try:
+        conn.backup(backup_conn)
+    finally:
+        backup_conn.close()
 
     log_event("info", "backup", f"Database backed up to {backup_path}")
+
+    # Retention: keep the 10 most recent backups, prune older ones.
+    # Runs best-effort — failures shouldn't break the backup itself.
+    try:
+        _prune_old_backups(os.path.dirname(backup_path), keep=10)
+    except Exception as _prune_err:
+        print(f"[database] backup retention prune failed: {_prune_err}", flush=True)
+
     return backup_path
+
+
+def _prune_old_backups(backup_dir: str, keep: int = 10) -> int:
+    """Delete all but the `keep` most recent bot_backup_*.db files.
+
+    Returns the number of files deleted.
+    """
+    import glob
+    try:
+        files = glob.glob(os.path.join(backup_dir, "bot_backup_*.db"))
+        if len(files) <= keep:
+            return 0
+        # Sort by modified time, newest first
+        files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        to_delete = files[keep:]
+        deleted = 0
+        for f in to_delete:
+            try:
+                os.remove(f)
+                deleted += 1
+            except Exception:
+                pass
+        return deleted
+    except Exception:
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -3833,19 +4235,6 @@ def set_market_analysis_cache(asset_id: str, analysis_type: str,
         except Exception:
             pass
         return False
-
-
-def prune_market_analysis_cache() -> int:
-    """Delete expired market analysis cache entries."""
-    conn = get_connection()
-    try:
-        cursor = conn.execute(
-            "DELETE FROM market_analysis_cache WHERE expires_at < datetime('now')"
-        )
-        conn.commit()
-        return cursor.rowcount
-    except Exception:
-        return 0
 
 
 def clear_market_analysis_cache(asset_id: str,

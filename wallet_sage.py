@@ -174,6 +174,19 @@ else:
     _SAGE_HOST = _url_body
     _SAGE_PORT = 9257
 
+# IPv4/IPv6 dual-stack gotcha on Windows: Sage binds to 127.0.0.1 only,
+# but Python's getaddrinfo("localhost", ...) on modern Windows returns
+# the IPv6 [::1] address FIRST. http.client.HTTPSConnection will then
+# try [::1]:9257, hang in SYN_SENT until its timeout, and only then fall
+# back to IPv4. That turns every RPC call into a multi-second stall.
+#
+# Normalising any hostname alias that means "this machine" down to the
+# literal IPv4 loopback bypasses getaddrinfo entirely and gives us the
+# fast path Sage expects. Users who deliberately run Sage on an IPv6
+# address or a real hostname keep whatever they configured.
+if _SAGE_HOST.lower() in ("localhost", "localhost.localdomain"):
+    _SAGE_HOST = "127.0.0.1"
+
 
 class SageMempoolConflict(Exception):
     """Raised when Sage reports a MEMPOOL_CONFLICT — two transactions tried to spend the same coin."""
@@ -189,13 +202,6 @@ class SageUnknownUnspent(Exception):
     - Stale coin ID from a previous state
     """
     pass
-
-
-class SageTransactionError(Exception):
-    """Raised when Sage reports a transaction-level error (not just HTTP failure)."""
-    def __init__(self, message: str, error_type: str = "unknown"):
-        super().__init__(message)
-        self.error_type = error_type
 
 
 # ---- Sage RPC result validation ----
@@ -227,21 +233,44 @@ def _rpc_succeeded(result) -> bool:
 # hitting un-initialized Sage and returning garbage/errors.
 import threading as _thr
 import time as _time
+import socket as _sock
 _init_lock = _thr.Lock()
 _init_ok = False
 _init_last_attempt = 0.0
-_INIT_RETRY_SECS = 5.0
+# Cooldown MUST exceed the RPC timeout below, otherwise callers that were
+# queued on _init_lock during a failing attempt will immediately retry the
+# moment the lock releases — you get an N-caller × 8-second pile-up on
+# startup when Sage is down.
+_INIT_RETRY_SECS = 45.0
+# Quick reachability pre-check timeout. If Sage's RPC port isn't even
+# accepting connections, we want to know that in milliseconds so the
+# startup path isn't held hostage waiting for HTTP/TLS timeouts.
+_INIT_REACHABILITY_TIMEOUT = 0.5
+# RPC timeout for the initialize call itself. 8s is enough for a healthy
+# Sage to respond; if Sage is reachable but sluggish we don't want to
+# block forever.
+_INIT_RPC_TIMEOUT = 8
 
 
-def reset_initialization_state() -> None:
-    """Reset init state so the next ensure_initialized() retries.
+def _sage_rpc_port_reachable() -> bool:
+    """Fast TCP reachability probe for the Sage RPC port.
 
-    Called externally (e.g. after wallet switch) or by tests.
+    Returns True if something is listening, False otherwise. Never raises.
+    Uses a sub-second timeout so startup paths aren't held hostage to
+    HTTP/TLS timeouts when Sage isn't running.
     """
-    global _init_ok, _init_last_attempt
-    with _init_lock:
-        _init_ok = False
-        _init_last_attempt = 0.0
+    s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+    try:
+        s.settimeout(_INIT_REACHABILITY_TIMEOUT)
+        s.connect((_SAGE_HOST, _SAGE_PORT))
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
 
 
 def ensure_initialized(force_retry: bool = False) -> bool:
@@ -253,6 +282,9 @@ def ensure_initialized(force_retry: bool = False) -> bool:
 
     Thread-safe: the actual RPC call happens inside _init_lock to prevent
     concurrent init attempts.
+
+    Fast-fails when the Sage RPC port is not listening, so startup paths
+    don't pay the full HTTP/TLS timeout on every caller when Sage is down.
     """
     global _init_ok, _init_last_attempt
     with _init_lock:
@@ -262,24 +294,38 @@ def ensure_initialized(force_retry: bool = False) -> bool:
         now = _time.time()
         if not force_retry and _init_last_attempt and (now - _init_last_attempt) < _INIT_RETRY_SECS:
             return False
-        _init_last_attempt = now
+
+        # Fast reachability pre-check — if Sage isn't listening at all,
+        # record the attempt and bail immediately without paying the
+        # multi-second HTTP/TLS timeout. This is the critical fix for
+        # startup: with Sage down, the caller returns in <1s instead of
+        # ~8s, and the cooldown still prevents retries for 45s.
+        if not _sage_rpc_port_reachable():
+            _init_last_attempt = _time.time()
+            _console(f"  [Sage] RPC port {_SAGE_HOST}:{_SAGE_PORT} unreachable — skipping initialize")
+            return False
 
         # Attempt initialization under the lock.
         # Some Sage versions don't have /initialize (returns 404) — that's OK,
         # it means the wallet doesn't require explicit init.
         try:
-            result = rpc("initialize", {}, timeout=30)
+            result = rpc("initialize", {}, timeout=_INIT_RPC_TIMEOUT)
             if _rpc_succeeded(result):
                 _console("  [Sage] initialize OK")
             elif isinstance(result, dict) and "404" in str(result.get("error", "")):
                 _console("  [Sage] initialize endpoint not found (Sage version doesn't require it) — OK")
             else:
                 _console(f"  [Sage] INIT FAILED: initialize returned {result!r}")
+                # Record attempt time at the END of a failed attempt so
+                # the cooldown starts from now, not from when we acquired
+                # the lock. This prevents waiting-caller pile-ups.
+                _init_last_attempt = _time.time()
                 return False
             _init_ok = True
             return True
         except Exception as e:
             _console(f"  [Sage] INIT FAILED: initialize error: {e}")
+            _init_last_attempt = _time.time()
             return False
 
 
@@ -423,7 +469,13 @@ def rpc(endpoint: str, payload: dict, timeout: int = 10):
     except ConnectionError as e:
         elapsed = time.time() - start
         err_str = str(e)
-        if not _quiet_mode:
+        # Suppress the noisy error print for the one expected 404 case:
+        # `initialize` returns 404 on Sage versions that don't require an
+        # explicit init RPC. ensure_initialized() handles this dict and
+        # treats it as success — there's no need to scare the operator
+        # with a ❌ line in the log every startup.
+        _is_expected_init_404 = (endpoint == "initialize" and "404" in err_str)
+        if not _quiet_mode and not _is_expected_init_404:
             print(f"❌ Sage RPC error calling {endpoint} (after {elapsed:.2f}s): {e}")
         # Return structured error so callers can see the actual message
         # (previously returned None which became "Unknown error" in logs)
@@ -591,21 +643,6 @@ def sage_login(fingerprint: int, force_resync: bool = False) -> bool:
         return False
     else:
         print(f"  [Sage] Login appeared to succeed but get_key returned null")
-        return False
-
-
-def sage_logout() -> bool:
-    """Log out from the current key.
-
-    Returns:
-        True if logout succeeded.
-    """
-    try:
-        result = rpc("logout", {}, timeout=10)
-        print(f"  [Sage] Logout: {'OK' if result is not None else 'failed'}")
-        return result is not None
-    except Exception as e:
-        print(f"  [Sage] logout error: {e}")
         return False
 
 
@@ -1378,7 +1415,13 @@ def split_coins_bulk(wallet_id: int, num_coins: int, coin_size_mojos: int,
 
         parent_bytes = bytes.fromhex(parent.replace("0x", ""))
         puzzle_bytes = bytes.fromhex(puzzle.replace("0x", ""))
-        amount_bytes = amount.to_bytes(8, 'big')
+        # Chia uses variable-length signed encoding, NOT fixed 8 bytes.
+        # Using fixed 8 bytes produces the WRONG coin_id for small amounts.
+        if amount > 0:
+            byte_count = (amount.bit_length() + 8) >> 3
+            amount_bytes = amount.to_bytes(byte_count, 'big', signed=True)
+        else:
+            amount_bytes = b'\x00'
         coin_id = "0x" + hashlib.sha256(parent_bytes + puzzle_bytes + amount_bytes).hexdigest()
 
     if is_cat:
@@ -1566,8 +1609,10 @@ def get_wallet_balance(wallet_id: int):
         if total < spendable:
             total = spendable
 
-        if total == 0 and spendable == 0:
-            return None
+        # A genuinely empty wallet is a valid state — return the zero
+        # balance instead of None so callers can distinguish "empty" from
+        # "RPC failed".  RPC failures already return None earlier in this
+        # function (before we computed `total`/`spendable`).
 
         return {
             "success": True,
@@ -1972,7 +2017,7 @@ def send_cat_multi(payments: list, fee_mojos: int = 0):
 # ============================================================================
 
 def create_offer(offer_dict: dict, validate_only: bool = True, max_time: int = None,
-                  reuse_puzhash: bool = True,
+                  _reuse_puzhash: bool = True,
                   min_coin_amount: int = None, max_coin_amount: int = None,
                   coin_ids: list = None, fee_mojos: int = 0):
     """Create an offer via Sage's make_offer endpoint.
@@ -2737,7 +2782,8 @@ def cancel_offers_batch(trade_ids: list, secure: bool = True, max_workers: int =
     # Helper: include both XCH wallet (1) and CAT wallet for coin-count checks
     _confirm_wallet_ids: set = {1}
     try:
-        _confirm_wallet_ids.add(int(getattr(cfg, "CAT_WALLET_ID", 1)))
+        from config import cfg as _cfg_ref
+        _confirm_wallet_ids.add(int(getattr(_cfg_ref, "CAT_WALLET_ID", 1)))
     except Exception:
         pass
 
@@ -2795,9 +2841,12 @@ def cancel_offers_batch(trade_ids: list, secure: bool = True, max_workers: int =
     # --- Try bulk cancel first (Sage-specific) ---
     # DISABLED for now — bulk cancel overwhelms Sage and causes long pending
     # states. The caller now sends measured batches (currently 25), so
-    # sequential cancel is slower than one blind bulk RPC but more reliable.
-    # Only try bulk for very large batches (>100) as a last resort.
-    if len(trade_ids) > 100:
+    # F63 (2026-04-10): Sage's bulk cancel_offers RPC processes all offers
+    # in a single call — Sage's own GUI uses this and cancels 44 offers in
+    # ~5 seconds. The bot was only using bulk for >100 offers and falling
+    # back to sequential (0.3s per offer = 13s for 44) for smaller batches.
+    # Lowered threshold to 3 so virtually all cancel operations use bulk.
+    if len(trade_ids) >= 3:
         print(f"📋 [Sage] Attempting bulk cancel of {len(trade_ids)} offers...")
         try:
             # Use _sage_post directly to see actual HTTP status on error
@@ -2830,16 +2879,20 @@ def cancel_offers_batch(trade_ids: list, secure: bool = True, max_workers: int =
             print(f"   ⚠️ [Sage] Bulk cancel error: {e} — falling back to sequential")
 
     # --- Sequential cancel (used for small batches, or fallback for large) ---
-    # 1.0s delay between each cancel gives Sage time to process each
-    # transaction individually, preventing MEMPOOL_CONFLICT errors.
+    # Small inter-cancel delay (0.3s) avoids hammering Sage but stays well
+    # under the previous 1.0s. Different offers spend different coins so
+    # MEMPOOL_CONFLICT is not a concern between them. Per-call timeout
+    # dropped from 60s to 15s — Sage responds in <2s normally; 60s only
+    # mattered when Sage was deeply backlogged, which we no longer want
+    # to silently tolerate.
     if not cancel_succeeded:
-        delay = 1.0
+        delay = 0.3
         print(f"📋 [Sage] Cancelling {len(trade_ids)} offers sequentially "
               f"({delay}s delay)...")
 
         for i, tid in enumerate(trade_ids):
             try:
-                timeout = 60
+                timeout = 15
                 result = cancel_offer(tid, secure, timeout=timeout, fee_mojos=resolved_fee)
                 results[tid] = result or {"success": False, "error": "RPC returned None"}
                 if result and result.get("success"):
@@ -2875,12 +2928,60 @@ def cancel_offers_batch(trade_ids: list, secure: bool = True, max_workers: int =
                        "PENDING_CONFIRM", "IN_PROGRESS", "0", "1"}
     TERMINAL_NON_CANCEL = {"CONFIRMED", "COMPLETED", "SUCCESS", "FAILED", "4", "5"}
 
+    # Snapshot which TIDs had a successful SUBMIT call before verification
+    # starts. The sequential cancel loop above populates results[tid] with
+    # success=True when the wallet accepted the cancel RPC. Sage often does
+    # not flip the offer's status to PENDING_CANCEL while the cancel TX is
+    # in the mempool — the offer keeps its old PENDING_ACCEPT/ACTIVE status
+    # until the cancel TX confirms on-chain. Without this snapshot, the
+    # verification phase below treats those offers as STILL_ACTIVE failures
+    # and overwrites the submit-level success — which is exactly what
+    # caused "Cancel All" to report 0/49 succeeded while every cancel TX
+    # was actually sitting in the mempool.
+    submitted_tids = {tid for tid in trade_ids
+                      if results.get(tid, {}).get("success")}
+
     if len(trade_ids) > 0:
         print(f"🔄 [Sage] Confirming cancellations ON-CHAIN (2-layer verification)...")
-        max_wait = min(120, max(45, len(trade_ids) * 5))
-        poll_interval = 4
+        # F51 (2026-04-09): POLL + RETRY flow.
+        #
+        # Previous design: single fast-path window of 25s at 3s poll interval.
+        # When the mempool was congested (multiple cancel batches in flight),
+        # 25s was never enough — cancels would sit pending and the function
+        # would return `submitted_pending_confirm` which the caller treated
+        # as "cancelled". Operators then saw stale state for minutes.
+        #
+        # New design: operator-tunable poll-and-retry.
+        #   Phase 1: poll every CANCEL_POLL_INTERVAL_SECS (default 10) up
+        #            to CANCEL_MAX_WAIT_SECS (default 90). Covers 3-5 blocks
+        #            at Chia's target rate.
+        #   Phase 2: any offers still `ACTIVE` (not even in PENDING_CANCEL)
+        #            get their cancel RPC resubmitted. This handles the
+        #            mempool-conflict case where Sage accepted the cancel
+        #            RPC but the spend bundle never made it into a block
+        #            due to fee competition or duplicate-coin conflicts.
+        #   Phase 3: second polling window for CANCEL_RETRY_WAIT_SECS
+        #            (default 60) at the same interval. Covers another
+        #            2-3 blocks after the retry.
+        #
+        # Max total wait = MAX_WAIT + RETRY_WAIT = 150s default. The
+        # caller (offer_manager.cancel_all) runs in its own thread, so
+        # this doesn't block the bot loop.
+        try:
+            from config import cfg as _cfg
+            poll_interval = int(getattr(_cfg, "CANCEL_POLL_INTERVAL_SECS", 10) or 10)
+            max_wait = int(getattr(_cfg, "CANCEL_MAX_WAIT_SECS", 90) or 90)
+            retry_wait = int(getattr(_cfg, "CANCEL_RETRY_WAIT_SECS", 60) or 60)
+        except Exception:
+            poll_interval, max_wait, retry_wait = 10, 90, 60
+        # Safety clamps
+        poll_interval = max(2, min(poll_interval, 30))
+        max_wait = max(poll_interval * 2, min(max_wait, 600))
+        retry_wait = max(0, min(retry_wait, 300))
+
         start_time = time.time()
         confirmed = False
+        retry_attempted = False
 
         while (time.time() - start_time) < max_wait:
             time.sleep(poll_interval)
@@ -3012,6 +3113,101 @@ def cancel_offers_batch(trade_ids: list, secure: bool = True, max_workers: int =
             except Exception as e:
                 print(f"   ⚠️ [Sage] Confirm poll error: {e}")
 
+        # --- Phase 2: RETRY any offers that are still ACTIVE (not yet in
+        # PENDING_CANCEL state, meaning Sage never submitted a cancel TX
+        # for them or the TX was dropped due to mempool conflict). ---
+        #
+        # F51 (2026-04-09): after the first polling window expires, re-query
+        # Sage one more time and try to resubmit cancels for anything still
+        # stuck in ACTIVE status. This handles the exact scenario the user
+        # hit: a large batch of cancels where some made it into blocks and
+        # others got rejected for mempool-conflict, leaving 20+ offers still
+        # showing ACTIVE after 90s. A re-submit with a fresh spend bundle
+        # almost always succeeds because the conflicting bundle has
+        # resolved (either confirmed or dropped) by now.
+        if not confirmed and retry_wait > 0 and not retry_attempted:
+            retry_attempted = True
+            try:
+                current_offers = get_all_offers(include_completed=True, start=0, end=500)
+                if current_offers is not None:
+                    stuck_active = []
+                    for o in current_offers:
+                        tid = o.get("trade_id", "") or o.get("offer_id", "")
+                        if tid not in trade_id_set:
+                            continue
+                        status = str(o.get("status", "")).upper()
+                        if status in ACTIVE_STATUSES:
+                            stuck_active.append(tid)
+
+                    if stuck_active:
+                        print(f"   🔁 [Sage] RETRY phase: {len(stuck_active)} offers "
+                              f"still ACTIVE after {int(time.time() - start_time)}s — "
+                              f"resubmitting cancels")
+                        for tid in stuck_active:
+                            try:
+                                retry_result = cancel_offer(
+                                    tid, secure, timeout=15, fee_mojos=resolved_fee
+                                )
+                                if retry_result and retry_result.get("success"):
+                                    print(f"      ✅ [Sage] Retry submit OK for {tid[:16]}...")
+                                else:
+                                    err = (retry_result or {}).get("error", "unknown")
+                                    print(f"      ⚠️ [Sage] Retry submit failed for "
+                                          f"{tid[:16]}...: {err}")
+                                time.sleep(0.3)
+                            except Exception as _retry_err:
+                                print(f"      ❌ [Sage] Retry cancel error for "
+                                      f"{tid[:16]}...: {_retry_err}")
+
+                        # Phase 3: second polling window for retried cancels
+                        retry_start = time.time()
+                        print(f"   🔄 [Sage] Post-retry polling for up to {retry_wait}s...")
+                        while (time.time() - retry_start) < retry_wait:
+                            time.sleep(poll_interval)
+                            try:
+                                current_offers = get_all_offers(
+                                    include_completed=True, start=0, end=500
+                                )
+                                if current_offers is None:
+                                    continue
+                                still_active_now = set()
+                                cancelled_now = set()
+                                in_progress_now = set()
+                                for o in current_offers:
+                                    tid = o.get("trade_id", "") or o.get("offer_id", "")
+                                    if tid not in trade_id_set:
+                                        continue
+                                    status = str(o.get("status", "")).upper()
+                                    if status in CANCELLED_STATUSES:
+                                        cancelled_now.add(tid)
+                                    elif status in IN_PROGRESS_CANCEL_STATUSES:
+                                        in_progress_now.add(tid)
+                                    elif status in ACTIVE_STATUSES:
+                                        still_active_now.add(tid)
+                                elapsed_retry = int(time.time() - retry_start)
+                                print(f"   🔄 [Sage] Retry confirm [{elapsed_retry}s]: "
+                                      f"cancelled={len(cancelled_now)}, "
+                                      f"in_progress={len(in_progress_now)}, "
+                                      f"still_active={len(still_active_now)}")
+                                if cancelled_now == trade_id_set:
+                                    print(f"   ✅ [Sage] All {len(trade_ids)} cancellations "
+                                          f"confirmed after retry!")
+                                    confirmed = True
+                                    for tid in trade_ids:
+                                        results[tid] = {
+                                            "success": True,
+                                            "method": "confirmed_by_status",
+                                            "note": "confirmed after retry phase",
+                                        }
+                                    break
+                            except Exception as _retry_poll_err:
+                                print(f"   ⚠️ [Sage] Retry poll error: {_retry_poll_err}")
+                    else:
+                        print(f"   [Sage] No retry needed — 0 offers stuck in ACTIVE "
+                              f"(remaining are in PENDING_CANCEL / mempool)")
+            except Exception as _retry_phase_err:
+                print(f"   ⚠️ [Sage] Retry phase error: {_retry_phase_err}")
+
         # --- Final verdict ---
         if not confirmed:
             elapsed = int(time.time() - start_time)
@@ -3027,7 +3223,14 @@ def cancel_offers_batch(trade_ids: list, secure: bool = True, max_workers: int =
                     post_coin_count = _total_spendable()
                 except Exception:
                     post_coin_count = 0
-                final_coin_delta = post_coin_count - pre_cancel_coin_count
+                # Guard against None — pre_cancel_coin_count/post_coin_count
+                # can be None if the spendable-count RPC failed.  Treat None
+                # as "unknown" and force a zero delta rather than crashing
+                # the cancel verification path.
+                if pre_cancel_coin_count is None or post_coin_count is None:
+                    final_coin_delta = 0
+                else:
+                    final_coin_delta = post_coin_count - pre_cancel_coin_count
                 try:
                     final_pending_count = len(get_pending_transactions() or [])
                 except Exception:
@@ -3062,23 +3265,89 @@ def cancel_offers_batch(trade_ids: list, secure: bool = True, max_workers: int =
                         elif status in ACTIVE_STATUSES:
                             final_still_active.add(tid)
 
-                    # Mark results based on final state
+                    # Mark results based on final state.
+                    #
+                    # IMPORTANT: After the fast-path window expires, "still in
+                    # the mempool" is the EXPECTED case for cancels submitted
+                    # in the last few seconds. Treating it as a failure here
+                    # was the root cause of the requote storm cascade — it
+                    # made the bot abort requote rounds, leave new+old offers
+                    # both live, and starve coin pre-selection. We now return
+                    # success="submitted_pending_confirm" for in-flight cancels
+                    # so the requote loop can move on; retry_failed_cancels()
+                    # plus the next wallet sync will reconcile any cancels
+                    # that genuinely fail to confirm.
                     for tid in final_cancelled:
                         results[tid] = {"success": True, "method": "confirmed_by_status"}
                     for tid in final_in_progress_cancel:
-                        results[tid] = {"success": False,
-                                        "error": "Cancel still PENDING (PENDING_CANCEL) — "
-                                                 "not yet confirmed on-chain",
-                                        "method": "on_chain_verification"}
-                        print(f"   ⏳ [Sage] PENDING CANCEL for {tid[:16]}... — "
-                              f"cancel submitted but not confirmed on-chain")
+                        results[tid] = {
+                            "success": True,
+                            "method": "submitted_pending_confirm",
+                            "note": "Cancel TX in mempool (PENDING_CANCEL) — "
+                                    "will reconcile on next wallet sync",
+                        }
+                        print(f"   📨 [Sage] PENDING CANCEL for {tid[:16]}... — "
+                              f"submitted, awaiting on-chain confirm")
+                    # Heuristic: how many in-flight cancel TXs can we
+                    # account for via the mempool/coin signals? If the
+                    # pending queue rose, every extra pending TX is almost
+                    # certainly one of OUR cancels (the bot is the only
+                    # writer to the wallet during a batch cancel). Same
+                    # for coins: every coin that disappeared from spendable
+                    # is locked into a pending cancel TX.
+                    _pending_delta = (
+                        (final_pending_count - pre_pending_count)
+                        if (final_pending_count is not None
+                            and pre_pending_count is not None)
+                        else 0
+                    )
+                    _coins_locked_into_cancels = (
+                        max(0, -final_coin_delta)
+                        if final_coin_delta is not None
+                        else 0
+                    )
+                    _inflight_signal = max(_pending_delta, _coins_locked_into_cancels)
+
                     for tid in final_still_active:
-                        results[tid] = {"success": False,
-                                        "error": "STILL ACTIVE after cancel — "
-                                                 "on-chain cancel FAILED",
-                                        "method": "on_chain_verification"}
-                        print(f"   ❌ [Sage] CANCEL FAILED for {tid[:16]}... — "
-                              f"offer is STILL ACTIVE on-chain!")
+                        # STILL_ACTIVE by status doesn't necessarily mean the
+                        # cancel failed. Sage routinely keeps offers in their
+                        # pre-cancel status until the cancel TX confirms on-
+                        # chain. Two cases:
+                        #
+                        # (A) The wallet accepted our cancel RPC (tid is in
+                        #     submitted_tids) AND we have evidence of in-flight
+                        #     cancel TXs (pending queue grew or coins moved
+                        #     into pending state) → treat as in-flight, NOT
+                        #     a failure. retry_failed_cancels() and the next
+                        #     wallet sync will reconcile.
+                        #
+                        # (B) Otherwise → genuine failure (RPC issue, malformed
+                        #     offer, Sage didn't pick it up at all).
+                        if tid in submitted_tids and _inflight_signal > 0:
+                            results[tid] = {
+                                "success": True,
+                                "method": "submitted_pending_confirm",
+                                "note": ("Status still ACTIVE but cancel TX in "
+                                         f"mempool (pending_delta={_pending_delta}, "
+                                         f"coins_locked_into_cancels="
+                                         f"{_coins_locked_into_cancels}) — Sage "
+                                         "has not yet flipped status to "
+                                         "PENDING_CANCEL; will reconcile on "
+                                         "next wallet sync"),
+                            }
+                            print(f"   📨 [Sage] PENDING cancel for {tid[:16]}... — "
+                                  f"submit OK + cancel TX in flight, awaiting "
+                                  f"on-chain confirm")
+                            # Decrement the in-flight budget so we don't
+                            # double-count it for the next still_active tid.
+                            _inflight_signal -= 1
+                        else:
+                            results[tid] = {"success": False,
+                                            "error": "STILL ACTIVE after cancel — "
+                                                     "on-chain cancel FAILED",
+                                            "method": "on_chain_verification"}
+                            print(f"   ❌ [Sage] CANCEL FAILED for {tid[:16]}... — "
+                                  f"offer is STILL ACTIVE on-chain!")
                     for tid in final_vanished:
                         if final_lock_state_known and tid not in final_still_locked and (
                             final_pending_count <= pre_pending_count or final_coin_delta > 0
@@ -3089,27 +3358,28 @@ def cancel_offers_batch(trade_ids: list, secure: bool = True, max_workers: int =
                                                      f"pending={final_pending_count}, "
                                                      f"coin_delta=+{final_coin_delta}")}
                         else:
-                            results[tid] = {"success": False,
-                                            "error": "Offer vanished from wallet "
-                                                     "but still looks pending/locked — "
-                                                     "cancel not safely confirmed",
-                                            "method": "on_chain_verification"}
-                            print(f"   ❌ [Sage] UNCERTAIN cancel for {tid[:16]}... — "
+                            # Vanished from active list but lock/pending state
+                            # is uncertain. Most likely this is a cancel TX in
+                            # the mempool — treat as submitted-pending-confirm
+                            # and let the next wallet sync reconcile.
+                            results[tid] = {
+                                "success": True,
+                                "method": "submitted_pending_confirm",
+                                "note": ("Offer vanished from active list; "
+                                         f"locked={tid in final_still_locked}, "
+                                         f"pending={final_pending_count}, "
+                                         f"coin_delta=+{final_coin_delta} — "
+                                         "treating as in-flight cancel"),
+                            }
+                            print(f"   📨 [Sage] PENDING cancel for {tid[:16]}... — "
                                   f"vanished, locked={tid in final_still_locked}, "
                                   f"pending={final_pending_count}, "
                                   f"coin_delta=+{final_coin_delta}")
 
-                    failed_count = len(final_still_active) + len(final_in_progress_cancel) + sum(
-                        1 for tid in final_vanished
-                        if (final_lock_state_known and tid in final_still_locked)
-                        or (final_pending_count > pre_pending_count and final_coin_delta <= 0)
-                    )
-                    success_count = len(final_cancelled) + sum(
-                        1 for tid in final_vanished
-                        if final_lock_state_known
-                        and tid not in final_still_locked
-                        and (final_pending_count <= pre_pending_count or final_coin_delta > 0)
-                    )
+                    failed_count = len(final_still_active)
+                    success_count = (len(final_cancelled) + len(final_in_progress_cancel)
+                                     + sum(1 for tid in final_vanished
+                                           if results.get(tid, {}).get("success")))
                     print(f"   ⚠️ [Sage] Cancel verification after {elapsed}s: "
                           f"{success_count} confirmed, {failed_count} FAILED "
                           f"(locked={'?' if not final_lock_state_known else len(final_still_locked)}, "
@@ -3563,6 +3833,119 @@ def auto_combine_cat(asset_id: str = None, fee_mojos: int = 0, max_coins: int = 
     return result
 
 
+# ---------------------------------------------------------------------------
+# F48 (2026-04-09): Wallet puzzle hash cache for self-spend detection.
+#
+# Used by fill_tracker to distinguish real fills (MZ added at one of our
+# addresses) from cancels (offer coin returned to one of our addresses).
+# Sage's get_derivations endpoint returns every derived address in our
+# wallet's address book; we decode each bech32 to a puzzle hash and cache
+# the set for fast O(1) membership checks.
+# ---------------------------------------------------------------------------
+
+_puzzle_hash_cache: set = set()
+_puzzle_hash_cache_at: float = 0.0
+_PUZZLE_HASH_CACHE_TTL_SECS: float = 600.0  # 10 minutes
+
+
+def get_wallet_puzzle_hashes(force: bool = False, max_derivations: int = 5000) -> set:
+    """F48 (2026-04-09): return the set of puzzle hashes owned by the
+    current Sage wallet.
+
+    Walks Sage's get_derivations endpoint (both unhardened and hardened
+    keys) and decodes each bech32 address to a 32-byte puzzle hash via
+    chia.util.bech32m. Results are cached for 10 minutes so repeated
+    calls during fill verification are cheap.
+
+    Returns a set of lowercase hex strings WITHOUT the '0x' prefix so
+    caller code can do `ph in get_wallet_puzzle_hashes()` after also
+    stripping its own prefix.
+
+    Returns an empty set on any failure. Callers must handle that case
+    (typically by falling back to the legacy verification path).
+    """
+    global _puzzle_hash_cache, _puzzle_hash_cache_at
+
+    now = time.time()
+    if (not force and _puzzle_hash_cache
+            and (now - _puzzle_hash_cache_at) < _PUZZLE_HASH_CACHE_TTL_SECS):
+        return _puzzle_hash_cache
+
+    try:
+        from chia.util.bech32m import decode_puzzle_hash
+    except ImportError:
+        log_event(
+            "warning",
+            "puzzle_hash_cache_no_bech32m",
+            "chia.util.bech32m not available — wallet PH cache disabled. "
+            "Install chia-blockchain to enable fill-vs-cancel disambiguation.",
+        )
+        return set()
+
+    collected: set = set()
+    page_size = 200
+
+    # Walk both unhardened and hardened derivation trees
+    for hardened in (False, True):
+        offset = 0
+        # Hard cap iterations as a safety net against pathological pagination
+        for _ in range(max(1, max_derivations // page_size)):
+            try:
+                res = rpc(
+                    "get_derivations",
+                    {"offset": offset, "limit": page_size, "hardened": hardened},
+                    timeout=10,
+                )
+            except Exception as exc:
+                log_event(
+                    "debug",
+                    "puzzle_hash_cache_rpc_error",
+                    f"get_derivations(hardened={hardened}, offset={offset}) failed: {exc}",
+                )
+                break
+
+            if not isinstance(res, dict) or res.get("success") is False:
+                break
+
+            derivations = res.get("derivations") or []
+            if not derivations:
+                break
+
+            for d in derivations:
+                addr = str((d or {}).get("address", "")).strip()
+                if not addr:
+                    continue
+                try:
+                    ph_bytes = decode_puzzle_hash(addr)
+                    collected.add(ph_bytes.hex().lower())
+                except Exception:
+                    # Unknown address format — skip, don't raise
+                    continue
+
+            if len(derivations) < page_size:
+                break
+            offset += page_size
+
+    if collected:
+        _puzzle_hash_cache = collected
+        _puzzle_hash_cache_at = now
+        log_event(
+            "info",
+            "puzzle_hash_cache_loaded",
+            f"Loaded {len(collected)} wallet puzzle hashes from Sage "
+            f"derivations (used for fill-vs-cancel disambiguation)",
+        )
+    else:
+        log_event(
+            "warning",
+            "puzzle_hash_cache_empty",
+            "get_derivations returned no usable addresses — fill verification "
+            "will fall back to legacy paths.",
+        )
+
+    return collected
+
+
 def delete_offer(offer_id: str) -> bool:
     """Delete an offer record from Sage's local database.
 
@@ -3661,219 +4044,3 @@ def cat_to_mojos(amount: Decimal, decimals: int) -> int:
 def xch_to_mojos(amount: Decimal) -> int:
     """Convert XCH amount to mojos (1 XCH = 1e12 mojos)."""
     return int((amount * Decimal("1000000000000")).to_integral_value(ROUND_DOWN))
-
-
-def prepare_coins_for_trading(
-    xch_wallet_id: int,
-    cat_wallet_id: int,
-    num_buy_offers: int,
-    num_sell_offers: int,
-    xch_per_offer: Decimal,
-    cat_per_offer: Decimal,
-    cat_decimals: int = 3,
-    reserve_multiplier: float = 2.0,
-) -> Dict[str, Any]:
-    """Prepare optimal coin structure for market making.
-
-    Same logic as Chia version — uses Sage's split endpoints internally.
-    """
-    print("\n🪙 [Sage] Starting smart coin preparation...")
-    print(f"📊 Requirements: {num_buy_offers} buy × {xch_per_offer} XCH, {num_sell_offers} sell × {cat_per_offer} CAT")
-
-    xch_mojos_per_coin = xch_to_mojos(xch_per_offer)
-    cat_mojos_per_coin = cat_to_mojos(cat_per_offer, cat_decimals)
-
-    # Check existing coins
-    xch_coins = count_suitable_coins(xch_wallet_id, xch_mojos_per_coin, is_cat=False)
-    cat_coins = count_suitable_coins(cat_wallet_id, cat_mojos_per_coin, is_cat=True, decimals=cat_decimals)
-
-    xch_needed = max(0, num_buy_offers - xch_coins)
-    cat_needed = max(0, num_sell_offers - cat_coins)
-
-    print(f"📊 XCH: Have {xch_coins}, need {num_buy_offers}, will create {xch_needed}")
-    print(f"📊 CAT: Have {cat_coins}, need {num_sell_offers}, will create {cat_needed}")
-
-    status = {
-        "xch": {"existing": xch_coins, "needed": xch_needed, "created": 0, "success": True},
-        "cat": {"existing": cat_coins, "needed": cat_needed, "created": 0, "success": True},
-    }
-
-    # Split XCH if needed
-    if xch_needed > 0:
-        result = split_coins_bulk(
-            wallet_id=xch_wallet_id,
-            num_coins=xch_needed,
-            coin_size_mojos=xch_mojos_per_coin,
-            fee_mojos=get_effective_transaction_fee_mojos(),
-            reserve_multiplier=reserve_multiplier,
-            is_cat=False
-        )
-        if result and result.get("success"):
-            status["xch"]["created"] = result.get("coins_created", 0)
-        else:
-            status["xch"]["success"] = False
-            status["xch"]["error"] = result.get("error", "Unknown") if result else "Split failed"
-            return {"success": False, "status": status}
-
-    # Split CAT if needed
-    if cat_needed > 0:
-        result = split_coins_bulk(
-            wallet_id=cat_wallet_id,
-            num_coins=cat_needed,
-            coin_size_mojos=int(cat_per_offer),
-            fee_mojos=get_effective_transaction_fee_mojos(),
-            reserve_multiplier=reserve_multiplier,
-            is_cat=True,
-            cat_decimals=cat_decimals
-        )
-        if result and result.get("success"):
-            status["cat"]["created"] = result.get("coins_created", 0)
-        else:
-            status["cat"]["success"] = False
-            status["cat"]["error"] = result.get("error", "Unknown") if result else "Split failed"
-            return {"success": False, "status": status}
-
-    # Wait for confirmations
-    if xch_needed > 0 or cat_needed > 0:
-        print("🪙 [Sage] Waiting for coin confirmations...")
-
-        if xch_needed > 0:
-            max_wait = 300
-            start_time = time.time()
-            while (time.time() - start_time) < max_wait:
-                current = count_suitable_coins(xch_wallet_id, xch_mojos_per_coin, is_cat=False)
-                if current - xch_coins >= xch_needed:
-                    break
-                time.sleep(10)
-
-        if cat_needed > 0:
-            max_wait = 300
-            start_time = time.time()
-            while (time.time() - start_time) < max_wait:
-                current = count_suitable_coins(cat_wallet_id, cat_mojos_per_coin, is_cat=True, decimals=cat_decimals)
-                if current - cat_coins >= cat_needed:
-                    break
-                time.sleep(10)
-
-    print("✅ [Sage] Coin preparation complete!")
-    return {"success": True, "status": status}
-
-
-def prepare_coins_for_offers_v2(
-    xch_wallet_id: int,
-    cat_wallet_id: int,
-    num_buy_offers: int,
-    num_sell_offers: int,
-    xch_per_offer_mojos: int,
-    cat_per_offer_mojos: int,
-    xch_spendable_mojos: int,
-    cat_spendable_mojos: int,
-    xch_reserve_mojos: int = 0,
-    cat_reserve_mojos: int = 0,
-    progress_callback=None
-) -> Dict:
-    """V2 coin preparation — matches wallet_chia.py signature exactly."""
-    result = {
-        'success': False,
-        'xch_coins_created': 0,
-        'cat_coins_created': 0,
-        'xch_coins_ready': 0,
-        'cat_coins_ready': 0,
-        'message': ''
-    }
-
-    def update_progress(status, xch_done=0, xch_total=0, cat_done=0, cat_total=0):
-        if progress_callback:
-            progress_callback({
-                'status': status,
-                'xch_progress': {'done': xch_done, 'total': xch_total},
-                'cat_progress': {'done': cat_done, 'total': cat_total}
-            })
-
-    try:
-        update_progress("Calculating requirements...")
-
-        xch_needed_total = num_buy_offers * xch_per_offer_mojos
-        cat_needed_total = num_sell_offers * cat_per_offer_mojos
-
-        if (xch_spendable_mojos - xch_needed_total) < xch_reserve_mojos:
-            result['message'] = f"Insufficient XCH balance"
-            return result
-
-        if (cat_spendable_mojos - cat_needed_total) < cat_reserve_mojos:
-            result['message'] = f"Insufficient CAT balance"
-            return result
-
-        update_progress("Checking existing coins...")
-
-        xch_existing = count_suitable_coins(xch_wallet_id, xch_per_offer_mojos, tolerance=0.25)
-        cat_existing = count_suitable_coins(cat_wallet_id, cat_per_offer_mojos, tolerance=0.25)
-
-        xch_to_create = max(0, num_buy_offers - xch_existing)
-        cat_to_create = max(0, num_sell_offers - cat_existing)
-
-        result['xch_coins_ready'] = xch_existing
-        result['cat_coins_ready'] = cat_existing
-
-        if xch_to_create == 0 and cat_to_create == 0:
-            result['success'] = True
-            result['message'] = "All coins already prepared!"
-            return result
-
-        if xch_to_create > 0:
-            update_progress(f"Splitting {xch_to_create} XCH coins...")
-            split_result = split_coins_bulk(
-                wallet_id=xch_wallet_id,
-                num_coins=xch_to_create,
-                coin_size_mojos=xch_per_offer_mojos,
-                fee_mojos=get_effective_transaction_fee_mojos()
-            )
-            if not split_result or not split_result.get("success"):
-                result['message'] = f"Failed to split XCH coins"
-                return result
-            result['xch_coins_created'] = xch_to_create
-
-            confirmed = wait_for_coin_confirmations(
-                wallet_id=xch_wallet_id,
-                target_coin_size_mojos=xch_per_offer_mojos,
-                target_count=num_buy_offers,
-                max_wait_seconds=180,
-            )
-            if not confirmed:
-                result['message'] = "Timeout waiting for XCH coins"
-                return result
-            result['xch_coins_ready'] = count_suitable_coins(xch_wallet_id, xch_per_offer_mojos)
-
-        if cat_to_create > 0:
-            update_progress(f"Splitting {cat_to_create} CAT coins...")
-            split_result = split_coins_bulk(
-                wallet_id=cat_wallet_id,
-                num_coins=cat_to_create,
-                coin_size_mojos=cat_per_offer_mojos,
-                fee_mojos=get_effective_transaction_fee_mojos()
-            )
-            if not split_result or not split_result.get("success"):
-                result['message'] = f"Failed to split CAT coins"
-                return result
-            result['cat_coins_created'] = cat_to_create
-
-            confirmed = wait_for_coin_confirmations(
-                wallet_id=cat_wallet_id,
-                target_coin_size_mojos=cat_per_offer_mojos,
-                target_count=num_sell_offers,
-                max_wait_seconds=180,
-            )
-            if not confirmed:
-                result['message'] = "Timeout waiting for CAT coins"
-                return result
-            result['cat_coins_ready'] = count_suitable_coins(cat_wallet_id, cat_per_offer_mojos)
-
-        result['success'] = True
-        result['message'] = f"✅ Created {result['xch_coins_created']} XCH and {result['cat_coins_created']} CAT coins!"
-        return result
-
-    except Exception as e:
-        result['message'] = f"Error preparing coins: {e}"
-        import traceback
-        print(traceback.format_exc())
-        return result

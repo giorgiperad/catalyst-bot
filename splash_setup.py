@@ -208,7 +208,10 @@ def download_splash(progress_callback: Callable = None) -> Dict:
     install_path = info["install_path"]
 
     try:
-        r = requests.get(download_url, stream=True, timeout=60)
+        # (connect, read) — a 30s stall on the body is enough to declare the
+        # download dead.  Without a read timeout a stalled connection can
+        # hang the download thread indefinitely.
+        r = requests.get(download_url, stream=True, timeout=(15, 30))
         r.raise_for_status()
 
         total = int(r.headers.get("content-length", download_size))

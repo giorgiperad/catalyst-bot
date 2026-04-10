@@ -574,7 +574,10 @@ def _fetch_tibet_pool(asset_id: str, decimals: int = 3) -> Optional[Dict]:
             if pair_asset.startswith("0x"):
                 pair_asset = pair_asset[2:]
 
-            if pair_asset == normalized or pair_asset.rstrip("0") == normalized.rstrip("0"):
+            # Exact match only — never strip trailing zeros from hex
+            # asset IDs (distinct CATs can differ only in trailing hex
+            # digits, and rstrip("0") would collide them).
+            if pair_asset == normalized:
                 xch_raw = _safe_float(pair.get("xch_reserve", 0))
                 tok_raw = _safe_float(pair.get("token_reserve", 0))
 
@@ -858,33 +861,54 @@ def _fetch_spacescan_data(asset_id: str) -> Optional[Dict]:
         if h_idx < len(holder_attempts) - 1:
             time.sleep(1)
 
-        # ---- Activity (Pro API, with legacy + plural endpoint fallback) ----
-        time.sleep(1)
-        activity_errors: List[str] = []
-        activity_attempts = [
-            ("/token/activity", {"asset_id": asset_id, "type": "transfer", "count": 100}, "activity"),
-            (f"/token/activities/{asset_id}", {"count": 100}, "activities"),
-        ]
-        for endpoint, params, label in activity_attempts:
-            data, err = _spacescan_smart_get(
-                pro_url,
-                endpoint,
-                params=params,
-                headers=pro_headers,
-                retries=1,
+    # ---- Activity ----
+    # F39 (2026-04-08): fixed indentation — was previously nested INSIDE
+    # the holders loop, so it ran once per holder attempt and only ever
+    # used the pro URL (ignoring the free fallback). Now it runs ONCE
+    # and tries pro then free, like the holders block above.
+    time.sleep(1)
+    activity_errors: List[str] = []
+    activity_attempts: List[tuple] = []
+    if api_key:
+        activity_attempts.append(
+            (pro_url, "/token/activity",
+             {"asset_id": asset_id, "type": "transfer", "count": 100},
+             pro_headers, "pro-legacy")
+        )
+        activity_attempts.append(
+            (pro_url, f"/token/activities/{asset_id}",
+             {"count": 100}, pro_headers, "pro-plural")
+        )
+    activity_attempts.append(
+        (free_url, f"/token/activities/{asset_id}",
+         {"count": 100}, free_headers, "free")
+    )
+    for base_url, endpoint, params, headers, label in activity_attempts:
+        data, err = _spacescan_smart_get(
+            base_url, endpoint, params=params, headers=headers, retries=1,
+        )
+        if data:
+            result["activity_count"] = _spacescan_count_from_payload(
+                data,
+                count_keys=["activity_count", "activities", "count", "total", "total_count"],
+                list_keys=["data", "activities", "items", "results"],
             )
-            if data:
-                result["activity_count"] = _spacescan_count_from_payload(
-                    data,
-                    count_keys=["activity_count", "activities", "count", "total", "total_count"],
-                    list_keys=["data", "activities", "items", "results"],
-                )
+            if result["activity_count"] > 0:
                 break
-            if err:
-                activity_errors.append(f"{label}: {err}")
+        if err:
+            activity_errors.append(f"{label}: {err}")
 
-        if result["activity_count"] == 0 and activity_errors:
-            print(f"[MARKET_DATA] Spacescan activity failed: {' | '.join(activity_errors)}")
+    if result["activity_count"] == 0 and activity_errors:
+        print(f"[MARKET_DATA] Spacescan activity failed: {' | '.join(activity_errors)}")
+
+    # F40 (2026-04-08): supply data lives inside /token/info/{id}'s
+    # `supply.{total_supply, circulating_supply}` block — verified live
+    # against api.spacescan.io for MZ. The dedicated /cat/total-supply
+    # and /cat/circulating-supply endpoints DO NOT EXIST on Spacescan
+    # (both 404 for any CAT). The /token/info parser at the top of this
+    # function already pulls both fields out via supply.get("..."), so
+    # no fallback is needed. If the values are still 0 here it means
+    # /token/info itself failed for this CAT.
 
     return result
 

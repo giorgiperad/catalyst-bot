@@ -1,5 +1,5 @@
 """
-Chia Market Maker â€” Desktop Application Entry Point (V4)
+CATalyst — Desktop Application Entry Point (V4)
 
 This is the main launcher for the desktop app. It:
 1. Starts Flask (api_server.py) in a background thread on localhost:5000
@@ -74,7 +74,7 @@ def _bundle_path(relative: str) -> str:
 # ---------------------------------------------------------------------------
 # Version & constants
 # ---------------------------------------------------------------------------
-APP_NAME = "Chia Market Maker"
+APP_NAME = "CATalyst"
 APP_VERSION = "4.0.0"
 FLASK_HOST = "127.0.0.1"
 FLASK_PORT = 5000
@@ -84,6 +84,64 @@ WINDOW_MIN_WIDTH = 1000
 WINDOW_MIN_HEIGHT = 700
 _CONSOLE_HIDDEN = False
 _RESPAWN_ENV = "BOT_GUI_RESPAWNED_UNDER_PYTHONW"
+
+# Window geometry persistence — lives in the user data directory so
+# the setting survives installs to read-only locations like Program Files.
+try:
+    from user_paths import window_state_file as _window_state_file
+    _WINDOW_STATE_FILE = _window_state_file()
+except Exception:
+    _WINDOW_STATE_FILE = os.path.join(APP_DIR, ".window_state.json")
+
+
+def _load_window_state() -> dict:
+    """Return the last saved window size/position, or {} if none."""
+    try:
+        import json as _json
+        if not os.path.exists(_WINDOW_STATE_FILE):
+            return {}
+        with open(_WINDOW_STATE_FILE, "r", encoding="utf-8") as fh:
+            data = _json.load(fh)
+        if not isinstance(data, dict):
+            return {}
+        # Minimal validation — ignore obviously bad values
+        width = int(data.get("width", 0) or 0)
+        height = int(data.get("height", 0) or 0)
+        if width < WINDOW_MIN_WIDTH or height < WINDOW_MIN_HEIGHT:
+            return {}
+        if width > 8000 or height > 8000:
+            return {}
+        return {
+            "width": width,
+            "height": height,
+            "x": int(data.get("x", 0) or 0),
+            "y": int(data.get("y", 0) or 0),
+            "maximized": bool(data.get("maximized", False)),
+        }
+    except Exception as e:
+        print(f"[WINDOW] Could not load window state: {e}", flush=True)
+        return {}
+
+
+def _save_window_state(window) -> None:
+    """Persist the current window size/position to disk."""
+    if window is None:
+        return
+    try:
+        import json as _json
+        state = {
+            "width": int(getattr(window, "width", 0) or 0),
+            "height": int(getattr(window, "height", 0) or 0),
+            "x": int(getattr(window, "x", 0) or 0),
+            "y": int(getattr(window, "y", 0) or 0),
+        }
+        # Skip obviously invalid snapshots (e.g. minimized window reports 0/0)
+        if state["width"] < WINDOW_MIN_WIDTH or state["height"] < WINDOW_MIN_HEIGHT:
+            return
+        with open(_WINDOW_STATE_FILE, "w", encoding="utf-8") as fh:
+            _json.dump(state, fh)
+    except Exception as e:
+        print(f"[WINDOW] Could not save window state: {e}", flush=True)
 
 
 def _hide_windows_console() -> bool:
@@ -330,7 +388,12 @@ def run_desktop_mode(dev_mode: bool = False):
     # Wire up tray callbacks
     if tray:
         tray.on_show_dashboard = lambda: _show_window(webview)
-        tray.on_quit = lambda: _quit_app(webview, tray)
+        # Tray "Exit" now routes through the SAME graceful shutdown as the
+        # in-window X button: show the window, trigger the shutdown modal,
+        # and let the user confirm (or cancel) offer cancellation. This
+        # removes the previous inconsistency where tray exit silently
+        # bypassed the shutdown confirmation.
+        tray.on_quit = lambda: _tray_graceful_quit(webview, tray)
 
         # Phase 3: Start / Stop from tray — call Flask API and show window
         # Read the auth token from the environment (set by api_server at import time).
@@ -404,35 +467,123 @@ def run_desktop_mode(dev_mode: bool = False):
         print(f"  Warning: JS bridge failed to load: {e}")
         bridge = None
 
-    # Create window â€” this is a PyWebView window pointing at Flask
-    window = webview.create_window(
+    # Restore last-saved window geometry if we have one
+    _saved_state = _load_window_state()
+    _win_width  = _saved_state.get("width",  WINDOW_WIDTH)
+    _win_height = _saved_state.get("height", WINDOW_HEIGHT)
+    _win_x      = _saved_state.get("x")
+    _win_y      = _saved_state.get("y")
+
+    # Show a local splash page first (logo + "created by MonkeyZoo") so the
+    # window doesn't flash black while the WebView2 backend boots and Flask's
+    # first HTML render lands. The splash auto-redirects to the Flask URL
+    # after a brief delay (see splash.html).
+    _splash_path = _bundle_path("splash.html")
+    if os.path.exists(_splash_path):
+        _initial_url = "file:///" + _splash_path.replace("\\", "/")
+    else:
+        _initial_url = f"http://{FLASK_HOST}:{FLASK_PORT}/"
+
+    _create_window_kwargs = dict(
         title=APP_NAME,
-        url=f"http://{FLASK_HOST}:{FLASK_PORT}/",
-        js_api=bridge,            # Exposes bridge as window.pywebview.api
-        width=WINDOW_WIDTH,
-        height=WINDOW_HEIGHT,
+        url=_initial_url,
+        js_api=bridge,
+        width=_win_width,
+        height=_win_height,
         min_size=(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT),
         resizable=True,
         frameless=True,
-        shadow=True,              # Enables DWM frame on Windows â€” gives resize handles in frameless mode
-        easy_drag=False,          # Off â€” titlebar CSS (-webkit-app-region: drag) handles dragging
+        shadow=True,
+        easy_drag=False,
         text_select=False,
         background_color="#0B0E14",
     )
+    # Only pass x/y if we actually have a saved position — PyWebView will
+    # centre on primary display otherwise, which is the correct default.
+    if _win_x is not None and _win_y is not None:
+        _create_window_kwargs["x"] = _win_x
+        _create_window_kwargs["y"] = _win_y
 
-    # Close button = graceful shutdown (stop bot, kill Flask, exit)
-    # No minimize-to-tray on close â€” users expect X to mean close.
+    window = webview.create_window(**_create_window_kwargs)
+
+    # Close button = graceful shutdown (stop bot, kill Flask, exit).
+    # We also snapshot the window geometry here so the next launch
+    # restores the same size/position.
+    #
+    # Alt+F4 protection: if the bot is running and the user has not yet
+    # acknowledged the shutdown modal, we cancel the close and bounce
+    # through the in-GUI modal first. Only when the modal has finished
+    # its graceful sequence (and sets _state["confirmed_close"]=True) do
+    # we let the window actually close.
+    _state["confirmed_close"] = False
+
     def on_closing():
-        print("\n  Window closing â€” shutting down...")
-        _cleanup()
-        if tray:
+        # If the user already confirmed via the modal, let it through.
+        if _state.get("confirmed_close"):
             try:
-                tray.stop()
+                _save_window_state(window)
             except Exception:
                 pass
-        return True  # Allow the window to close
+            _cleanup()
+            if tray:
+                try:
+                    tray.stop()
+                except Exception:
+                    pass
+            return True
+
+        # Check whether the bot is actually running. If not, we can
+        # close immediately — there's nothing to gracefully shut down.
+        bot_running = False
+        try:
+            import api_server as _api
+            if _api.bot and getattr(_api.bot, "_running", False):
+                bot_running = True
+        except Exception:
+            pass
+
+        if not bot_running:
+            # Safe path — save state and close.
+            try:
+                _save_window_state(window)
+            except Exception:
+                pass
+            _cleanup()
+            if tray:
+                try:
+                    tray.stop()
+                except Exception:
+                    pass
+            return True
+
+        # Bot is running — route through the in-GUI shutdown modal.
+        try:
+            window.show()
+            window.restore()
+            window.evaluate_js("window.showShutdownModal && window.showShutdownModal();")
+            print("\n  Alt+F4 intercepted — showing shutdown confirmation.", flush=True)
+        except Exception as e:
+            print(f"  [CLOSE] Could not show shutdown modal: {e}", flush=True)
+            # Fall back to hard close so the user isn't trapped
+            try:
+                _save_window_state(window)
+            except Exception:
+                pass
+            _cleanup()
+            return True
+        # Cancel this close event — the modal will set confirmed_close
+        # and re-invoke the close when it finishes the graceful sequence.
+        return False
 
     window.events.closing += on_closing
+    # Expose the confirm flag to the JS side via the bridge.
+    # The shutdown modal's "Shutdown App" button sets this before
+    # re-triggering close, so a second on_closing() call is honoured.
+    if bridge is not None:
+        try:
+            bridge._set_confirmed_close = lambda: _state.update({"confirmed_close": True})
+        except Exception:
+            pass
 
     # Store window reference for tray callbacks
     _state["window"] = window
@@ -507,7 +658,7 @@ def _show_window(webview_module):
 
 
 def _quit_app(webview_module, tray):
-    """Clean shutdown from tray quit action."""
+    """Clean shutdown from tray quit action (fallback for non-graceful paths)."""
     _cleanup()
     try:
         # Destroy all webview windows
@@ -519,6 +670,38 @@ def _quit_app(webview_module, tray):
         tray.stop()
     # Force exit after brief cleanup window
     threading.Timer(2.0, lambda: os._exit(0)).start()
+
+
+def _tray_graceful_quit(webview_module, tray):
+    """Tray-initiated graceful quit.
+
+    Shows the main window and triggers the in-GUI shutdown modal via the
+    JS bridge.  If the window/bridge isn't available, falls back to the
+    older hard _quit_app path.  This way tray Exit behaves exactly like
+    clicking the X button in the custom titlebar — letting users cancel
+    offers first if the bot is running.
+    """
+    window = _state.get("window")
+    if not window:
+        # No window — nothing to show, just quit.
+        _quit_app(webview_module, tray)
+        return
+
+    try:
+        # Bring the window up so the modal is visible.
+        window.show()
+        window.restore()
+    except Exception:
+        pass
+
+    try:
+        # Trigger the same shutdown modal the X button uses.
+        window.evaluate_js(
+            "window.showShutdownModal && window.showShutdownModal();"
+        )
+    except Exception as e:
+        print(f"[TRAY] Graceful quit via JS bridge failed: {e}", flush=True)
+        _quit_app(webview_module, tray)
 
 
 def _cleanup():
@@ -538,7 +721,7 @@ def _cleanup():
         pass
 
 
-def _poll_tray_status(tray, interval: float = 10.0):
+def _poll_tray_status(tray, interval: float = 3.0):
     """
     Phase 3: Background thread that polls /api/status every `interval` seconds
     and calls tray.update_tray_state() to keep the icon/tooltip/menu current.
@@ -655,22 +838,69 @@ def main(argv=None):
             run_desktop_mode(dev_mode=args.dev)
         return 0
     except Exception as e:
-        # Log crash to file so we can diagnose even if console is hidden
+        # Log crash to file so we can diagnose even if console is hidden.
+        # The crash log lives under the user data directory so it's
+        # writable regardless of install location.
         import traceback
-        crash_log = os.path.join(APP_DIR, "crash.log")
-        with open(crash_log, "w") as f:
-            f.write(f"Chia Market Maker V4 â€” Crash Report\n")
-            f.write(f"{'=' * 50}\n")
-            f.write(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Error: {e}\n\n")
-            traceback.print_exc(file=f)
-        fatal_msg = f"CRASH: {e}\n\nDetails saved to:\n{crash_log}"
+        try:
+            from user_paths import crash_log_file
+            crash_log = crash_log_file()
+        except Exception:
+            crash_log = os.path.join(APP_DIR, "crash.log")
+
+        # Capture the full traceback as a string so we can include it
+        # in the crash dialog as well as the file.
+        tb_str = traceback.format_exc()
+
+        # Write the crash log — UTF-8 encoded with ASCII-safe fallbacks
+        # so the handler itself never crashes on cp1252 Windows locales.
+        try:
+            with open(crash_log, "w", encoding="utf-8", errors="replace") as f:
+                f.write("CATalyst V4 - Crash Report\n")
+                f.write("=" * 50 + "\n")
+                f.write(f"Time:    {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Version: {APP_VERSION}\n")
+                f.write(f"Python:  {sys.version}\n")
+                f.write(f"Platform: {sys.platform}\n")
+                f.write(f"Install: {APP_DIR}\n")
+                try:
+                    from user_paths import data_dir as _dd
+                    f.write(f"Data:    {_dd()}\n")
+                except Exception:
+                    pass
+                f.write("\n")
+                f.write(f"Error: {e}\n\n")
+                f.write("Traceback:\n")
+                f.write(tb_str)
+        except Exception as write_err:
+            # Last-ditch: if we can't write the log file, at least print
+            # the traceback to stderr so `--show-console` users see it.
+            print(f"[CRASH] Could not write crash log to {crash_log}: {write_err}",
+                  file=sys.stderr, flush=True)
+            print(tb_str, file=sys.stderr, flush=True)
+
+        # Build a user-friendly message for the fatal dialog. Include
+        # the actual error text (not just the filename) so the user can
+        # read what went wrong without hunting for the log file.
+        short_err = str(e)[:300]
+        fatal_msg = (
+            f"The app crashed on startup.\n\n"
+            f"Error: {short_err}\n\n"
+            f"A full crash report has been saved to:\n{crash_log}\n\n"
+            f"If this keeps happening, please send the crash.log file to "
+            f"support so we can diagnose the issue."
+        )
+
         if _CONSOLE_HIDDEN:
             _show_fatal_error_dialog(fatal_msg)
         else:
             print(f"\n  CRASH: {e}")
+            print(f"  {tb_str}")
             print(f"  Details saved to: {crash_log}")
-            input("\n  Press Enter to close...")
+            try:
+                input("\n  Press Enter to close...")
+            except (EOFError, KeyboardInterrupt):
+                pass
         return 1
 
 

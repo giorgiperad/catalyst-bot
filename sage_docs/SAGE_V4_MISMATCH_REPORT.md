@@ -6,8 +6,8 @@ This document records only confirmed mismatches, high-confidence issues, and mis
 
 ### 1. Sage `initialize` lifecycle is not implemented
 - Affected files/functions:
-  - [wallet_sage.py](C:\Users\t_you\Pictures\01 Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py)
-  - [chia_node.py](C:\Users\t_you\Pictures\01 Monkeyzoo\chia_liquidity_bot_v2\v4\chia_node.py) `_log_in_fingerprint()`
+  - [wallet_sage.py](. Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py)
+  - [chia_node.py](. Monkeyzoo\chia_liquidity_bot_v2\v4\chia_node.py) `_log_in_fingerprint()`
 - Documentation basis:
   - `sage_docs/SAGE_AUDIT_CHECKLIST.md` requires calling `initialize` before wallet/data/transaction operations and handling failure explicitly.
 - Actual behavior:
@@ -19,7 +19,7 @@ This document records only confirmed mismatches, high-confidence issues, and mis
 
 ### 2. `get_pending_transactions()` does not use the documented Sage endpoint
 - Affected files/functions:
-  - [wallet_sage.py](C:\Users\t_you\Pictures\01 Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py) `get_pending_transactions()`
+  - [wallet_sage.py](. Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py) `get_pending_transactions()`
 - Documentation basis:
   - `sage_docs/SAGE_COMPLETE_REFERENCE.md` documents `get_pending_transactions` as the endpoint for unconfirmed transactions.
 - Actual behavior:
@@ -31,7 +31,7 @@ This document records only confirmed mismatches, high-confidence issues, and mis
 
 ### 3. `get_spendable_coin_count()` does not use the documented Sage endpoint
 - Affected files/functions:
-  - [wallet_sage.py](C:\Users\t_you\Pictures\01 Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py) `get_spendable_coin_count()`
+  - [wallet_sage.py](. Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py) `get_spendable_coin_count()`
 - Documentation basis:
   - `sage_docs/SAGE_COMPLETE_REFERENCE.md` documents `get_spendable_coin_count(asset_id) -> { count }`.
 - Actual behavior:
@@ -43,7 +43,7 @@ This document records only confirmed mismatches, high-confidence issues, and mis
 
 ### 4. `create_offer()` ignores `validate_only`
 - Affected files/functions:
-  - [wallet_sage.py](C:\Users\t_you\Pictures\01 Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py) `create_offer()`
+  - [wallet_sage.py](. Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py) `create_offer()`
 - Documentation basis:
   - `sage_docs/SAGE_AUDIT_CHECKLIST.md` requires callers to distinguish construction, signing, and submission behavior.
 - Actual behavior:
@@ -56,7 +56,7 @@ This document records only confirmed mismatches, high-confidence issues, and mis
 
 ### 5. Sync/readiness logic invents undocumented `synced=None` behavior
 - Affected files/functions:
-  - [wallet_sage.py](C:\Users\t_you\Pictures\01 Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py) `get_wallet_sync_status()`
+  - [wallet_sage.py](. Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py) `get_wallet_sync_status()`
 - Documentation basis:
   - `sage_docs/SAGE_COMPLETE_REFERENCE.md` documents `get_sync_status` with `synced: true|false`.
 - Actual behavior:
@@ -71,7 +71,7 @@ This document records only confirmed mismatches, high-confidence issues, and mis
 
 ### 6. `cancel_offer()` treats undocumented error cases as success
 - Affected files/functions:
-  - [wallet_sage.py](C:\Users\t_you\Pictures\01 Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py) `cancel_offer()`
+  - [wallet_sage.py](. Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py) `cancel_offer()`
 - Documentation basis:
   - `sage_docs/SAGE_COMPLETE_REFERENCE.md` supports treating `404` missing offer as success.
 - Actual behavior:
@@ -82,7 +82,7 @@ This document records only confirmed mismatches, high-confidence issues, and mis
 
 ### 7. Exact `offer_id`-based reconciliation is available but not consistently used
 - Affected files/functions:
-  - [wallet_sage.py](C:\Users\t_you\Pictures\01 Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py)
+  - [wallet_sage.py](. Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py)
     - `get_owned_coins()`
     - `get_owned_coins_detailed()`
     - `get_selectable_coins_map()`
@@ -98,8 +98,8 @@ This document records only confirmed mismatches, high-confidence issues, and mis
 
 ### 8. Session lifecycle is compressed into `resync + login`
 - Affected files/functions:
-  - [wallet_sage.py](C:\Users\t_you\Pictures\01 Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py) `sage_login()`
-  - [chia_node.py](C:\Users\t_you\Pictures\01 Monkeyzoo\chia_liquidity_bot_v2\v4\chia_node.py) `_log_in_fingerprint()`
+  - [wallet_sage.py](. Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py) `sage_login()`
+  - [chia_node.py](. Monkeyzoo\chia_liquidity_bot_v2\v4\chia_node.py) `_log_in_fingerprint()`
 - Documentation basis:
   - `sage_docs/SAGE_AUDIT_CHECKLIST.md` separates initialization, login, active-fingerprint tracking, and startup-sensitive serialization.
 - Actual behavior:
@@ -112,7 +112,7 @@ This document records only confirmed mismatches, high-confidence issues, and mis
 
 ### 9. Watch-only wallets are not blocked from signing flows
 - Affected files/functions:
-  - [wallet_sage.py](C:\Users\t_you\Pictures\01 Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py)
+  - [wallet_sage.py](. Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py)
     - `get_sage_keys()`
     - `send_transaction()`
     - `send_transaction_multi()`
@@ -131,7 +131,7 @@ This document records only confirmed mismatches, high-confidence issues, and mis
 
 ### 10. Request-only offer fee rule is not enforced
 - Affected files/functions:
-  - [wallet_sage.py](C:\Users\t_you\Pictures\01 Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py) `create_offer()`
+  - [wallet_sage.py](. Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py) `create_offer()`
 - Documentation basis:
   - `sage_docs/SAGE_EDGE_CASES.md` says request-only offers are allowed only with a fee.
   - `sage_docs/SAGE_AUDIT_CHECKLIST.md` explicitly requires handling this rule.
@@ -144,7 +144,7 @@ This document records only confirmed mismatches, high-confidence issues, and mis
 
 ### 11. Send paths do not validate address/network correctness in the adapter
 - Affected files/functions:
-  - [wallet_sage.py](C:\Users\t_you\Pictures\01 Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py)
+  - [wallet_sage.py](. Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py)
     - `send_transaction()`
     - `send_transaction_multi()`
     - `send_cat_multi()`
@@ -160,8 +160,8 @@ This document records only confirmed mismatches, high-confidence issues, and mis
 
 ### 12. Initialization failure and retry edge cases are completely unhandled
 - Affected files/functions:
-  - [chia_node.py](C:\Users\t_you\Pictures\01 Monkeyzoo\chia_liquidity_bot_v2\v4\chia_node.py) `_log_in_fingerprint()`
-  - [wallet_sage.py](C:\Users\t_you\Pictures\01 Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py) `sage_login()`
+  - [chia_node.py](. Monkeyzoo\chia_liquidity_bot_v2\v4\chia_node.py) `_log_in_fingerprint()`
+  - [wallet_sage.py](. Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py) `sage_login()`
 - Documentation basis:
   - `sage_docs/SAGE_EDGE_CASES.md` says failed first init may block later retries and startup-sensitive operations should be serialized.
 - Actual behavior:

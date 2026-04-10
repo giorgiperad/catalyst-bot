@@ -4,7 +4,7 @@ This checklist is implementation-oriented. Every item below maps to a confirmed 
 
 ## 1. Implement Sage initialization lifecycle
 - Priority: P0
-- File: [chia_node.py](C:\Users\t_you\Pictures\01 Monkeyzoo\chia_liquidity_bot_v2\v4\chia_node.py), [wallet_sage.py](C:\Users\t_you\Pictures\01 Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py)
+- File: [chia_node.py](. Monkeyzoo\chia_liquidity_bot_v2\v4\chia_node.py), [wallet_sage.py](. Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py)
 - Function:
   - `_log_in_fingerprint()`
   - `sage_login()`
@@ -24,7 +24,7 @@ This checklist is implementation-oriented. Every item below maps to a confirmed 
 
 ## 2. Restore documented `get_pending_transactions` behavior
 - Priority: P0
-- File: [wallet_sage.py](C:\Users\t_you\Pictures\01 Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py)
+- File: [wallet_sage.py](. Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py)
 - Function: `get_pending_transactions()`
 - Exact change needed:
   - Remove the duplicate override.
@@ -39,7 +39,7 @@ This checklist is implementation-oriented. Every item below maps to a confirmed 
 
 ## 3. Restore documented `get_spendable_coin_count` behavior
 - Priority: P0
-- File: [wallet_sage.py](C:\Users\t_you\Pictures\01 Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py)
+- File: [wallet_sage.py](. Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py)
 - Function: `get_spendable_coin_count()`
 - Exact change needed:
   - Remove the duplicate override.
@@ -55,7 +55,7 @@ This checklist is implementation-oriented. Every item below maps to a confirmed 
 
 ## 4. Make `create_offer(validate_only=...)` behave correctly
 - Priority: P0
-- File: [wallet_sage.py](C:\Users\t_you\Pictures\01 Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py)
+- File: [wallet_sage.py](. Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py)
 - Function: `create_offer()`
 - Exact change needed:
   - Either implement a real non-submitting path for `validate_only`, or reject unsupported validate-only calls explicitly.
@@ -72,7 +72,7 @@ This checklist is implementation-oriented. Every item below maps to a confirmed 
 
 ## 5. Enforce Sage request-only offer fee rule
 - Priority: P0
-- File: [wallet_sage.py](C:\Users\t_you\Pictures\01 Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py)
+- File: [wallet_sage.py](. Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py)
 - Function: `create_offer()`
 - Exact change needed:
   - Detect request-only offers.
@@ -88,7 +88,7 @@ This checklist is implementation-oriented. Every item below maps to a confirmed 
 
 ## 6. Stop inferring sync readiness from undocumented `synced=None` heuristics
 - Priority: P1
-- File: [wallet_sage.py](C:\Users\t_you\Pictures\01 Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py)
+- File: [wallet_sage.py](. Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py)
 - Function: `get_wallet_sync_status()`
 - Exact change needed:
   - Remove undocumented promotion of `synced is None` to ready/synced.
@@ -106,7 +106,7 @@ This checklist is implementation-oriented. Every item below maps to a confirmed 
 
 ## 7. Restrict `cancel_offer()` success cases to documented behavior
 - Priority: P1
-- File: [wallet_sage.py](C:\Users\t_you\Pictures\01 Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py)
+- File: [wallet_sage.py](. Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py)
 - Function: `cancel_offer()`
 - Exact change needed:
   - Keep `404/missing offer` as success if desired.
@@ -124,7 +124,7 @@ This checklist is implementation-oriented. Every item below maps to a confirmed 
 
 ## 8. Prefer exact `offer_id`-based coin reconciliation
 - Priority: P1
-- File: [wallet_sage.py](C:\Users\t_you\Pictures\01 Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py)
+- File: [wallet_sage.py](. Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py)
 - Function:
   - `get_owned_coins_detailed()`
   - `get_owned_coins()`
@@ -144,7 +144,7 @@ This checklist is implementation-oriented. Every item below maps to a confirmed 
 
 ## 9. Block watch-only wallets from signing flows
 - Priority: P1
-- File: [wallet_sage.py](C:\Users\t_you\Pictures\01 Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py), [chia_node.py](C:\Users\t_you\Pictures\01 Monkeyzoo\chia_liquidity_bot_v2\v4\chia_node.py)
+- File: [wallet_sage.py](. Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py), [chia_node.py](. Monkeyzoo\chia_liquidity_bot_v2\v4\chia_node.py)
 - Function:
   - `get_sage_keys()`
   - `sage_login()`
@@ -166,7 +166,7 @@ This checklist is implementation-oriented. Every item below maps to a confirmed 
 
 ## 10. Validate addresses against intended network before send
 - Priority: P1
-- File: [wallet_sage.py](C:\Users\t_you\Pictures\01 Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py)
+- File: [wallet_sage.py](. Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py)
 - Function:
   - `send_transaction()`
   - `send_transaction_multi()`
@@ -185,7 +185,7 @@ This checklist is implementation-oriented. Every item below maps to a confirmed 
 
 ## 11. Add explicit init failure/retry handling
 - Priority: P1
-- File: [chia_node.py](C:\Users\t_you\Pictures\01 Monkeyzoo\chia_liquidity_bot_v2\v4\chia_node.py), [wallet_sage.py](C:\Users\t_you\Pictures\01 Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py)
+- File: [chia_node.py](. Monkeyzoo\chia_liquidity_bot_v2\v4\chia_node.py), [wallet_sage.py](. Monkeyzoo\chia_liquidity_bot_v2\v4\wallet_sage.py)
 - Function:
   - `_log_in_fingerprint()`
   - `sage_login()`

@@ -417,7 +417,11 @@ class RuntimeMonitor:
         except Exception:
             pass
 
-        pattern = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_superlog_*.log")
+        try:
+            from user_paths import log_dir as _user_log_dir
+            pattern = os.path.join(_user_log_dir(), "bot_superlog_*.log")
+        except Exception:
+            pattern = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_superlog_*.log")
         matches = sorted(glob.glob(pattern))
         return matches[-1] if matches else ""
 

@@ -3,26 +3,26 @@
 ## Top 5 Sage integration problems
 
 1. The project does not implement the documented Sage initialization lifecycle.
-   - [chia_node.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/chia_node.py) and [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py) currently treat `resync + login` as the effective startup path, with no explicit `initialize` handling.
+   - [chia_node.py](/./chia_node.py) and [wallet_sage.py](/./wallet_sage.py) currently treat `resync + login` as the effective startup path, with no explicit `initialize` handling.
 
 2. Two documented Sage adapter helpers are shadowed by duplicate definitions that use heuristics instead of the documented endpoints.
-   - In [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py), the live `get_pending_transactions()` uses `get_transactions` heuristics instead of `get_pending_transactions`, and the live `get_spendable_coin_count()` uses `get_coins` instead of `get_spendable_coin_count`.
+   - In [wallet_sage.py](/./wallet_sage.py), the live `get_pending_transactions()` uses `get_transactions` heuristics instead of `get_pending_transactions`, and the live `get_spendable_coin_count()` uses `get_coins` instead of `get_spendable_coin_count`.
 
 3. `create_offer()` does not match its public contract or documented Sage expectations.
-   - [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py) `create_offer()` ignores `validate_only` and does not enforce the documented request-only-offers-require-a-fee rule.
+   - [wallet_sage.py](/./wallet_sage.py) `create_offer()` ignores `validate_only` and does not enforce the documented request-only-offers-require-a-fee rule.
 
 4. Signing safety is incomplete.
    - The adapter exposes `has_secrets` for Sage keys but does not appear to block signing operations for watch-only wallets before send, offer, cancel, split, or combine flows.
 
 5. Readiness and cancel semantics include undocumented assumptions.
-   - [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py) `get_wallet_sync_status()` invents `synced=None` readiness logic, and `cancel_offer()` treats undocumented `500` and `202` responses as probable success.
+   - [wallet_sage.py](/./wallet_sage.py) `get_wallet_sync_status()` invents `synced=None` readiness logic, and `cancel_offer()` treats undocumented `500` and `202` responses as probable success.
 
 ## Safest first implementation batch
 
 Batch 2: Pending and spendable endpoint corrections
 
 Why this is the safest first batch:
-- it is limited to [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py)
+- it is limited to [wallet_sage.py](/./wallet_sage.py)
 - it only touches two helper functions and their duplicate shadowing definitions
 - repository search confirmed:
   - `get_pending_transactions()` callers do not pass `wallet_id`
@@ -67,7 +67,7 @@ Why it is highest risk:
 
 ## Top things Claude must not accidentally break
 
-1. Public adapter shape in [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py), unless clearly wrong.
+1. Public adapter shape in [wallet_sage.py](/./wallet_sage.py), unless clearly wrong.
    - Keep return types and public entry points stable where possible.
 
 2. Caller compatibility for existing Sage helper usage.

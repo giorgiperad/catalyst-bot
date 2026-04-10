@@ -47,7 +47,6 @@ from wallet import (
     split_coins_rpc,
     get_transaction,
 )
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from coin_prep_utils import (
     should_extend_pending_consumed_split_grace,
     should_retry_unconsumed_split,
@@ -55,8 +54,6 @@ from coin_prep_utils import (
 from tx_fees import (
     fee_pool_enabled,
     get_effective_transaction_fee_mojos,
-    get_fee_coin_size_xch,
-    get_fee_pool_count,
     get_fee_tier_name,
 )
 
@@ -286,7 +283,6 @@ class CoinPrepWorker:
             self.log(f"   XCH prep coin size: {self.xch_coin_size} (+{self.coin_prep_headroom_pct}% headroom)")
 
         self.xch_reserve = Decimal(os.getenv("XCH_RESERVE", "0.03"))
-        self.xch_consolidate_threshold = int(os.getenv("XCH_CONSOLIDATE_THRESHOLD", "20"))
 
         # CAT settings — same approach, derive from bot config
         # CAT_DECIMALS is the canonical name; MZ_DECIMALS is the legacy alias kept for
@@ -317,34 +313,112 @@ class CoinPrepWorker:
 
         # CAT_RESERVE is the canonical name; MZ_RESERVE is the legacy alias.
         self.cat_reserve = Decimal(os.getenv("CAT_RESERVE") or os.getenv("MZ_RESERVE", "0"))
-        self.cat_consolidate_threshold = int(os.getenv("CAT_CONSOLIDATE_THRESHOLD", "20"))
 
         # --- Tier configuration (set by coin_manager.start_coin_prep) ---
-        tier_sizes_str = os.getenv("_CLI_TIER_SIZES")  # e.g. "inner=1.0,mid=0.5,outer=0.25,extreme=0.1"
-        tier_counts_str = os.getenv("_CLI_TIER_COUNTS")  # e.g. "inner=4,mid=16,outer=16,extreme=14"
+        tier_sizes_str = os.getenv("_CLI_TIER_SIZES")  # legacy shared sizes
+        # F62 (2026-04-09): per-side sizes. When both are provided they
+        # override --tier-sizes — XCH coin prep uses buy sizes, CAT coin
+        # prep uses sell sizes. Enables asymmetric ladders.
+        buy_tier_sizes_str  = os.getenv("_CLI_BUY_TIER_SIZES")
+        sell_tier_sizes_str = os.getenv("_CLI_SELL_TIER_SIZES")
+        tier_counts_str = os.getenv("_CLI_TIER_COUNTS")  # legacy: applies to BOTH sides
+        tier_counts_xch_str = os.getenv("_CLI_TIER_COUNTS_XCH")  # per-side XCH (buy ladder)
+        tier_counts_cat_str = os.getenv("_CLI_TIER_COUNTS_CAT")  # per-side CAT (sell ladder)
 
-        if tier_sizes_str and tier_counts_str:
+        def _parse_sizes(spec):
+            out = {}
+            if not spec:
+                return out
+            for pair in spec.split(","):
+                if "=" not in pair:
+                    continue
+                k, v = pair.split("=", 1)
+                try:
+                    out[k.strip()] = Decimal(v.strip())
+                except Exception:
+                    continue
+            return out
+
+        # Per-side counts take precedence; legacy --tier-counts is the fallback
+        # for both sides (symmetric prep).
+        any_tier_counts = bool(tier_counts_str or tier_counts_xch_str or tier_counts_cat_str)
+        any_tier_sizes = bool(tier_sizes_str or buy_tier_sizes_str or sell_tier_sizes_str)
+        if any_tier_sizes and any_tier_counts:
             self.tier_enabled = True
-            # Parse intended live tier sizes from the caller config.
-            self.offer_tier_xch_sizes = {}
-            for pair in tier_sizes_str.split(","):
-                k, v = pair.split("=")
-                self.offer_tier_xch_sizes[k.strip()] = Decimal(v.strip())
-
-            # Prepared tier coins get extra headroom above the live offer size.
-            self.tier_xch_sizes = {
-                tier_name: self._apply_prep_headroom_xch(size_xch)
-                for tier_name, size_xch in self.offer_tier_xch_sizes.items()
+            # Parse intended live tier sizes from the caller config. When
+            # per-side strings are present they take priority; otherwise
+            # fall back to the legacy shared --tier-sizes.
+            _legacy_live_sizes = _parse_sizes(tier_sizes_str)
+            self.offer_tier_xch_sizes_buy  = _parse_sizes(buy_tier_sizes_str)  or dict(_legacy_live_sizes)
+            self.offer_tier_xch_sizes_sell = _parse_sizes(sell_tier_sizes_str) or dict(_legacy_live_sizes)
+            # `offer_tier_xch_sizes` remains as a MAX-of-both-sides view
+            # that legacy code paths (tier_order, status reports) consume.
+            # Individual coin splitting uses the per-side dicts.
+            all_tier_names = set(self.offer_tier_xch_sizes_buy) | set(self.offer_tier_xch_sizes_sell)
+            self.offer_tier_xch_sizes = {
+                tn: max(
+                    self.offer_tier_xch_sizes_buy.get(tn, Decimal("0")),
+                    self.offer_tier_xch_sizes_sell.get(tn, Decimal("0")),
+                )
+                for tn in all_tier_names
             }
 
-            # Parse tier counts: {tier_name: int}
-            self.tier_counts = {}
-            for pair in tier_counts_str.split(","):
-                k, v = pair.split("=")
-                self.tier_counts[k.strip()] = int(v.strip())
+            # Prepared tier coins get extra headroom above the live offer size.
+            # Per-side prep sizes are built from the per-side live sizes so
+            # XCH coins are prepped at buy sizes and CAT coins at sell sizes.
+            self.tier_xch_sizes_buy = {
+                tier_name: self._apply_prep_headroom_xch(size_xch)
+                for tier_name, size_xch in self.offer_tier_xch_sizes_buy.items()
+            }
+            self.tier_xch_sizes_sell = {
+                tier_name: self._apply_prep_headroom_xch(size_xch)
+                for tier_name, size_xch in self.offer_tier_xch_sizes_sell.items()
+            }
+            # Legacy `tier_xch_sizes` for back-compat — defaults to the
+            # BUY-side values since this was historically the XCH side.
+            self.tier_xch_sizes = dict(self.tier_xch_sizes_buy)
 
-            # Derive CAT sizes per tier from XCH sizes / price × 1.2 buffer
+            def _parse_counts(spec):
+                out = {}
+                if not spec:
+                    return out
+                for pair in spec.split(","):
+                    if "=" not in pair:
+                        continue
+                    k, v = pair.split("=", 1)
+                    try:
+                        out[k.strip()] = int(v.strip())
+                    except ValueError:
+                        continue
+                return out
+
+            legacy_counts = _parse_counts(tier_counts_str)
+            self.xch_tier_counts = _parse_counts(tier_counts_xch_str) if tier_counts_xch_str else dict(legacy_counts)
+            self.cat_tier_counts = _parse_counts(tier_counts_cat_str) if tier_counts_cat_str else dict(legacy_counts)
+
+            # Build a unified `tier_counts` for legacy code paths that still
+            # consume a single dict. Use max() so per-amount partition logic
+            # never under-allocates either side.
+            all_tier_names = set(self.xch_tier_counts) | set(self.cat_tier_counts) | set(legacy_counts)
+            self.tier_counts = {
+                tn: max(
+                    int(self.xch_tier_counts.get(tn, 0) or 0),
+                    int(self.cat_tier_counts.get(tn, 0) or 0),
+                )
+                for tn in all_tier_names
+            }
+
+            # Derive CAT sizes per tier from XCH sizes / price × headroom
             self.tier_cat_sizes = self._derive_tier_cat_sizes()
+            # Drop any CAT counts for tiers that have no CAT size (e.g. fees,
+            # which is XCH-only). Avoids accidentally trying to multi-send CAT
+            # for an XCH-only tier.
+            self.cat_tier_counts = {
+                tn: cnt
+                for tn, cnt in self.cat_tier_counts.items()
+                if self.tier_cat_sizes.get(tn, Decimal("0")) > 0
+            }
+
             self.tier_order = sorted(
                 self.offer_tier_xch_sizes.keys(),
                 key=lambda t: self.offer_tier_xch_sizes[t],
@@ -352,34 +426,32 @@ class CoinPrepWorker:
             )
 
             # Update totals for pool creation
-            self.xch_target_coins = sum(self.tier_counts.values())
-            self.cat_target_coins = sum(
-                count
-                for tier_name, count in self.tier_counts.items()
-                if self.tier_cat_sizes.get(tier_name, Decimal("0")) > 0
-            )
+            self.xch_target_coins = sum(self.xch_tier_counts.values())
+            self.cat_target_coins = sum(self.cat_tier_counts.values())
 
             self.log(f"\n   🏗️ TIER MODE:")
             for tn in self.tier_order:
-                cnt = self.tier_counts.get(tn, 0)
+                xcnt = int(self.xch_tier_counts.get(tn, 0) or 0)
+                ccnt = int(self.cat_tier_counts.get(tn, 0) or 0)
                 live_xsz = self.offer_tier_xch_sizes.get(tn, Decimal("0"))
                 prep_xsz = self.tier_xch_sizes.get(tn, Decimal("0"))
                 csz = self.tier_cat_sizes.get(tn, Decimal("0"))
                 if csz > 0:
                     self.log(
-                        f"     {tn}: {cnt} coins × {live_xsz} XCH live "
-                        f"→ {prep_xsz} XCH prep / {csz:,.0f} CAT prep"
+                        f"     {tn}: XCH={xcnt} × {prep_xsz} / CAT={ccnt} × {csz:,.0f} "
+                        f"(live size {live_xsz} XCH)"
                     )
                 else:
                     self.log(
-                        f"     {tn}: {cnt} coins × {live_xsz} XCH live "
-                        f"→ {prep_xsz} XCH prep / XCH-only pool"
+                        f"     {tn}: XCH={xcnt} × {prep_xsz} (live size {live_xsz} XCH, XCH-only pool)"
                     )
         else:
             self.tier_enabled = False
             self.offer_tier_xch_sizes = {}
             self.tier_xch_sizes = {}
             self.tier_counts = {}
+            self.xch_tier_counts = {}
+            self.cat_tier_counts = {}
             self.tier_cat_sizes = {}
             self.tier_order = []
 
@@ -389,9 +461,11 @@ class CoinPrepWorker:
         # Thread-safe status updates
         self.status_lock = threading.Lock()
         
-        # Internally we still expect one leftover reserve/change coin per side
-        # once prep is finished, but the GUI targets should reflect the
-        # prepared trading coins the user asked for, not "target + 1".
+        # The wallet always ends prep with one extra leftover coin per side —
+        # the change/reserve coin that doubles as the topup buffer for coin
+        # management. Surface that in the GUI target so the "Coins Ready"
+        # display matches the actual wallet state (e.g. 111/111 instead of
+        # 111/110).
         self.xch_expected_total_coins = self.xch_target_coins + 1
         self.cat_expected_total_coins = self.cat_target_coins + 1
 
@@ -401,9 +475,9 @@ class CoinPrepWorker:
             progress=0.0,
             message="Initializing...",
             xch_coins_current=0,
-            xch_coins_target=self.xch_target_coins,
+            xch_coins_target=self.xch_expected_total_coins,
             cat_coins_current=0,
-            cat_coins_target=self.cat_target_coins,
+            cat_coins_target=self.cat_expected_total_coins,
             timestamp=time.time()
         )
         
@@ -443,8 +517,8 @@ class CoinPrepWorker:
         self.cat_expected_total_coins = self.cat_target_coins + 1
         if hasattr(self, "status"):
             with self.status_lock:
-                self.status.xch_coins_target = self.xch_target_coins
-                self.status.cat_coins_target = self.cat_target_coins
+                self.status.xch_coins_target = self.xch_expected_total_coins
+                self.status.cat_coins_target = self.cat_expected_total_coins
 
     @staticmethod
     def _prepared_coin_count_from_total(total_count: int) -> int:
@@ -692,7 +766,10 @@ class CoinPrepWorker:
             return plan
 
         for tier_name in self.tier_order:
-            expected_count = int(self.tier_counts.get(tier_name, 0) or 0)
+            if wallet_type == "xch":
+                expected_count = int(self.xch_tier_counts.get(tier_name, 0) or 0)
+            else:
+                expected_count = int(self.cat_tier_counts.get(tier_name, 0) or 0)
             if expected_count <= 0:
                 continue
             if wallet_type == "xch":
@@ -706,29 +783,78 @@ class CoinPrepWorker:
         return plan
 
     def _partition_coins_for_designation(self, coins, wallet_type: str):
-        """Allocate coins to tiers by exact amount and expected counts."""
+        """Allocate coins to tiers by tier amount and expected counts.
+
+        F60 (2026-04-09): fuzzy amount matching. Previously this was an
+        EXACT amount-match lookup (plan keyed by `int(size × 1e12)`), but
+        Sage's split + multi_send flow can deduct a single transaction fee
+        from the pool coin mid-flight, leaving each output N-fee_mojos
+        smaller than the plan expects. On fee coins (50 × 0.001 XCH) the
+        discrepancy was ~261,582 mojos per coin — small in absolute terms
+        but enough to make the exact-match fall through. Result: the whole
+        fees tier ended up in `unmatched` and got merged back into reserve
+        by `_merge_xch_fee_change_into_reserve`, leaving the bot with 50
+        fewer coins than the run had actually successfully prepared.
+
+        Fix: for each coin, find the CLOSEST plan amount within a relative
+        tolerance (1% or ±10,000,000 mojos, whichever is smaller). This
+        handles both large-tier coins (where 1% is generous) and tiny fee
+        coins (where 10M mojos = 0.00001 XCH is enough slack for the fee
+        to be absorbed).
+        """
         plan = self._build_tier_amount_plan(wallet_type)
-        coins_by_amount = {}
-        for coin in coins or []:
-            amount = coin.get("amount", 0)
-            if amount <= 0:
-                continue
-            coins_by_amount.setdefault(amount, []).append(coin)
+        # Build a flat list of (plan_amount, tier_name, expected_count) so
+        # we can find the closest plan entry for each coin.
+        plan_entries = []  # list[(amount:int, tier:str, expected:int)]
+        for plan_amount, specs in plan.items():
+            for tier_name, expected in specs:
+                plan_entries.append((int(plan_amount), tier_name, int(expected)))
+
+        # Tolerance: 1% of the plan amount, or a minimum of 10M mojos
+        # (0.00001 XCH) to cover typical single-tx fees on tiny fee coins.
+        def _within_tolerance(coin_amount: int, plan_amount: int) -> bool:
+            if plan_amount <= 0:
+                return False
+            abs_tol = max(int(plan_amount * 0.01), 10_000_000)
+            return abs(coin_amount - plan_amount) <= abs_tol
+
+        # Sort coins by amount descending so biggest tiers get first pick
+        # (prevents a mid-sized coin stealing an extreme slot, etc.)
+        all_coins = sorted(
+            [c for c in (coins or []) if c.get("amount", 0) > 0],
+            key=lambda c: c.get("amount", 0),
+            reverse=True,
+        )
+
+        # Track remaining slots per (plan_amount, tier_name) so each plan
+        # entry can only absorb its expected count of coins.
+        slots_remaining = {
+            (amt, tier): exp for (amt, tier, exp) in plan_entries
+        }
 
         assigned = {}
         unmatched = []
 
-        for amount, amount_coins in coins_by_amount.items():
-            ordered = sorted(amount_coins, key=lambda c: c.get("coin_id", ""))
-            tier_specs = plan.get(amount, [])
-            cursor = 0
-            for tier_name, expected_count in tier_specs:
-                take = min(expected_count, max(0, len(ordered) - cursor))
-                if take > 0:
-                    assigned.setdefault(tier_name, []).extend(ordered[cursor:cursor + take])
-                    cursor += take
-            if cursor < len(ordered):
-                unmatched.extend(ordered[cursor:])
+        for coin in all_coins:
+            coin_amount = int(coin.get("amount", 0) or 0)
+            # Find the plan entry (amount, tier) that is within tolerance
+            # AND has remaining slots, picking the CLOSEST match.
+            best_key = None
+            best_diff = None
+            for (plan_amount, tier_name, _exp) in plan_entries:
+                if slots_remaining.get((plan_amount, tier_name), 0) <= 0:
+                    continue
+                if not _within_tolerance(coin_amount, plan_amount):
+                    continue
+                diff = abs(coin_amount - plan_amount)
+                if best_diff is None or diff < best_diff:
+                    best_diff = diff
+                    best_key = (plan_amount, tier_name)
+            if best_key is not None:
+                assigned.setdefault(best_key[1], []).append(coin)
+                slots_remaining[best_key] -= 1
+            else:
+                unmatched.append(coin)
 
         unmatched.sort(key=lambda c: c.get("amount", 0), reverse=True)
         return assigned, unmatched
@@ -927,7 +1053,11 @@ class CoinPrepWorker:
                 self.log(f"   DB VERIFY {wallet_type}: query failed: {ve}")
 
         try:
-            debug_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "designation_debug.json")
+            try:
+                from user_paths import data_dir as _dd
+                debug_path = os.path.join(_dd(), "designation_debug.json")
+            except Exception:
+                debug_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "designation_debug.json")
             from database import get_connection
             dconn = get_connection()
             debug_data = {"timestamp": datetime.now().isoformat()}
@@ -1021,7 +1151,14 @@ class CoinPrepWorker:
             self.log(f"   ⚠️ Price fetch failed for tier CAT sizes: {e}")
 
         if price and price > 0:
-            live_sizes = self.offer_tier_xch_sizes or self.tier_xch_sizes
+            # F62 (2026-04-09): CAT coin sizes come from the SELL side live
+            # tier sizes (sell offers lock CAT coins). Fall back to the
+            # buy/legacy sizes only when the sell-side dict is empty.
+            live_sizes = (
+                getattr(self, 'offer_tier_xch_sizes_sell', None)
+                or self.offer_tier_xch_sizes
+                or self.tier_xch_sizes
+            )
             for tier_name, xch_size in live_sizes.items():
                 if tier_name == get_fee_tier_name():
                     result[tier_name] = Decimal("0")
@@ -1032,7 +1169,7 @@ class CoinPrepWorker:
                 ).quantize(Decimal("1"))
                 result[tier_name] = cat_coin_size
             self.log(
-                f"   Tier CAT sizes derived from price {price} "
+                f"   Tier CAT sizes derived from SELL sizes at price {price} "
                 f"with +{self.coin_prep_headroom_pct}% headroom"
             )
         else:
@@ -1501,8 +1638,13 @@ class CoinPrepWorker:
             # Load protected offer IDs (written by graceful_pre_migration in api_server)
             protected_ids = set()
             try:
-                if os.path.exists("protected_offers.json"):
-                    with open("protected_offers.json", "r") as f:
+                try:
+                    from user_paths import protected_offers_file
+                    _protected_path = protected_offers_file()
+                except Exception:
+                    _protected_path = "protected_offers.json"
+                if os.path.exists(_protected_path):
+                    with open(_protected_path, "r", encoding="utf-8") as f:
                         data = json.load(f)
                     protected_ids = set(data.get("protected_ids", []))
                     ts = data.get("timestamp", 0)
@@ -1514,7 +1656,7 @@ class CoinPrepWorker:
                         self.log(f"  Protected offers file is stale ({age}s) — ignoring")
                         protected_ids = set()
             except Exception as e:
-                self.log(f"  Could not read protected_offers.json: {e}")
+                self.log(f"  Could not read protected_offers file: {e}")
             
             # Filter out protected offers (kept alive for market liquidity during migration)
             if protected_ids:
@@ -1531,10 +1673,15 @@ class CoinPrepWorker:
             
             cancel_count = len(trade_ids)
             
-            # Write IDs we're about to cancel to file, so bot can avoid false fill detection
+            # Write IDs we're about to cancel to file, so bot can avoid false fill detection.
+            # Lives under the user data dir so it's writable alongside bot.db.
             try:
-                worker_cancelled_file = "worker_cancelled_ids.json"
-                with open(worker_cancelled_file, "w") as f:
+                try:
+                    from user_paths import worker_cancelled_ids_file
+                    worker_cancelled_file = worker_cancelled_ids_file()
+                except Exception:
+                    worker_cancelled_file = "worker_cancelled_ids.json"
+                with open(worker_cancelled_file, "w", encoding="utf-8") as f:
                     json.dump({"cancelled_ids": trade_ids, "timestamp": time.time()}, f)
             except Exception:
                 pass  # Non-critical
@@ -1611,47 +1758,81 @@ class CoinPrepWorker:
                 self.log(f"No offers to verify")
                 return True
             
-            # VERIFICATION LOOP - Poll RPC until expected offers are gone
+            # VERIFICATION LOOP — poll RPC until expected offers are gone.
+            #
+            # F62 (2026-04-09): aggressive straggler re-cancel.
+            #
+            # The old flow polled for 300s and then gave up — if any offers
+            # were still active on-chain, it just logged TIMEOUT and moved
+            # on, leaving their backing coins locked. On a busy Chia mempool
+            # this left 4-10 offers stuck per run.
+            #
+            # New flow: poll for a short window (60s), and if any stragglers
+            # remain, re-submit cancel RPCs for them and poll again. Loop up
+            # to 3 rounds, total ~3 minutes max. This both speeds up the
+            # common case (cancels typically confirm in 1-2 blocks) and
+            # dramatically reduces the straggler count in the pathological
+            # case (re-submission lands most in the next block).
             pf_note = f", skipping {len(permanently_failed)} uncancellable" if permanently_failed else ""
             self.log(f"\nVERIFYING CANCELLATIONS... (checking {len(expected_cancelled_ids)} offers{pf_note})")
-            
-            max_wait = 300  # 5 minutes
+
+            per_round_wait = 60   # 60s per round (covers ~1-3 blocks)
+            max_rounds = 3        # total max wait ~ 3 min (vs old 5 min)
             check_interval = 5
-            elapsed = 0
-            
-            while elapsed < max_wait:
-                # Get current offers via RPC
-                current_offers = self.get_all_open_offers_rpc()
-                current_ids = [o["id"] for o in current_offers]
-                
-                # Only check offers we expect to have been cancelled
-                still_open = [tid for tid in expected_cancelled_ids if tid in current_ids]
-                
-                if not still_open:
-                    self.log(f"   ALL OFFERS CANCELLED! (verified after {elapsed}s)")
-                    if permanently_failed:
-                        self.log(f"   Note: {len(permanently_failed)} uncancellable offers remain open")
-                    return True
-                
-                # Log progress
-                remaining = len(still_open)
-                cancelled_so_far = len(expected_cancelled_ids) - remaining
-                self.log(f"   Progress: {cancelled_so_far}/{len(expected_cancelled_ids)} cancelled, {remaining} remaining ({elapsed}s)")
-                
-                time.sleep(check_interval)
-                elapsed += check_interval
-            
-            # Timeout check
-            final_offers = self.get_all_open_offers_rpc()
-            final_ids = [o["id"] for o in final_offers]
-            still_open = [tid for tid in expected_cancelled_ids if tid in final_ids]
-            
+            round_num = 1
+            still_open: list = list(expected_cancelled_ids)
+
+            while round_num <= max_rounds and still_open:
+                round_start = time.time()
+                elapsed = 0
+                while elapsed < per_round_wait:
+                    current_offers = self.get_all_open_offers_rpc()
+                    current_ids = [o["id"] for o in current_offers]
+                    still_open = [tid for tid in expected_cancelled_ids if tid in current_ids]
+                    if not still_open:
+                        total_elapsed = int(time.time() - round_start)
+                        self.log(f"   ALL OFFERS CANCELLED! (round {round_num}, {total_elapsed}s)")
+                        if permanently_failed:
+                            self.log(f"   Note: {len(permanently_failed)} uncancellable offers remain open")
+                        return True
+                    remaining = len(still_open)
+                    cancelled_so_far = len(expected_cancelled_ids) - remaining
+                    self.log(f"   Round {round_num}/{max_rounds}: {cancelled_so_far}/{len(expected_cancelled_ids)} cancelled, {remaining} remaining ({elapsed}s)")
+                    time.sleep(check_interval)
+                    elapsed += check_interval
+
+                # Round timed out with stragglers remaining — re-submit cancels
+                if still_open and round_num < max_rounds:
+                    self.log(f"\nRound {round_num} timed out with {len(still_open)} stragglers — re-submitting cancels...")
+                    try:
+                        re_results = cancel_offers_batch(still_open, secure=True)
+                        re_ok = sum(1 for tid in still_open if (re_results.get(tid, {}) or {}).get("success"))
+                        self.log(f"   Re-submit result: {re_ok}/{len(still_open)} accepted")
+                    except Exception as _re_err:
+                        self.log(f"   Re-submit failed: {_re_err}")
+                        # Fall back to individual re-cancels
+                        try:
+                            _ok = 0
+                            for _tid in still_open:
+                                try:
+                                    _r = rpc_cancel_offer(_tid, secure=True, timeout=60)
+                                    if _r and _r.get("success"):
+                                        _ok += 1
+                                except Exception:
+                                    pass
+                                time.sleep(0.3)
+                            self.log(f"   Individual re-submit: {_ok}/{len(still_open)} accepted")
+                        except Exception:
+                            pass
+                round_num += 1
+
+            # All rounds exhausted — log final state and proceed
             if still_open:
-                self.log(f"\nTIMEOUT: {len(still_open)} offers still open after {max_wait}s")
-                self.log(f"Proceeding anyway - consolidation may help")
+                self.log(f"\nTIMEOUT: {len(still_open)} offers still open after {max_rounds} rounds")
+                self.log(f"Proceeding anyway — consolidation will skip their locked coins")
             else:
                 self.log(f"\nAll cancellable offers confirmed!")
-            
+
             return True
             
         except Exception as e:
@@ -1739,6 +1920,31 @@ class CoinPrepWorker:
             self.log(f"❌ Consolidation error: {e}")
             return False
 
+    def _priority_combine_fee_mojos(self, coin_count: int) -> int:
+        """Return the tx fee (in mojos) to attach to a consolidation combine.
+
+        F61 (2026-04-09): large combines tend to land several Chia blocks
+        late because the tx is big (lots of input coins) and competes for
+        block space. Attach a slightly higher fee to push it toward the
+        front of the mempool queue. Scaling:
+          • < 20 coins  → base tx fee (no bump)
+          • 20-49 coins → 2× base
+          • 50-99 coins → 4× base
+          • ≥ 100 coins → 6× base
+
+        The multipliers cap at 6× so even a 500-coin combine only pays a
+        very small absolute amount (base fee is the user's
+        TRANSACTION_FEE_XCH which defaults to ~0.0000131 XCH).
+        """
+        base = max(0, int(self._tx_fee_mojos()))
+        if coin_count >= 100:
+            return base * 6
+        if coin_count >= 50:
+            return base * 4
+        if coin_count >= 20:
+            return base * 2
+        return base
+
     def _consolidate_wallet_sage(self, wallet_id: int, name: str) -> bool:
         """Consolidate coins via Sage's native endpoints.
 
@@ -1760,12 +1966,24 @@ class CoinPrepWorker:
                 self.log(f"✅ {name} already consolidated ({coin_count} coin)")
                 return True
 
-            self.log(f"Submitting auto-combine via Sage RPC (max_coins={coin_count})...")
+            # F61: scale the fee up for large combines to get faster block
+            # inclusion. Without this bump, a 71-coin XCH combine can sit
+            # in the mempool for 5+ blocks (~2m 30s) while smaller txes
+            # land in the first block.
+            combine_fee = self._priority_combine_fee_mojos(coin_count)
+            base_fee = self._tx_fee_mojos()
+            if combine_fee > base_fee:
+                fee_multiplier = combine_fee // max(1, base_fee)
+                self.log(f"Submitting auto-combine via Sage RPC "
+                         f"(max_coins={coin_count}, fee={combine_fee:,} mojos, "
+                         f"{fee_multiplier}× base for priority block inclusion)...")
+            else:
+                self.log(f"Submitting auto-combine via Sage RPC (max_coins={coin_count})...")
 
             if is_cat:
-                result = auto_combine_cat(fee_mojos=self._tx_fee_mojos(), max_coins=coin_count)
+                result = auto_combine_cat(fee_mojos=combine_fee, max_coins=coin_count)
             else:
-                result = auto_combine_xch(fee_mojos=self._tx_fee_mojos(), max_coins=coin_count)
+                result = auto_combine_xch(fee_mojos=combine_fee, max_coins=coin_count)
 
             if self._sage_submit_succeeded(result):
                 self.log(f"✅ {name} auto-combine submitted via Sage (was {coin_count} coins)")
@@ -1815,8 +2033,13 @@ class CoinPrepWorker:
                 self.log(f"❌ Not enough coin IDs found for /combine")
                 return self._consolidate_wallet_sage_fallback(wallet_id, name)
 
-            self.log(f"Combining {len(coin_ids)} {name} coins via /combine...")
-            result = combine_coins(coin_ids=coin_ids, fee_mojos=self._tx_fee_mojos())
+            # F61: scaled priority fee for large combines (same as the
+            # auto-combine path above) so the /combine fallback also
+            # benefits from faster block inclusion.
+            combine_fee = self._priority_combine_fee_mojos(len(coin_ids))
+            self.log(f"Combining {len(coin_ids)} {name} coins via /combine "
+                     f"(fee={combine_fee:,} mojos)...")
+            result = combine_coins(coin_ids=coin_ids, fee_mojos=combine_fee)
 
             if self._sage_submit_succeeded(result):
                 self.log(f"✅ {name} /combine submitted (was {len(coin_ids)} coins)")
@@ -2099,25 +2322,29 @@ class CoinPrepWorker:
         address = addr_result["address"]
         self.log(f"   Receive address: {address[:20]}...")
 
-        # Calculate per-tier amounts
-        tier_info = []  # [(tier_name, count, xch_mojos_total, cat_mojos_total, xch_size, cat_size)]
+        # Calculate per-tier amounts. XCH and CAT counts can differ (asymmetric
+        # buy/sell ladders) so we build per-side tuples independently.
+        tier_info = []  # legacy combined view (only used for the empty-check below)
         xch_tier_info = []
         cat_tier_info = []
         for tier_name in tier_order:
-            count = self.tier_counts.get(tier_name, 0)
+            xch_count = int(self.xch_tier_counts.get(tier_name, 0) or 0)
+            cat_count = int(self.cat_tier_counts.get(tier_name, 0) or 0)
             xch_size = self.tier_xch_sizes.get(tier_name, Decimal("0"))
             cat_size = self.tier_cat_sizes.get(tier_name, Decimal("0"))
-            if count <= 0:
+            if xch_count <= 0 and cat_count <= 0:
                 continue
-            xch_mojos = int(xch_size * Decimal("1000000000000")) * count
-            cat_mojos = int(cat_size * (10 ** self.cat_decimals)) * count
-            tier_info.append((tier_name, count, xch_mojos, cat_mojos, xch_size, cat_size))
-            self.log(f"   {tier_name}: {count} coins × {xch_size} XCH / {cat_size:,.0f} CAT "
-                     f"= {xch_mojos:,} / {cat_mojos:,} mojos total")
-            if xch_mojos > 0:
-                xch_tier_info.append((tier_name, count, xch_mojos, cat_mojos, xch_size, cat_size))
-            if cat_mojos > 0:
-                cat_tier_info.append((tier_name, count, xch_mojos, cat_mojos, xch_size, cat_size))
+            xch_mojos_each = int(xch_size * Decimal("1000000000000"))
+            cat_mojos_each = int(cat_size * (10 ** self.cat_decimals))
+            xch_mojos_total = xch_mojos_each * xch_count
+            cat_mojos_total = cat_mojos_each * cat_count
+            tier_info.append((tier_name, max(xch_count, cat_count), xch_mojos_total, cat_mojos_total, xch_size, cat_size))
+            self.log(f"   {tier_name}: XCH={xch_count} × {xch_size} ({xch_mojos_total:,} mojos) / "
+                     f"CAT={cat_count} × {cat_size:,.0f} ({cat_mojos_total:,} mojos)")
+            if xch_count > 0 and xch_mojos_total > 0:
+                xch_tier_info.append((tier_name, xch_count, xch_mojos_total, 0, xch_size, Decimal("0")))
+            if cat_count > 0 and cat_mojos_total > 0:
+                cat_tier_info.append((tier_name, cat_count, 0, cat_mojos_total, Decimal("0"), cat_size))
 
         if not tier_info:
             self.log(f"❌ No tiers configured!")
@@ -2850,6 +3077,24 @@ class CoinPrepWorker:
                         reserved_offset += prev_cnt
                 output_ids = split_candidate_ids[reserved_offset:reserved_offset + cnt]
                 owned_output_count = len(output_ids)
+
+                # Fallback: Sage deducts the TX fee from output coin amounts, which makes
+                # small coins (fee tier, small sniper) come back slightly under coin_size.
+                # When the source coin is already consumed but exact-amount search finds
+                # nothing, retry with a ±15% tolerance (minimum 1 M-mojo / 0.000001 XCH).
+                fuzzy_match = False
+                if owned_output_count == 0 and not pool_still_visible:
+                    _tol = max(coin_size // 7, 1_000_000)  # ~14% or 0.000001 XCH
+                    fuzzy_ids = sorted(
+                        cid for cid, amount in owned_coin_map.items()
+                        if 0 < amount <= coin_size + _tol and coin_size - _tol <= amount
+                    )
+                    fuzzy_ids = fuzzy_ids[reserved_offset:reserved_offset + cnt]
+                    if len(fuzzy_ids) >= cnt:
+                        output_ids = fuzzy_ids
+                        owned_output_count = len(output_ids)
+                        fuzzy_match = True
+
                 selectable_output_count = sum(
                     1 for cid in output_ids
                     if cid in selectable_coin_ids
@@ -2874,6 +3119,7 @@ class CoinPrepWorker:
                     "owned_output_count": owned_output_count,
                     "selectable_output_count": selectable_output_count,
                     "outputs_selectable": outputs_selectable,
+                    "fuzzy_match": fuzzy_match,
                 }
 
             poll = 0
@@ -2984,6 +3230,66 @@ class CoinPrepWorker:
                         retry_after_s=retry_after_s,
                         max_retries=1,
                     ):
+                        # ────────────────────────────────────────────────────────
+                        # AUTHORITATIVE on-chain check (Option B fix 2026-04-07):
+                        # Sage's `selectable` view can lag the mempool by tens of
+                        # seconds. Before submitting a retry, query the source
+                        # coin DIRECTLY via get_coins_by_ids and check whether it
+                        # is genuinely unspent. If `spent_height` is set, or if
+                        # there's a pending `transaction_id`, the source coin is
+                        # already committed to a TX — issuing a retry would race
+                        # the original split and risk creating mismatched outputs
+                        # at puzzle hashes the wallet doesn't recognise (the
+                        # 2026-04-07 CAT sniper 23/25 incident).
+                        # ────────────────────────────────────────────────────────
+                        retry_pool_id = split_state.get("pool_coin_id") or ""
+                        retry_blocked_reason = None
+                        try:
+                            from wallet_sage import get_coins_by_ids as _gcbi
+                            chain_view = _gcbi([retry_pool_id]) if retry_pool_id else None
+                        except Exception as _e_chain:
+                            chain_view = None
+                            self.log(
+                                f"      ⚠️ {sl} {tn} on-chain pre-retry check failed "
+                                f"({_e_chain}) — falling back to view-based decision"
+                            )
+                        if isinstance(chain_view, dict) and chain_view:
+                            # Sage normalises ids with 0x prefix in the map keys
+                            _key_a = retry_pool_id if retry_pool_id.startswith("0x") else "0x" + retry_pool_id
+                            _key_b = retry_pool_id.replace("0x", "")
+                            rec = chain_view.get(_key_a) or chain_view.get(_key_b)
+                            if rec is None and chain_view:
+                                # try the only entry as a last resort
+                                try:
+                                    rec = next(iter(chain_view.values()))
+                                except Exception:
+                                    rec = None
+                            if rec is not None:
+                                spent_h = rec.get("spent_height")
+                                tx_id_chain = rec.get("transaction_id")
+                                if spent_h not in (None, 0):
+                                    retry_blocked_reason = (
+                                        f"source coin already SPENT on-chain at height {spent_h} — "
+                                        f"original split confirmed; outputs will arrive shortly"
+                                    )
+                                elif tx_id_chain:
+                                    retry_blocked_reason = (
+                                        f"source coin is bound to pending TX {str(tx_id_chain)[:16]}… — "
+                                        f"original split is in mempool; retry would race it"
+                                    )
+
+                        if retry_blocked_reason:
+                            self.log(
+                                f"      🛑 {sl} {tn} retry SUPPRESSED ({retry_blocked_reason}) — "
+                                f"extending grace instead"
+                            )
+                            # Burn the retry slot AND extend the deadline so we
+                            # don't immediately re-evaluate next iteration.
+                            retry_counts[idx] = 1  # mark as "used" so we don't try again
+                            split_deadlines[idx] = split_deadlines.get(idx, timeout_s) + grace_extension_s
+                            grace_extensions[idx] = grace_extensions.get(idx, 0) + 1
+                            continue
+
                         if force_retry_now:
                             self.log(
                                 f"      ⚠️ {sl} {tn} source coin is still intact while later {sl} tiers are confirming — retrying split once now"
@@ -3080,7 +3386,10 @@ class CoinPrepWorker:
                 time.sleep(min(5, remaining_sleep_s))
                 poll += 1
 
-            # Mark any still pending
+            # Mark any still pending; check if only optional tiers remain
+            _optional_tiers = {"fees", "sniper"}
+            _hard_failures = []
+            _soft_failures = []
             for idx, (wid, tn, cnt, pm, pcid, sl, _, tx_ids) in enumerate(pending_splits):
                 if idx not in confirmed:
                     owned_coin_map = self._get_owned_coin_amount_map(wid, f"{sl}-{tn}-timeout-diagnostic") or {}
@@ -3098,17 +3407,37 @@ class CoinPrepWorker:
                     else:
                         pool_state = "source coin already consumed"
                     outputs_state = (
-                        f"{split_state['owned_output_count']}/{cnt} exact outputs owned; "
+                        f"{split_state['owned_output_count']}/{cnt} outputs owned; "
                         f"{split_state['selectable_output_count']}/{cnt} selectable; "
                         f"tx={'confirmed' if tx_state['confirmed'] else 'pending'}; "
                         f"retries={retry_counts.get(idx, 0)}; "
                         f"grace={grace_extensions.get(idx, 0)}"
                     )
-                    self.log(
-                        f"      ❌ {sl} {tn} split not confirmed after {timeout_s}s "
-                        f"({pool_state}; {outputs_state})"
-                    )
-            return len(confirmed) == len(pending_splits)
+                    # Optional tier (fees/sniper) whose on-chain TX completed: treat
+                    # as a soft failure — coins exist but wallet view lagged behind.
+                    # Non-optional tiers or unconsumed source coins are hard failures.
+                    if tn in _optional_tiers and split_state["pool_consumed"]:
+                        _soft_failures.append((sl, tn))
+                        self.log(
+                            f"      ⚠️ {sl} {tn} split unconfirmed after {timeout_s}s but TX went through "
+                            f"({pool_state}; {outputs_state}) — continuing (optional tier)"
+                        )
+                    else:
+                        _hard_failures.append((sl, tn))
+                        self.log(
+                            f"      ❌ {sl} {tn} split not confirmed after {timeout_s}s "
+                            f"({pool_state}; {outputs_state})"
+                        )
+            if _hard_failures:
+                return False
+            # Only soft failures (optional tiers with consumed source coins) — treat as success
+            if _soft_failures:
+                self.log(
+                    f"   ⚠️ {len(_soft_failures)} optional tier(s) unconfirmed but on-chain: "
+                    + ", ".join(f"{sl} {tn}" for sl, tn in _soft_failures)
+                    + " — proceeding"
+                )
+            return True
 
         # ================================================================
         # MAIN: TRULY PARALLEL — matches test_coin_prep_v2.py approach
@@ -4175,12 +4504,8 @@ class CoinPrepWorker:
         )
 
         total_tiers = len(tier_order)
-        total_xch_coins = sum(self.tier_counts.values())
-        total_cat_coins = sum(
-            count
-            for tier_name, count in self.tier_counts.items()
-            if self.tier_cat_sizes.get(tier_name, Decimal("0")) > 0
-        )
+        total_xch_coins = sum(self.xch_tier_counts.values())
+        total_cat_coins = sum(self.cat_tier_counts.values())
 
         # ---- Phase 1: XCH tier splits (65% → 75%) ----
         # CRITICAL: Each split consumes the "pool" coin and creates N new coins
@@ -4192,7 +4517,7 @@ class CoinPrepWorker:
         xch_tier_results = {}  # Track success/failure per tier for retry logic
 
         for idx, tier_name in enumerate(tier_order):
-            count = self.tier_counts.get(tier_name, 0)
+            count = int(self.xch_tier_counts.get(tier_name, 0) or 0)
             xch_size = self.tier_xch_sizes.get(tier_name, Decimal("0"))
 
             if count <= 0 or xch_size <= 0:
@@ -4257,7 +4582,7 @@ class CoinPrepWorker:
         cat_tier_results = {}
 
         for idx, tier_name in enumerate(tier_order):
-            count = self.tier_counts.get(tier_name, 0)
+            count = int(self.cat_tier_counts.get(tier_name, 0) or 0)
             cat_size = self.tier_cat_sizes.get(tier_name, Decimal("0"))
 
             if count <= 0 or cat_size <= 0:
@@ -4577,21 +4902,22 @@ class CoinPrepWorker:
 
             # Calculate what we need
             if self.tier_enabled:
-                # Sum across all tiers: count × size per tier
+                # Sum across all tiers: per-side count × size per tier
                 xch_pool_amount = sum(
-                    Decimal(str(self.tier_counts.get(t, 0))) * self.tier_xch_sizes.get(t, Decimal("0"))
+                    Decimal(str(self.xch_tier_counts.get(t, 0) or 0)) * self.tier_xch_sizes.get(t, Decimal("0"))
                     for t in self.tier_xch_sizes
                 )
                 cat_pool_amount = sum(
-                    Decimal(str(self.tier_counts.get(t, 0))) * self.tier_cat_sizes.get(t, Decimal("0"))
+                    Decimal(str(self.cat_tier_counts.get(t, 0) or 0)) * self.tier_cat_sizes.get(t, Decimal("0"))
                     for t in self.tier_cat_sizes
                 )
                 self.log(f"\nTarget (TIERED):")
                 for tn in self.tier_order:
-                    cnt = self.tier_counts.get(tn, 0)
+                    xcnt = int(self.xch_tier_counts.get(tn, 0) or 0)
+                    ccnt = int(self.cat_tier_counts.get(tn, 0) or 0)
                     xs = self.tier_xch_sizes.get(tn, Decimal("0"))
                     cs = self.tier_cat_sizes.get(tn, Decimal("0"))
-                    self.log(f"  {tn}: {cnt} × {xs} XCH + {cnt} × {cs:,.0f} CAT")
+                    self.log(f"  {tn}: {xcnt} × {xs} XCH + {ccnt} × {cs:,.0f} CAT")
                 self.log(f"  Total XCH pool: {xch_pool_amount}")
                 self.log(f"  Total CAT pool: {cat_pool_amount:,.0f}")
             else:
@@ -4600,7 +4926,82 @@ class CoinPrepWorker:
                 self.log(f"\nTarget:")
                 self.log(f"XCH: {self.xch_target_coins} × {self.xch_coin_size} = {xch_pool_amount} pool")
                 self.log(f"CAT: {self.cat_target_coins} × {self.cat_coin_size} = {cat_pool_amount} pool")
-            
+
+            # F62 (2026-04-09): PRE-FLIGHT OVERSHOOT CHECK.
+            # Verify the planned pool target actually fits the current wallet
+            # (confirmed + pending). If pool_target > available, the splits
+            # would run out of XCH partway through and leave a crippled
+            # ladder — which is exactly what happened when the user re-ran
+            # Smart Settings during a pending combine. Better to fail cleanly
+            # and ask the user to re-run Smart Settings than silently prep
+            # ~40% of the planned coins.
+            try:
+                from wallet_sage import get_wallet_balance as _get_wb
+                _xch_wb = _get_wb(self.xch_wallet_id) or {}
+                _cat_wb = _get_wb(self.cat_wallet_id) or {}
+                _xch_bal = (_xch_wb.get("wallet_balance") or {}) if isinstance(_xch_wb, dict) else {}
+                _cat_bal = (_cat_wb.get("wallet_balance") or {}) if isinstance(_cat_wb, dict) else {}
+                # Prefer unconfirmed (projected post-pending), fall back to confirmed.
+                _xch_total_mojos = int(
+                    _xch_bal.get("unconfirmed_wallet_balance")
+                    or _xch_bal.get("confirmed_wallet_balance") or 0
+                )
+                _cat_total_mojos = int(
+                    _cat_bal.get("unconfirmed_wallet_balance")
+                    or _cat_bal.get("confirmed_wallet_balance") or 0
+                )
+                _xch_reserve_xch = Decimal(str(os.getenv("XCH_RESERVE", "0") or "0"))
+                _xch_reserve_mojos = int((_xch_reserve_xch * Decimal("1000000000000")).quantize(Decimal("1")))
+                _cat_scale = Decimal(10) ** Decimal(self.cat_decimals)
+                _cat_reserve_mojos = int((Decimal(str(self.cat_reserve)) * _cat_scale).quantize(Decimal("1")))
+                _xch_avail_mojos = max(0, _xch_total_mojos - _xch_reserve_mojos)
+                _cat_avail_mojos = max(0, _cat_total_mojos - _cat_reserve_mojos)
+                _xch_pool_mojos = int((Decimal(str(xch_pool_amount)) * Decimal("1000000000000")).quantize(Decimal("1")))
+                _cat_pool_mojos = int((Decimal(str(cat_pool_amount)) * _cat_scale).quantize(Decimal("1")))
+
+                _xch_overshoot = _xch_pool_mojos > _xch_avail_mojos
+                _cat_overshoot = _cat_pool_mojos > _cat_avail_mojos
+                if _xch_overshoot or _cat_overshoot:
+                    self.log("")
+                    self.log("=" * 60)
+                    self.log("OVERSHOOT: coin prep pool exceeds available wallet")
+                    self.log("=" * 60)
+                    if _xch_overshoot:
+                        self.log(
+                            f"  XCH: pool wants {_xch_pool_mojos/1e12:.4f} XCH, "
+                            f"wallet has {_xch_avail_mojos/1e12:.4f} XCH avail "
+                            f"(total {_xch_total_mojos/1e12:.4f} - reserve {_xch_reserve_mojos/1e12:.4f})"
+                        )
+                    if _cat_overshoot:
+                        _sf = float(_cat_scale)
+                        self.log(
+                            f"  CAT: pool wants {_cat_pool_mojos/_sf:,.0f} tokens, "
+                            f"wallet has {_cat_avail_mojos/_sf:,.0f} avail "
+                            f"(total {_cat_total_mojos/_sf:,.0f} - reserve {_cat_reserve_mojos/_sf:,.0f})"
+                        )
+                    self.log("")
+                    self.log("This usually means Smart Settings ran against a")
+                    self.log("temporarily-drained wallet (e.g. during a pending combine).")
+                    self.log("Please restart the bot, wait for wallet to settle (all txs")
+                    self.log("confirmed), then re-run Smart Settings and coin prep.")
+                    self.log("=" * 60)
+                    # Mark the run as failed and return. The status file
+                    # shows the error so the GUI can render the message.
+                    try:
+                        self.update_status(
+                            PrepPhase.ERROR,
+                            0.05,
+                            "Coin prep pool exceeds available wallet — re-run Smart Settings",
+                            error="pool_exceeds_avail"
+                        )
+                    except Exception:
+                        pass
+                    return
+            except Exception as _oe:
+                # Don't fail the whole run on a precheck error; just log
+                # and continue with existing behaviour.
+                self.log(f"   (pool overshoot precheck skipped: {_oe})")
+
             # Phase 1: ⚡ PARALLEL CONSOLIDATION (10-15%)
 # STEP 0: Cancel all open offers with verification
             self.update_status(PrepPhase.CONSOLIDATING, 0.05, "🗑️ Cancelling open offers...")
@@ -4875,53 +5276,47 @@ class CoinPrepWorker:
                     raise Exception(f"XCH balance too low ({post_xch_balance}) for pool creation")
                 self.log(f"   Adjusted XCH pool: {xch_pool_amount}")
 
-                # CRITICAL: Also reduce tier COUNTS proportionally so the actual
-                # per-tier payments fit within the capped XCH balance.
-                # Without this, create_and_split_tier_pools_sage() ignores the cap
-                # and sends the original (too-large) payment amounts.
-                if self.tier_enabled and self.tier_xch_sizes and self.tier_counts:
-                    # Calculate current total XCH mojos from tier plan
+                # CRITICAL: Also reduce XCH-side tier COUNTS proportionally so the
+                # actual per-tier payments fit within the capped XCH balance. Only
+                # the XCH side is scaled — CAT counts (sell ladder) are unaffected
+                # by an XCH shortfall.
+                if self.tier_enabled and self.tier_xch_sizes and self.xch_tier_counts:
                     total_xch_mojos_orig = Decimal("0")
-                    for tn in self.tier_counts:
+                    for tn in self.xch_tier_counts:
                         xs = self.tier_xch_sizes.get(tn, Decimal("0"))
-                        cnt = self.tier_counts.get(tn, 0)
+                        cnt = int(self.xch_tier_counts.get(tn, 0) or 0)
                         total_xch_mojos_orig += xs * Decimal("1000000000000") * cnt
 
                     if total_xch_mojos_orig > 0:
-                        # Scale factor: how much we need to shrink
                         available_mojos = int(xch_pool_amount * Decimal("1000000000000"))
                         scale = Decimal(str(available_mojos)) / total_xch_mojos_orig
-                        self.log(f"   Scaling tier counts by {float(scale):.2f} to fit XCH balance")
+                        self.log(f"   Scaling XCH tier counts by {float(scale):.2f} to fit XCH balance")
 
-                        # Reduce counts per tier (keep sizes, reduce quantity)
-                        new_counts = {}
-                        for tn in self.tier_counts:
-                            orig_count = self.tier_counts[tn]
-                            new_count = max(1, int(orig_count * float(scale)))
-                            new_counts[tn] = new_count
-                        self.tier_counts = new_counts
+                        new_xch_counts = {}
+                        for tn in self.xch_tier_counts:
+                            orig_count = int(self.xch_tier_counts.get(tn, 0) or 0)
+                            new_count = max(1, int(orig_count * float(scale))) if orig_count > 0 else 0
+                            new_xch_counts[tn] = new_count
+                        self.xch_tier_counts = new_xch_counts
 
-                        # Also update total targets
-                        self.xch_target_coins = sum(new_counts.values())
-                        self.cat_target_coins = sum(
-                            count
-                            for tn, count in new_counts.items()
-                            if self.tier_cat_sizes.get(tn, Decimal("0")) > 0
-                        )
+                        # Refresh unified tier_counts (max of both sides)
+                        all_tn = set(self.xch_tier_counts) | set(self.cat_tier_counts)
+                        self.tier_counts = {
+                            tn: max(int(self.xch_tier_counts.get(tn, 0) or 0),
+                                    int(self.cat_tier_counts.get(tn, 0) or 0))
+                            for tn in all_tn
+                        }
+                        self.xch_target_coins = sum(self.xch_tier_counts.values())
                         self._refresh_coin_targets()
-                        self.log(f"   Adjusted tier counts: {new_counts} (XCH total: {self.xch_target_coins}, CAT total: {self.cat_target_coins})")
+                        self.log(f"   Adjusted XCH tier counts: {self.xch_tier_counts} (XCH total: {self.xch_target_coins})")
 
-                        # Recalculate actual pool amounts with new counts
+                        # Recalculate actual XCH pool amount with new counts
                         new_xch_total = Decimal("0")
-                        new_cat_total = Decimal("0")
-                        for tn in new_counts:
+                        for tn, cnt in self.xch_tier_counts.items():
                             xs = self.tier_xch_sizes.get(tn, Decimal("0"))
-                            cs = self.tier_cat_sizes.get(tn, Decimal("0"))
-                            new_xch_total += xs * new_counts[tn]
-                            new_cat_total += cs * new_counts[tn]
+                            new_xch_total += xs * cnt
                         self.log(f"   New XCH total: {new_xch_total} (balance: {post_xch_balance})")
                         xch_pool_amount = new_xch_total
-                        cat_pool_amount = new_cat_total
 
             if cat_pool_amount > post_cat_balance and post_cat_balance > 0:
                 self.log(f"⚠️ CAT pool ({cat_pool_amount:,.0f}) exceeds balance ({post_cat_balance:,.0f}) — capping to balance")
@@ -4932,56 +5327,44 @@ class CoinPrepWorker:
                     raise Exception(f"CAT balance too low ({post_cat_balance}) for pool creation")
                 self.log(f"   Adjusted CAT pool: {cat_pool_amount:,.0f}")
 
-                # CRITICAL: Also reduce tier COUNTS proportionally so the actual
-                # per-tier payments fit within the capped balance.
-                # Without this, create_and_split_tier_pools_sage() ignores the cap
-                # and sends the original (too-large) payment amounts.
-                if self.tier_enabled and self.tier_cat_sizes and self.tier_counts:
-                    # Calculate current total CAT mojos from tier plan
+                # CRITICAL: Also reduce CAT-side tier COUNTS proportionally so the
+                # actual per-tier payments fit within the capped CAT balance.
+                # Only the CAT side is scaled.
+                if self.tier_enabled and self.tier_cat_sizes and self.cat_tier_counts:
                     total_cat_mojos_orig = Decimal("0")
-                    for tn in self.tier_counts:
+                    for tn in self.cat_tier_counts:
                         cs = self.tier_cat_sizes.get(tn, Decimal("0"))
-                        cnt = self.tier_counts.get(tn, 0)
+                        cnt = int(self.cat_tier_counts.get(tn, 0) or 0)
                         total_cat_mojos_orig += cs * (10 ** self.cat_decimals) * cnt
 
                     if total_cat_mojos_orig > 0:
-                        # Scale factor: how much we need to shrink
                         available_mojos = int(cat_pool_amount * (10 ** self.cat_decimals))
                         scale = Decimal(str(available_mojos)) / total_cat_mojos_orig
-                        self.log(f"   Scaling tier counts by {float(scale):.2f} to fit CAT balance")
+                        self.log(f"   Scaling CAT tier counts by {float(scale):.2f} to fit CAT balance")
 
-                        # Reduce counts per tier (keep sizes, reduce quantity)
-                        new_counts = {}
-                        for tn in self.tier_counts:
-                            orig_count = self.tier_counts[tn]
-                            if self.tier_cat_sizes.get(tn, Decimal("0")) <= 0:
-                                new_count = orig_count
-                            else:
-                                new_count = max(1, int(orig_count * float(scale)))
-                            new_counts[tn] = new_count
-                        self.tier_counts = new_counts
+                        new_cat_counts = {}
+                        for tn in self.cat_tier_counts:
+                            orig_count = int(self.cat_tier_counts.get(tn, 0) or 0)
+                            new_count = max(1, int(orig_count * float(scale))) if orig_count > 0 else 0
+                            new_cat_counts[tn] = new_count
+                        self.cat_tier_counts = new_cat_counts
 
-                        # Also update total targets
-                        self.xch_target_coins = sum(new_counts.values())
-                        self.cat_target_coins = sum(
-                            count
-                            for tn, count in new_counts.items()
-                            if self.tier_cat_sizes.get(tn, Decimal("0")) > 0
-                        )
+                        all_tn = set(self.xch_tier_counts) | set(self.cat_tier_counts)
+                        self.tier_counts = {
+                            tn: max(int(self.xch_tier_counts.get(tn, 0) or 0),
+                                    int(self.cat_tier_counts.get(tn, 0) or 0))
+                            for tn in all_tn
+                        }
+                        self.cat_target_coins = sum(self.cat_tier_counts.values())
                         self._refresh_coin_targets()
-                        self.log(f"   Adjusted tier counts: {new_counts} (XCH total: {self.xch_target_coins}, CAT total: {self.cat_target_coins})")
+                        self.log(f"   Adjusted CAT tier counts: {self.cat_tier_counts} (CAT total: {self.cat_target_coins})")
 
-                        # Recalculate actual pool amounts
                         new_cat_total = Decimal("0")
-                        new_xch_total = Decimal("0")
-                        for tn in new_counts:
+                        for tn, cnt in self.cat_tier_counts.items():
                             cs = self.tier_cat_sizes.get(tn, Decimal("0"))
-                            xs = self.tier_xch_sizes.get(tn, Decimal("0"))
-                            new_cat_total += cs * new_counts[tn]
-                            new_xch_total += xs * new_counts[tn]
+                            new_cat_total += cs * cnt
                         self.log(f"   New CAT total: {new_cat_total:,.0f} (balance: {post_cat_balance:,.0f})")
                         cat_pool_amount = new_cat_total
-                        xch_pool_amount = new_xch_total
 
             # Phase 2+3: Create pools and split coins
             if self.is_sage and self.tier_enabled:
@@ -5125,14 +5508,20 @@ class CoinPrepWorker:
                     }
                     last_prep["tier_sizes_cat"] = {k: float(v) for k, v in self.tier_cat_sizes.items()}
                     last_prep["tier_counts"] = dict(self.tier_counts)
+                    last_prep["tier_counts_xch"] = dict(self.xch_tier_counts)
+                    last_prep["tier_counts_cat"] = dict(self.cat_tier_counts)
                 else:
                     last_prep["xch_coin_size"] = float(self.xch_coin_size)
                     last_prep["cat_coin_size"] = float(self.cat_coin_size)
 
                 last_prep["designations_written"] = self._db_ready
 
-                prep_json_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "coin_prep_last.json")
-                with open(prep_json_path, "w") as f:
+                try:
+                    from user_paths import data_dir as _dd
+                    prep_json_path = os.path.join(_dd(), "coin_prep_last.json")
+                except Exception:
+                    prep_json_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "coin_prep_last.json")
+                with open(prep_json_path, "w", encoding="utf-8") as f:
                     json.dump(last_prep, f, indent=2)
                 self.log(f"💾 Saved prep settings to coin_prep_last.json")
             except Exception as e:
@@ -5175,9 +5564,20 @@ def parse_arguments():
     parser.add_argument('--fingerprint', type=str, default=None,
                         help='Override: wallet fingerprint')
     parser.add_argument('--tier-sizes', type=str, default=None,
-                        help='Tier XCH sizes: inner=1.0,mid=0.5,outer=0.25,extreme=0.1')
+                        help='Tier XCH sizes (legacy, shared): inner=1.0,mid=0.5,outer=0.25,extreme=0.1')
+    # F62 (2026-04-09): per-side tier sizes. When both are provided they
+    # override --tier-sizes — XCH coins are prepped at buy sizes and CAT
+    # coins are prepped at sell sizes, enabling asymmetric ladders.
+    parser.add_argument('--buy-tier-sizes', type=str, default=None,
+                        help='Per-side XCH (buy) tier sizes: inner=0.4,mid=0.9,outer=1.6,extreme=2.8[,sniper=0.01][,fees=0.001]')
+    parser.add_argument('--sell-tier-sizes', type=str, default=None,
+                        help='Per-side CAT (sell, in XCH-equiv) tier sizes: inner=1.2,mid=0.7,outer=0.36,extreme=0.16[,sniper=0.01]')
     parser.add_argument('--tier-counts', type=str, default=None,
-                        help='Tier coin counts: inner=4,mid=16,outer=16,extreme=14')
+                        help='Tier coin counts (legacy, applied to BOTH sides): inner=4,mid=16,outer=16,extreme=14')
+    parser.add_argument('--tier-counts-xch', type=str, default=None,
+                        help='Per-side XCH tier counts (buy ladder): inner=4,mid=16,outer=16,extreme=14[,sniper=10][,fees=20]')
+    parser.add_argument('--tier-counts-cat', type=str, default=None,
+                        help='Per-side CAT tier counts (sell ladder): inner=4,mid=16,outer=16,extreme=14')
     parser.add_argument('--prep-headroom-pct', type=float, default=None,
                         help='Extra % headroom to add to prepared coins above live offer size')
     parser.add_argument('--run-id', type=str, default=None,
@@ -5232,9 +5632,24 @@ def main():
     if args.tier_sizes is not None:
         os.environ["_CLI_TIER_SIZES"] = args.tier_sizes
         overrides.append(f"TIER_SIZES={args.tier_sizes}")
+    # F62 (2026-04-09): per-side tier sizes. XCH coin prep uses buy sizes,
+    # CAT coin prep uses sell sizes. When both are provided they override
+    # the legacy --tier-sizes for their respective wallet.
+    if args.buy_tier_sizes is not None:
+        os.environ["_CLI_BUY_TIER_SIZES"] = args.buy_tier_sizes
+        overrides.append(f"BUY_TIER_SIZES={args.buy_tier_sizes}")
+    if args.sell_tier_sizes is not None:
+        os.environ["_CLI_SELL_TIER_SIZES"] = args.sell_tier_sizes
+        overrides.append(f"SELL_TIER_SIZES={args.sell_tier_sizes}")
     if args.tier_counts is not None:
         os.environ["_CLI_TIER_COUNTS"] = args.tier_counts
         overrides.append(f"TIER_COUNTS={args.tier_counts}")
+    if args.tier_counts_xch is not None:
+        os.environ["_CLI_TIER_COUNTS_XCH"] = args.tier_counts_xch
+        overrides.append(f"TIER_COUNTS_XCH={args.tier_counts_xch}")
+    if args.tier_counts_cat is not None:
+        os.environ["_CLI_TIER_COUNTS_CAT"] = args.tier_counts_cat
+        overrides.append(f"TIER_COUNTS_CAT={args.tier_counts_cat}")
     if args.prep_headroom_pct is not None:
         os.environ["_CLI_PREP_HEADROOM_PCT"] = str(args.prep_headroom_pct)
         overrides.append(f"PREP_HEADROOM={args.prep_headroom_pct}%")
@@ -5256,20 +5671,17 @@ def main():
     print(f"🎯 Final Configuration:")
     if worker.tier_enabled:
         print(f"   TIER MODE ENABLED")
-        total_xch_coins = sum(worker.tier_counts.values())
-        total_cat_coins = sum(
-            count
-            for tier_name, count in worker.tier_counts.items()
-            if worker.tier_cat_sizes.get(tier_name, Decimal("0")) > 0
-        )
+        total_xch_coins = sum(worker.xch_tier_counts.values())
+        total_cat_coins = sum(worker.cat_tier_counts.values())
         for tier_name in worker.tier_order:
-            count = worker.tier_counts.get(tier_name, 0)
+            xcnt = int(worker.xch_tier_counts.get(tier_name, 0) or 0)
+            ccnt = int(worker.cat_tier_counts.get(tier_name, 0) or 0)
             live_size = worker.offer_tier_xch_sizes.get(tier_name, Decimal("0"))
             prep_size = worker.tier_xch_sizes.get(tier_name, Decimal("0"))
             cat_size = worker.tier_cat_sizes.get(tier_name, Decimal("0"))
             print(
-                f"   {tier_name}: {count} coins × {live_size} XCH live "
-                f"→ {prep_size} XCH prep (CAT prep: {cat_size:,.0f})"
+                f"   {tier_name}: XCH={xcnt} × {prep_size} / CAT={ccnt} × {cat_size:,.0f} "
+                f"(live size {live_size} XCH)"
             )
         print(f"   Total: {total_xch_coins} XCH coins + {total_cat_coins} CAT coins")
     else:

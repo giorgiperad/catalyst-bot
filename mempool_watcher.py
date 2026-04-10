@@ -129,7 +129,14 @@ class MempoolWatcher:
         self._watched_offer_coins: set = set()
         # Debounce: track which offer coins have already fired this session
         # so we don't spam signals while the tx is pending confirmation.
-        self._fill_warned_coin_ids: set = set()
+        # F10 (2026-04-08): timestamped to allow TTL-based expiry. If the
+        # bot misses the wake (e.g. cycle was already running) the entry
+        # would otherwise stay until set_watched_offer_coins removes the
+        # coin entirely. With the TTL, an unconsumed entry naturally
+        # decays so a future re-emission can fire if the coin is still
+        # being watched. Map: coin_id -> first_warned_timestamp.
+        self._fill_warned_coin_ids: Dict[str, float] = {}
+        self._fill_warn_ttl_secs: float = 300.0  # 5 minutes
 
         # Background threads
         self._reserve_thread: Optional[threading.Thread] = None
@@ -207,7 +214,14 @@ class MempoolWatcher:
         with self._lock:
             self._watched_offer_coins = normalised
             # Remove debounce entries for coins no longer being watched
-            self._fill_warned_coin_ids &= normalised
+            # F10: dict-based debounce — keep only entries for coins still
+            # in the watch set, AND drop entries that have aged past TTL.
+            now = time.time()
+            self._fill_warned_coin_ids = {
+                cid: ts
+                for cid, ts in self._fill_warned_coin_ids.items()
+                if cid in normalised and (now - ts) < self._fill_warn_ttl_secs
+            }
 
     # ------------------------------------------------------------------
     # Reserve polling thread
@@ -340,7 +354,15 @@ class MempoolWatcher:
             current_pool_coin = self._pool_coin_id
             already_warned = self._mempool_warned_coin_id
             watched_offers = set(self._watched_offer_coins)
-            already_warned_fills = set(self._fill_warned_coin_ids)
+            # F10: prune expired entries before reading. A coin warned >TTL ago
+            # is no longer considered "already warned" — fresh signal can fire.
+            now = time.time()
+            ttl = self._fill_warn_ttl_secs
+            expired = [cid for cid, ts in self._fill_warned_coin_ids.items()
+                       if (now - ts) >= ttl]
+            for cid in expired:
+                self._fill_warned_coin_ids.pop(cid, None)
+            already_warned_fills = set(self._fill_warned_coin_ids.keys())
 
         # Skip the fetch entirely if there's nothing new to watch
         pool_check_needed = bool(
@@ -433,7 +455,9 @@ class MempoolWatcher:
         # --- Emit fill_imminent signals for our offer coins ---
         if fill_hits:
             with self._lock:
-                self._fill_warned_coin_ids.update(fill_hits)
+                _now_ts = time.time()
+                for cid in fill_hits:
+                    self._fill_warned_coin_ids[cid] = _now_ts
 
             for coin_id in fill_hits:
                 signal = {

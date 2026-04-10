@@ -1,5 +1,5 @@
 """
-Stress tests for the Chia Market Maker simulation engine.
+Stress tests for the CATalyst simulation engine.
 
 Each stress test runs a specific scenario designed to expose edge-case
 behaviour: marathon runs, coin exhaustion, oscillating markets, etc.

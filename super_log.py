@@ -113,7 +113,13 @@ def init_super_log(log_dir: str = None, file_level: str = "info",
     _terminal_level = LEVELS.get(terminal_level.lower(), LEVELS["info"])
 
     if log_dir is None:
-        log_dir = os.path.dirname(os.path.abspath(__file__))
+        # Default to the per-user data directory so the log files are
+        # writable regardless of install location.
+        try:
+            from user_paths import log_dir as _user_log_dir
+            log_dir = _user_log_dir()
+        except Exception:
+            log_dir = os.path.dirname(os.path.abspath(__file__))
     _log_dir = log_dir
 
     # Clean up old log files

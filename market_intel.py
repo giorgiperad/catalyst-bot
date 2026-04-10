@@ -580,10 +580,6 @@ class MarketIntel:
             "thin_side": self._competitors.get("thin_side", ""),
         }
 
-    def prune_fingerprints(self):
-        """Compatibility no-op after Offerpool removal."""
-        return
-
     def reset_session_stats(self):
         """Reset per-run market-intel counters for a fresh run."""
         with self._lock:

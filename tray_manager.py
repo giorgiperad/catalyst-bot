@@ -1,5 +1,5 @@
 """
-System Tray Manager — pystray wrapper for the Chia Market Maker desktop app.
+System Tray Manager — pystray wrapper for the CATalyst desktop app.
 
 Creates a system tray icon with:
 - Dynamic icon colour (green/amber/red/grey based on bot state)
@@ -49,7 +49,7 @@ class TrayManager:
     Manages the system tray icon and menu.
 
     Usage:
-        tray = TrayManager(app_name="Chia Market Maker")
+        tray = TrayManager(app_name="CATalyst")
         tray.on_show_dashboard = lambda: show_window()
         tray.on_quit = lambda: quit_app()
 
@@ -67,7 +67,7 @@ class TrayManager:
         tray.update_tray_state("running", cat_name="MZ")
     """
 
-    def __init__(self, app_name: str = "Chia Market Maker", app_version: str = "4.0.0"):
+    def __init__(self, app_name: str = "CATalyst", app_version: str = "4.0.0"):
         if not PYSTRAY_AVAILABLE:
             raise ImportError("pystray and/or Pillow not installed")
 
@@ -197,10 +197,13 @@ class TrayManager:
         Build the right-click context menu.
 
         Dynamic items based on bot state:
-          - Stopped:        [Start Bot]
-          - Running:        [Pause Bot] [Stop Bot]
-          - Paused/Warning: [Resume Bot] [Stop Bot]
+          - Stopped/Error:   [Start Bot]
+          - Running/Warning: [Stop Bot]
         Always present: [Show Dashboard] --- [Exit]
+
+        NOTE: Pause/Resume are intentionally omitted — the bot does not
+        support a pause state.  The user should Stop the bot if they want
+        to suspend trading.
         """
         status_text = self._status.capitalize()
         if self._cat_name and self._status in ("running", "paused"):
@@ -220,12 +223,8 @@ class TrayManager:
             MenuItem("📊 Show Dashboard", self._on_show),
         ]
 
-        # Dynamic bot-control items
-        if self._status == "running":
-            items.append(MenuItem("⏸ Pause Bot", self._on_pause))
-            items.append(MenuItem("⏹ Stop Bot", self._on_stop_bot))
-        elif self._status in ("paused", "warning"):
-            items.append(MenuItem("▶ Resume Bot", self._on_resume))
+        # Dynamic bot-control items — Start when idle, Stop when active.
+        if self._status in ("running", "warning", "paused"):
             items.append(MenuItem("⏹ Stop Bot", self._on_stop_bot))
         else:
             # stopped / error / unknown

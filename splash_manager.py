@@ -123,19 +123,22 @@ class SplashManager:
 
         def _handle_result(result, item):
             nonlocal posted, failed, skipped
-            if result.get("skipped"):
-                skipped += 1
-                self._total_skipped += 1
-            elif result.get("success"):
-                posted += 1
-                self._total_posted += 1
-            else:
-                failed += 1
-                self._total_failed += 1
-                retries = item.get("_splash_retries", 0)
-                if retries < _MAX_SPLASH_RETRIES:
-                    item["_splash_retries"] = retries + 1
-                    failed_items.append(item)
+            # Updates to instance counters and failed_items list happen under
+            # the lock so ThreadPoolExecutor workers don't clobber each other.
+            with self._lock:
+                if result.get("skipped"):
+                    skipped += 1
+                    self._total_skipped += 1
+                elif result.get("success"):
+                    posted += 1
+                    self._total_posted += 1
+                else:
+                    failed += 1
+                    self._total_failed += 1
+                    retries = item.get("_splash_retries", 0)
+                    if retries < _MAX_SPLASH_RETRIES:
+                        item["_splash_retries"] = retries + 1
+                        failed_items.append(item)
 
         if len(batch) > 10:
             from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -153,12 +156,13 @@ class SplashManager:
                     except Exception as e:
                         log_event("warning", "splash_parallel_error",
                                   f"Parallel Splash post failed: {e}")
-                        failed += 1
-                        self._total_failed += 1
-                        retries = item.get("_splash_retries", 0)
-                        if retries < _MAX_SPLASH_RETRIES:
-                            item["_splash_retries"] = retries + 1
-                            failed_items.append(item)
+                        with self._lock:
+                            failed += 1
+                            self._total_failed += 1
+                            retries = item.get("_splash_retries", 0)
+                            if retries < _MAX_SPLASH_RETRIES:
+                                item["_splash_retries"] = retries + 1
+                                failed_items.append(item)
         else:
             for item in batch:
                 result = _process_one(item)
@@ -219,14 +223,15 @@ class SplashManager:
                 )
 
                 if 200 <= r.status_code < 300:
-                    # Mark as posted (lock-protected for thread safety)
+                    # Mark as posted + reset health tracking — lock-protected.
+                    recovered = False
                     with self._lock:
                         self._posted_fingerprints.add(fp)
-
-                    # Reset health tracking on success
-                    if not self._splash_healthy:
-                        self._splash_healthy = True
-                        self._consecutive_failures = 0
+                        if not self._splash_healthy:
+                            self._splash_healthy = True
+                            self._consecutive_failures = 0
+                            recovered = True
+                    if recovered:
                         log_event("info", "splash_recovered",
                                   "Splash connection restored")
 
@@ -249,17 +254,20 @@ class SplashManager:
             if attempt < retries:
                 time.sleep(retry_sleep)
 
-        # All retries failed
-        self._consecutive_failures += 1
+        # All retries failed — bump counter and decide if we should log.
+        with self._lock:
+            self._consecutive_failures += 1
+            cf = self._consecutive_failures
+            should_log = (cf <= 3) or (cf % self._max_silent_failures == 0)
+            should_mark_unhealthy = self._splash_healthy and cf >= 3
+            if should_mark_unhealthy:
+                self._splash_healthy = False
 
-        # Only log every Nth failure to avoid spamming
-        if self._consecutive_failures <= 3 or self._consecutive_failures % self._max_silent_failures == 0:
+        if should_log:
             log_event("warning", "splash_post_failed",
                       f"Failed to broadcast to Splash "
-                      f"(attempt {self._consecutive_failures}): {last_err}")
-
-        if self._splash_healthy and self._consecutive_failures >= 3:
-            self._splash_healthy = False
+                      f"(attempt {cf}): {last_err}")
+        if should_mark_unhealthy:
             log_event("warning", "splash_unhealthy",
                       "Splash appears offline — will keep trying silently")
 
@@ -316,16 +324,17 @@ class SplashManager:
     # -------------------------------------------------------------------
 
     def get_stats(self) -> Dict:
-        """Get broadcasting statistics."""
-        return {
-            "total_posted": self._total_posted,
-            "total_failed": self._total_failed,
-            "total_skipped": self._total_skipped,
-            "queue_size": len(self._queue),
-            "fingerprints_cached": len(self._posted_fingerprints),
-            "healthy": self._splash_healthy,
-            "consecutive_failures": self._consecutive_failures,
-        }
+        """Get broadcasting statistics (thread-safe snapshot)."""
+        with self._lock:
+            return {
+                "total_posted": self._total_posted,
+                "total_failed": self._total_failed,
+                "total_skipped": self._total_skipped,
+                "queue_size": len(self._queue),
+                "fingerprints_cached": len(self._posted_fingerprints),
+                "healthy": self._splash_healthy,
+                "consecutive_failures": self._consecutive_failures,
+            }
 
     def reset_session_stats(self):
         """Reset per-run broadcast stats and dedup state."""

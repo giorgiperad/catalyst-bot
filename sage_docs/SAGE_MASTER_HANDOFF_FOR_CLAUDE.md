@@ -14,31 +14,31 @@ Its purpose is to:
 
 ## 2. Source documents used
 
-- [sage_docs/SAGE_API_REFERENCE.md](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/sage_docs/SAGE_API_REFERENCE.md)
+- [sage_docs/SAGE_API_REFERENCE.md](/./sage_docs/SAGE_API_REFERENCE.md)
   - Endpoint names and baseline API surface.
 
-- [sage_docs/SAGE_COMPLETE_REFERENCE.md](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/sage_docs/SAGE_COMPLETE_REFERENCE.md)
+- [sage_docs/SAGE_COMPLETE_REFERENCE.md](/./sage_docs/SAGE_COMPLETE_REFERENCE.md)
   - Detailed endpoint behavior, coin semantics, offer semantics, and adapter mappings.
 
-- [sage_docs/SAGE_EDGE_CASES.md](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/sage_docs/SAGE_EDGE_CASES.md)
+- [sage_docs/SAGE_EDGE_CASES.md](/./sage_docs/SAGE_EDGE_CASES.md)
   - Documented edge cases, weak handling areas, and caller-side defensive expectations.
 
-- [sage_docs/SAGE_AUDIT_CHECKLIST.md](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/sage_docs/SAGE_AUDIT_CHECKLIST.md)
+- [sage_docs/SAGE_AUDIT_CHECKLIST.md](/./sage_docs/SAGE_AUDIT_CHECKLIST.md)
   - Review expectations for lifecycle, session state, validation, transaction semantics, and error handling.
 
-- [sage_docs/SAGE_V4_MISMATCH_REPORT.md](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/sage_docs/SAGE_V4_MISMATCH_REPORT.md)
+- [sage_docs/SAGE_V4_MISMATCH_REPORT.md](/./sage_docs/SAGE_V4_MISMATCH_REPORT.md)
   - Repository-specific list of confirmed mismatches, high-confidence issues, and missing edge cases.
 
-- [sage_docs/SAGE_V4_PATCH_CHECKLIST.md](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/sage_docs/SAGE_V4_PATCH_CHECKLIST.md)
+- [sage_docs/SAGE_V4_PATCH_CHECKLIST.md](/./sage_docs/SAGE_V4_PATCH_CHECKLIST.md)
   - Patch-ready implementation items with priority, scope, risk, and test guidance.
 
-- [sage_docs/SAGE_V4_ACCEPTANCE_CRITERIA.md](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/sage_docs/SAGE_V4_ACCEPTANCE_CRITERIA.md)
+- [sage_docs/SAGE_V4_ACCEPTANCE_CRITERIA.md](/./sage_docs/SAGE_V4_ACCEPTANCE_CRITERIA.md)
   - Post-fix truth conditions, non-regression constraints, and verification steps.
 
-- [sage_docs/SAGE_V4_REVIEW_RULES.md](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/sage_docs/SAGE_V4_REVIEW_RULES.md)
+- [sage_docs/SAGE_V4_REVIEW_RULES.md](/./sage_docs/SAGE_V4_REVIEW_RULES.md)
   - Reusable rules for lifecycle, signing safety, offer creation, readiness, validation, and coin-state handling.
 
-- [AGENTS.md](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/AGENTS.md)
+- [AGENTS.md](/./AGENTS.md)
   - Standing repository instructions that require those Sage review rules to be applied when editing or reviewing Sage-related code.
 
 ## 3. Sage integration overview in this project
@@ -58,38 +58,38 @@ This project uses Sage as a local wallet backend for:
 
 ### Key files involved
 
-- [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py)
+- [wallet_sage.py](/./wallet_sage.py)
   - primary Sage adapter
 
-- [wallet.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet.py)
+- [wallet.py](/./wallet.py)
   - backend selector
 
-- [chia_node.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/chia_node.py)
+- [chia_node.py](/./chia_node.py)
   - startup and login orchestration
 
-- [coin_prep_worker.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/coin_prep_worker.py)
+- [coin_prep_worker.py](/./coin_prep_worker.py)
   - pending transaction polling and coin-prep sequencing
 
-- [test_coin_prep.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/test_coin_prep.py)
-- [test_hidden_coins.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/test_hidden_coins.py)
+- [test_coin_prep.py](/./test_coin_prep.py)
+- [test_hidden_coins.py](/./test_hidden_coins.py)
   - manual/integration-style Sage helper usage
 
 ### Important call paths
 
 - Startup/login:
-  - [chia_node.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/chia_node.py) `_log_in_fingerprint()`
-  - calls [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py) `sage_login()`
+  - [chia_node.py](/./chia_node.py) `_log_in_fingerprint()`
+  - calls [wallet_sage.py](/./wallet_sage.py) `sage_login()`
 
 - Offer creation:
-  - [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py) `create_offer()`
+  - [wallet_sage.py](/./wallet_sage.py) `create_offer()`
 
 - Offer cancellation:
-  - [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py) `cancel_offer()`
+  - [wallet_sage.py](/./wallet_sage.py) `cancel_offer()`
 
 - Pending transaction polling:
-  - [coin_prep_worker.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/coin_prep_worker.py)
-  - [test_coin_prep.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/test_coin_prep.py)
-  - [test_hidden_coins.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/test_hidden_coins.py)
+  - [coin_prep_worker.py](/./coin_prep_worker.py)
+  - [test_coin_prep.py](/./test_coin_prep.py)
+  - [test_hidden_coins.py](/./test_hidden_coins.py)
 
 ### Current integration assumptions
 
@@ -106,8 +106,8 @@ This project uses Sage as a local wallet backend for:
 - Title: Missing explicit Sage initialization lifecycle
 - Severity/priority: High / P0
 - Exact file:
-  - [chia_node.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/chia_node.py)
-  - [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py)
+  - [chia_node.py](/./chia_node.py)
+  - [wallet_sage.py](/./wallet_sage.py)
 - Exact function:
   - `_log_in_fingerprint()`
   - `sage_login()`
@@ -123,7 +123,7 @@ This project uses Sage as a local wallet backend for:
 - Title: Live `get_pending_transactions()` does not use documented endpoint
 - Severity/priority: High / P0
 - Exact file:
-  - [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py)
+  - [wallet_sage.py](/./wallet_sage.py)
 - Exact function:
   - `get_pending_transactions()`
 - What the code currently does:
@@ -138,7 +138,7 @@ This project uses Sage as a local wallet backend for:
 - Title: Live `get_spendable_coin_count()` does not use documented endpoint
 - Severity/priority: High / P0
 - Exact file:
-  - [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py)
+  - [wallet_sage.py](/./wallet_sage.py)
 - Exact function:
   - `get_spendable_coin_count()`
 - What the code currently does:
@@ -153,7 +153,7 @@ This project uses Sage as a local wallet backend for:
 - Title: `create_offer()` ignores `validate_only`
 - Severity/priority: High / P0
 - Exact file:
-  - [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py)
+  - [wallet_sage.py](/./wallet_sage.py)
 - Exact function:
   - `create_offer()`
 - What the code currently does:
@@ -169,7 +169,7 @@ This project uses Sage as a local wallet backend for:
 - Title: `get_wallet_sync_status()` invents `synced=None` semantics
 - Severity/priority: Medium / P1
 - Exact file:
-  - [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py)
+  - [wallet_sage.py](/./wallet_sage.py)
 - Exact function:
   - `get_wallet_sync_status()`
 - What the code currently does:
@@ -186,7 +186,7 @@ This project uses Sage as a local wallet backend for:
 - Title: `cancel_offer()` treats `500` and `202` like success
 - Priority: P1
 - Exact file:
-  - [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py)
+  - [wallet_sage.py](/./wallet_sage.py)
 - Exact function:
   - `cancel_offer()`
 - Why it is likely a real problem:
@@ -199,7 +199,7 @@ This project uses Sage as a local wallet backend for:
 - Title: Exact `offer_id` attribution is available but not consistently used
 - Priority: P1
 - Exact file:
-  - [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py)
+  - [wallet_sage.py](/./wallet_sage.py)
 - Exact function:
   - `get_owned_coins()`
   - `get_owned_coins_detailed()`
@@ -215,8 +215,8 @@ This project uses Sage as a local wallet backend for:
 - Title: Session lifecycle is compressed into `resync + login`
 - Priority: P0
 - Exact file:
-  - [chia_node.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/chia_node.py)
-  - [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py)
+  - [chia_node.py](/./chia_node.py)
+  - [wallet_sage.py](/./wallet_sage.py)
 - Exact function:
   - `_log_in_fingerprint()`
   - `sage_login()`
@@ -231,14 +231,14 @@ This project uses Sage as a local wallet backend for:
 - Edge case:
   - watch-only wallets can be queried but must not sign
 - Affected file/function:
-  - [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py)
+  - [wallet_sage.py](/./wallet_sage.py)
     - `get_sage_keys()`
     - `send_transaction()`
     - `send_transaction_multi()`
     - `create_offer()`
     - `cancel_offer()`
     - split/combine helpers
-  - [chia_node.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/chia_node.py) if active-wallet gating is enforced there
+  - [chia_node.py](/./chia_node.py) if active-wallet gating is enforced there
 - Documented Sage expectation:
   - callers should block signing flows for wallets without secrets
 - Current gap:
@@ -251,7 +251,7 @@ This project uses Sage as a local wallet backend for:
 - Edge case:
   - request-only offers are allowed only with a fee
 - Affected file/function:
-  - [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py) `create_offer()`
+  - [wallet_sage.py](/./wallet_sage.py) `create_offer()`
 - Documented Sage expectation:
   - request-only offers must include a fee
 - Current gap:
@@ -263,7 +263,7 @@ This project uses Sage as a local wallet backend for:
 - Edge case:
   - wrong-network or malformed addresses must be blocked before send
 - Affected file/function:
-  - [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py)
+  - [wallet_sage.py](/./wallet_sage.py)
     - `send_transaction()`
     - `send_transaction_multi()`
     - `send_cat_multi()`
@@ -278,8 +278,8 @@ This project uses Sage as a local wallet backend for:
 - Edge case:
   - failed first init may block later retries; startup-sensitive operations must be serialized
 - Affected file/function:
-  - [chia_node.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/chia_node.py) `_log_in_fingerprint()`
-  - [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py) `sage_login()`
+  - [chia_node.py](/./chia_node.py) `_log_in_fingerprint()`
+  - [wallet_sage.py](/./wallet_sage.py) `sage_login()`
 - Documented Sage expectation:
   - initialization failure, retry, and startup ordering should be handled explicitly
 - Current gap:
@@ -297,8 +297,8 @@ This project uses Sage as a local wallet backend for:
   - missing init failure/retry handling
   - lifecycle currently compressed into `resync + login`
 - Files touched:
-  - [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py)
-  - [chia_node.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/chia_node.py)
+  - [wallet_sage.py](/./wallet_sage.py)
+  - [chia_node.py](/./chia_node.py)
 - Why these changes belong together:
   - they all affect the same startup/login boundary
 - Risk level:
@@ -314,7 +314,7 @@ This project uses Sage as a local wallet backend for:
   - `get_spendable_coin_count()` should use the documented endpoint
   - duplicate shadowing definitions should be removed
 - Files touched:
-  - [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py)
+  - [wallet_sage.py](/./wallet_sage.py)
 - Why these changes belong together:
   - both are adapter read helpers currently shadowed by duplicate definitions
 - Risk level:
@@ -329,7 +329,7 @@ This project uses Sage as a local wallet backend for:
   - `create_offer()` ignores `validate_only`
   - request-only fee rule is not enforced
 - Files touched:
-  - [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py)
+  - [wallet_sage.py](/./wallet_sage.py)
 - Why these changes belong together:
   - both changes are inside the same public offer-construction function
 - Risk level:
@@ -343,8 +343,8 @@ This project uses Sage as a local wallet backend for:
 - Issues included:
   - signing operations are not blocked for wallets without secrets
 - Files touched:
-  - [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py)
-  - possibly [chia_node.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/chia_node.py)
+  - [wallet_sage.py](/./wallet_sage.py)
+  - possibly [chia_node.py](/./chia_node.py)
 - Why these changes belong together:
   - this is one safety policy applied across signing entry points
 - Risk level:
@@ -358,7 +358,7 @@ This project uses Sage as a local wallet backend for:
 - Issues included:
   - `get_wallet_sync_status()` invents undocumented `synced=None` behavior
 - Files touched:
-  - [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py)
+  - [wallet_sage.py](/./wallet_sage.py)
 - Why these changes belong together:
   - this is one contained readiness logic correction
 - Risk level:
@@ -372,7 +372,7 @@ This project uses Sage as a local wallet backend for:
 - Issues included:
   - `cancel_offer()` treats undocumented `500` and `202` as success
 - Files touched:
-  - [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py)
+  - [wallet_sage.py](/./wallet_sage.py)
 - Why these changes belong together:
   - this is a narrow error-normalization correction in one function
 - Risk level:
@@ -386,7 +386,7 @@ This project uses Sage as a local wallet backend for:
 - Issues included:
   - send helpers do not perform caller-side network/address validation
 - Files touched:
-  - [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py)
+  - [wallet_sage.py](/./wallet_sage.py)
 - Why these changes belong together:
   - all affected functions are outbound send helpers and need the same validation rule
 - Risk level:
@@ -400,7 +400,7 @@ This project uses Sage as a local wallet backend for:
 - Issues included:
   - exact `offer_id`-based reconciliation is available but not consistently used
 - Files touched:
-  - [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py)
+  - [wallet_sage.py](/./wallet_sage.py)
   - immediate Sage-specific callers if they consume heuristic lock attribution
 - Why these changes belong together:
   - this is one data-model correction: prefer Sage's exact `offer_id` lock attribution
@@ -761,7 +761,7 @@ Recommended first batch:
 
 Why start there:
 - it is the smallest safe batch
-- it is confined to [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py)
+- it is confined to [wallet_sage.py](/./wallet_sage.py)
 - repository search already confirmed:
   - `get_pending_transactions()` callers do not pass `wallet_id`
   - callers only depend on "returns a list, empty means no pending transactions"

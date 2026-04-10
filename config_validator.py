@@ -180,8 +180,10 @@ def validate_config(cfg) -> ValidationReport:
     max_buy = getattr(cfg, "MAX_ACTIVE_BUY_OFFERS", 25)
     max_sell = getattr(cfg, "MAX_ACTIVE_SELL_OFFERS", 25)
     total_offers = max_buy + max_sell
-    if total_offers > 100:
-        warn("MAX_ACTIVE_*_OFFERS", f"Total max offers ({total_offers}) > 100 — wallet may struggle")
+    # Smart Defaults spreads the ladder widely (up to ~60 per side on busy
+    # markets, ~120 total) — only warn well above that.
+    if total_offers > 300:
+        warn("MAX_ACTIVE_*_OFFERS", f"Total max offers ({total_offers}) > 300 — wallet may struggle")
 
     # ---- Requoting ----
     requote_cooldown = getattr(cfg, "REQUOTE_COOLDOWN_SECS", 60)

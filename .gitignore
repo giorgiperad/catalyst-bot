@@ -6,6 +6,7 @@
 # --- Secrets & environment ---
 .env
 .env.*
+!.env.example
 user_secrets.json
 secrets.json
 
@@ -64,6 +65,7 @@ src-tauri/target/
 # --- Backup and archive directories (large, no public value) ---
 _backups/
 _archive/
+backups_pre_*/
 _tauri_release_runtime_monitor/
 tauri-shell/
 
@@ -92,6 +94,11 @@ splash.exe
 splash.exe.bak
 *.exe
 *.exe.bak
+
+# --- Claude Code local settings (contains session tokens + wallet fingerprints) ---
+.claude/settings.local.json
+.claude/launch.json
+.claude/projects/
 
 # --- Misc ---
 tmp_greenfloor_review/

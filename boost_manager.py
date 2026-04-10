@@ -23,6 +23,7 @@ Usage:
 """
 
 import time
+import threading
 from decimal import Decimal
 from typing import Optional, Dict, List
 
@@ -56,12 +57,17 @@ class BoostManager:
         self._dexie_manager = dexie_manager
         self._risk_manager = risk_manager
 
+        # Re-entrant lock protecting mutation of _active_boost_ids,
+        # _boost_active, _gap_spread_bps, _boost_id_expiry, convergence,
+        # and cascade tracking.  RLock so helpers called under the lock
+        # (e.g. _create_gap_closer_pair → _create_single_offer) can
+        # re-acquire without deadlocking.
+        self._lock = threading.RLock()
+
         # State
         self._boost_active: bool = False
         self._active_boost_ids: List[str] = []
         self._boost_mid_price: Decimal = Decimal("0")  # Price of current offers
-        self._last_activate_time: float = 0
-        self._last_refresh_time: float = 0
 
         # ---- Adaptive gap-closer spread (changes over time!) ----
         self._gap_spread_bps: int = 0        # Current gap-closer spread
@@ -126,6 +132,13 @@ class BoostManager:
         if mid_price <= 0:
             return {"success": False, "error": "No valid mid price available"}
 
+        # Circuit breaker check — refuse to create pair if either side blocked.
+        if self._cb_blocks_boost():
+            return {
+                "success": False,
+                "error": "Circuit breaker active — Close the Gap cannot create offers",
+            }
+
         # Store user overrides
         self._custom_size_xch = size_xch_override
 
@@ -162,7 +175,6 @@ class BoostManager:
 
         if created:
             self._boost_active = True
-            self._last_activate_time = time.time()
             self._stable_since = time.time()
             self._steps_taken = 0
             self._arb_count = 0
@@ -205,42 +217,80 @@ class BoostManager:
             return self._custom_size_xch
         return Decimal(str(getattr(cfg, "SNIPER_SIZE_XCH", "0.2")))
 
+    def _cb_blocks_boost(self) -> bool:
+        """Return True if the circuit breaker should block boost activity.
+
+        Boost creates a buy+sell PAIR, so we must pause entirely if either
+        side is blocked (partial halts included).  A blocked side would leave
+        only one leg on the book, defeating the gap-closer premise and
+        potentially worsening the imbalance that tripped the CB.
+        """
+        rm = self._risk_manager
+        if rm is None:
+            return False
+        try:
+            if rm.is_full_halt():
+                return True
+            blocked = rm.get_circuit_breaker_blocked_side() or ""
+            if blocked in ("buy", "sell"):
+                return True
+        except Exception:
+            # Fail open on unexpected errors — boost already has a refresh
+            # cycle that will catch up once the CB surfaces correctly.
+            return False
+        return False
+
     def deactivate(self) -> Dict:
         """Turn gap-closer OFF — cancel all offers, reset spread to normal."""
-        if not self._boost_active and not self._active_boost_ids:
-            return {"success": True, "message": "Close the Gap already inactive"}
+        with self._lock:
+            if not self._boost_active and not self._active_boost_ids:
+                return {"success": True, "message": "Close the Gap already inactive"}
 
-        cancelled = 0
-        failed = 0
+            cancelled = 0
+            failed = 0
 
-        if self._active_boost_ids and self._offer_manager:
-            for tid in self._active_boost_ids:
-                self._offer_manager._bot_cancelled_ids.add(tid)
-            result = self._offer_manager.cancel_offers(
-                self._active_boost_ids, reason="gap_closer_deactivate"
+            # Snapshot IDs under the lock so the network cancel runs on a
+            # stable list (we release the lock for the cancel RPC below to
+            # avoid holding it across a wallet call).
+            to_cancel = list(self._active_boost_ids)
+            offer_mgr = self._offer_manager
+
+        if to_cancel and offer_mgr:
+            for tid in to_cancel:
+                offer_mgr._bot_cancelled_ids.add(tid)
+            result = offer_mgr.cancel_offers(
+                to_cancel, reason="gap_closer_deactivate"
             )
+            # cancel_offers returns {trade_id: {"success": bool, ...}, ...}
+            # — NOT {"cancelled": N, "failed": N}. Count by iterating values.
             if isinstance(result, dict):
-                cancelled = result.get("cancelled", 0)
-                failed = result.get("failed", 0)
+                for _tid, _res in result.items():
+                    if isinstance(_res, dict) and _res.get("success"):
+                        cancelled += 1
+                    else:
+                        failed += 1
 
-        self._boost_active = False
-        self._active_boost_ids.clear()
-        self._boost_mid_price = Decimal("0")
-        self._gap_spread_bps = 0
-        self._start_spread_bps = 0
-        self._arb_floor_bps = 0
-        self._custom_size_xch = None
-        # Reset convergence — main book spread back to normal
-        self._convergence_factor = Decimal("1.0")
-        self._stable_since = 0
-        self._cascade_done_at_spread = -1
+        with self._lock:
+            self._boost_active = False
+            self._active_boost_ids.clear()
+            self._boost_mid_price = Decimal("0")
+            self._gap_spread_bps = 0
+            self._start_spread_bps = 0
+            self._arb_floor_bps = 0
+            self._custom_size_xch = None
+            # Reset convergence — main book spread back to normal
+            self._convergence_factor = Decimal("1.0")
+            self._stable_since = 0
+            self._cascade_done_at_spread = -1
+            steps_taken = self._steps_taken
+            arb_count = self._arb_count
 
         log_event("info", "gap_closer_deactivated",
                   f"📈 Close the Gap OFF — cancelled {cancelled} offers, "
                   f"spread reset to normal")
         print(f"📈 Close the Gap OFF: cancelled {cancelled} offers "
-              f"({self._steps_taken} steps taken, "
-              f"{self._arb_count} times arbed)", flush=True)
+              f"({steps_taken} steps taken, "
+              f"{arb_count} times arbed)", flush=True)
 
         return {
             "success": True,
@@ -265,6 +315,11 @@ class BoostManager:
         Returns True if a step was taken (offers recreated at tighter spread).
         """
         if not self._boost_active or self._gap_spread_bps == 0:
+            return False
+
+        # Circuit breaker — skip stepping while CB is active. Existing offers
+        # stay put; they will be refreshed (or not) next cycle once CB clears.
+        if self._cb_blocks_boost():
             return False
 
         now = time.time()
@@ -379,6 +434,11 @@ class BoostManager:
         if current_mid_price <= 0:
             return False
 
+        # Circuit breaker — skip refresh while CB is active so we don't
+        # recreate an imbalanced pair while the bot is trying to correct.
+        if self._cb_blocks_boost():
+            return False
+
         # ---- Check 1: Are offers still alive? ----
         needs_refresh = False
         refresh_reason = ""
@@ -433,7 +493,6 @@ class BoostManager:
 
         if created:
             self._total_refreshes += 1
-            self._last_refresh_time = time.time()
             log_event("info", "gap_closer_refreshed",
                       f"📈 Gap closer refreshed: {len(created)} offers at "
                       f"{_bps_to_pct(self._gap_spread_bps)}, mid {current_mid_price:.8f}")
@@ -456,37 +515,40 @@ class BoostManager:
         Also detects arb fills: if an offer disappeared but was NOT
         bot-cancelled, it was arbed. This triggers spread widening.
         """
-        before = len(self._active_boost_ids)
+        with self._lock:
+            before = len(self._active_boost_ids)
 
-        bot_cancelled = set()
-        if self._offer_manager:
-            bot_cancelled = self._offer_manager._bot_cancelled_ids
+            bot_cancelled = set()
+            if self._offer_manager:
+                bot_cancelled = self._offer_manager._bot_cancelled_ids
 
-        now = time.time()
-        for tid in self._active_boost_ids:
-            if tid not in open_trade_ids and tid not in bot_cancelled:
-                # Before declaring arb, check if this offer simply expired.
-                # Gap closer offers carry a 60-second expiry; when the time
-                # is up they vanish from the wallet without a cancel tx.
-                expiry_time = self._boost_id_expiry.get(tid, 0)
-                if expiry_time > 0 and now >= (expiry_time - 5):
-                    # Natural expiry — not an arb fill, don't widen spread
-                    log_event("debug", "gap_closer_offer_expired",
-                              f"Gap closer offer {tid[:16]}… expired naturally (not arbed)")
-                else:
-                    # Disappeared before expiry — this was arbed
-                    self._arb_count += 1
-                    self._on_arbed()
+            now = time.time()
+            # Iterate over a snapshot so _on_arbed() cannot mutate the list
+            # out from under us.
+            for tid in list(self._active_boost_ids):
+                if tid not in open_trade_ids and tid not in bot_cancelled:
+                    # Before declaring arb, check if this offer simply expired.
+                    # Gap closer offers carry a 60-second expiry; when the time
+                    # is up they vanish from the wallet without a cancel tx.
+                    expiry_time = self._boost_id_expiry.get(tid, 0)
+                    if expiry_time > 0 and now >= (expiry_time - 5):
+                        # Natural expiry — not an arb fill, don't widen spread
+                        log_event("debug", "gap_closer_offer_expired",
+                                  f"Gap closer offer {tid[:16]}… expired naturally (not arbed)")
+                    else:
+                        # Disappeared before expiry — this was arbed
+                        self._arb_count += 1
+                        self._on_arbed()
 
-        self._active_boost_ids = [
-            tid for tid in self._active_boost_ids if tid in open_trade_ids
-        ]
-        # Clean up stale expiry entries older than 5 minutes
-        self._boost_id_expiry = {
-            k: v for k, v in self._boost_id_expiry.items()
-            if v > now - 300
-        }
-        pruned = before - len(self._active_boost_ids)
+            self._active_boost_ids = [
+                tid for tid in self._active_boost_ids if tid in open_trade_ids
+            ]
+            # Clean up stale expiry entries older than 5 minutes
+            self._boost_id_expiry = {
+                k: v for k, v in self._boost_id_expiry.items()
+                if v > now - 300
+            }
+            pruned = before - len(self._active_boost_ids)
 
         if pruned > 0:
             log_event("debug", "gap_closer_pruned",
@@ -608,6 +670,10 @@ class BoostManager:
             # natural expiry for an arb fill.
             self._boost_id_expiry[trade_id] = time.time() + offer_expiry
 
+            # expires_at matches the on-chain expiry so cleanup and dashboard
+            # reporting stay consistent with the actual wallet offer lifetime.
+            from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+            _expiry_iso = (_dt.now(_tz.utc) + _td(seconds=offer_expiry)).strftime("%Y-%m-%d %H:%M:%S")
             db_ok = add_offer(
                 trade_id=trade_id,
                 side=side,
@@ -616,6 +682,8 @@ class BoostManager:
                 size_cat=cat_amount,
                 cat_asset_id=cfg.CAT_ASSET_ID,
                 tier="boost",
+                expires_at=_expiry_iso,
+                coin_id=locked_coin_id,
             )
             if not db_ok:
                 # DB insert failed — cancel the on-chain offer to prevent
@@ -665,29 +733,30 @@ class BoostManager:
         Widens the gap-closer spread by 20% and resets stability timer.
         Also widens the main book convergence factor.
         """
-        if self._gap_spread_bps <= 0:
-            return
+        with self._lock:
+            if self._gap_spread_bps <= 0:
+                return
 
-        old_spread = self._gap_spread_bps
+            old_spread = self._gap_spread_bps
 
-        # Widen gap-closer spread by 20%
-        new_spread = int(self._gap_spread_bps * 1.2)
+            # Widen gap-closer spread by 20%
+            new_spread = int(self._gap_spread_bps * 1.2)
 
-        # Never widen beyond where we started
-        new_spread = min(new_spread, self._start_spread_bps)
-        self._gap_spread_bps = new_spread
+            # Never widen beyond where we started
+            new_spread = min(new_spread, self._start_spread_bps)
+            self._gap_spread_bps = new_spread
 
-        # Reset stability timer — need to prove stability again
-        self._stable_since = 0
-        # Reset cascade — need to re-prove at the new wider spread
-        self._cascade_done_at_spread = -1
+            # Reset stability timer — need to prove stability again
+            self._stable_since = 0
+            # Reset cascade — need to re-prove at the new wider spread
+            self._cascade_done_at_spread = -1
 
-        # Also widen main book convergence by 20%
-        old_factor = self._convergence_factor
-        self._convergence_factor = min(
-            Decimal("1.0"),
-            self._convergence_factor + Decimal("0.20")
-        )
+            # Also widen main book convergence by 20%
+            old_factor = self._convergence_factor
+            self._convergence_factor = min(
+                Decimal("1.0"),
+                self._convergence_factor + Decimal("0.20")
+            )
 
         log_event("warning", "gap_closer_arbed",
                   f"⚠️ Gap closer arbed! Widening: "
@@ -999,61 +1068,47 @@ class BoostManager:
 
         return stale
 
-    def mark_cascade_done(self):
-        """Record that the main book has been cascaded at the current spread.
-
-        Called by bot_loop after it force-requotes the main book.
-        Prevents the cascade from re-triggering at the same spread level.
-        """
-        self._cascade_done_at_spread = self._gap_spread_bps
-        self._cascade_count += 1
-        log_event("info", "gap_closer_cascade",
-                  f"📈 Main book cascaded to match probe at "
-                  f"{_bps_to_pct(self._gap_spread_bps)} spread "
-                  f"(cascade #{self._cascade_count})")
-        print(f"📈 Main book cascading — offers rebuilding behind probe "
-              f"at {_bps_to_pct(self._gap_spread_bps)}", flush=True)
-
     # -------------------------------------------------------------------
     # State query
     # -------------------------------------------------------------------
 
     def get_state(self) -> Dict:
-        """Get gap-closer state for GUI."""
-        stable_secs = 0
-        if self._stable_since > 0:
-            stable_secs = time.time() - self._stable_since
+        """Get gap-closer state for GUI (thread-safe snapshot)."""
+        with self._lock:
+            stable_secs = 0
+            if self._stable_since > 0:
+                stable_secs = time.time() - self._stable_since
 
-        cooldown = getattr(cfg, "GAP_CLOSE_STEP_COOLDOWN_SECS", 300)
-        now = time.time()
-        # The actual blocker is whichever timer has more time left:
-        # 1) cooldown since last step, 2) stability proof since last arb/refresh
-        step_wait = max(0, cooldown - (now - self._last_step_time))
-        stable_wait = max(0, cooldown - stable_secs) if self._stable_since > 0 else cooldown
-        secs_until_step = max(0, int(max(step_wait, stable_wait)))
+            cooldown = getattr(cfg, "GAP_CLOSE_STEP_COOLDOWN_SECS", 300)
+            now = time.time()
+            # The actual blocker is whichever timer has more time left:
+            # 1) cooldown since last step, 2) stability proof since last arb/refresh
+            step_wait = max(0, cooldown - (now - self._last_step_time))
+            stable_wait = max(0, cooldown - stable_secs) if self._stable_since > 0 else cooldown
+            secs_until_step = max(0, int(max(step_wait, stable_wait)))
 
-        return {
-            "active": self._boost_active,
-            "boost_count": len(self._active_boost_ids),
-            "boost_mid_price": str(self._boost_mid_price),
-            # Adaptive spread info
-            "current_spread_bps": self._gap_spread_bps,
-            "start_spread_bps": self._start_spread_bps,
-            "arb_floor_bps": self._arb_floor_bps,
-            "steps_taken": self._steps_taken,
-            "arb_count": self._arb_count,
-            "secs_until_step": secs_until_step,
-            # Offer details
-            "size_xch": str(self._effective_size_xch()),
-            "active_ids": list(self._active_boost_ids),
-            # Main book convergence
-            "convergence_factor": str(self._convergence_factor),
-            "convergence_pct": str(self._convergence_factor * Decimal("100")),
-            # Stats
-            "total_refreshes": self._total_refreshes,
-            "total_arb_warnings": self._total_arb_warnings,
-            "stable_secs": int(stable_secs),
-            # Cascade info
-            "cascade_count": self._cascade_count,
-            "cascade_ready": self.should_cascade(),
-        }
+            return {
+                "active": self._boost_active,
+                "boost_count": len(self._active_boost_ids),
+                "boost_mid_price": str(self._boost_mid_price),
+                # Adaptive spread info
+                "current_spread_bps": self._gap_spread_bps,
+                "start_spread_bps": self._start_spread_bps,
+                "arb_floor_bps": self._arb_floor_bps,
+                "steps_taken": self._steps_taken,
+                "arb_count": self._arb_count,
+                "secs_until_step": secs_until_step,
+                # Offer details
+                "size_xch": str(self._effective_size_xch()),
+                "active_ids": list(self._active_boost_ids),
+                # Main book convergence
+                "convergence_factor": str(self._convergence_factor),
+                "convergence_pct": str(self._convergence_factor * Decimal("100")),
+                # Stats
+                "total_refreshes": self._total_refreshes,
+                "total_arb_warnings": self._total_arb_warnings,
+                "stable_secs": int(stable_secs),
+                # Cascade info
+                "cascade_count": self._cascade_count,
+                "cascade_ready": self.should_cascade(),
+            }

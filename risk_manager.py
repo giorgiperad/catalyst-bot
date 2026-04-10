@@ -120,12 +120,33 @@ class RiskManager:
         Returns current inventory state.
         """
         try:
-            self._net_position_cat = get_net_position(cfg.CAT_ASSET_ID)
+            new_pos = get_net_position(cfg.CAT_ASSET_ID)
         except Exception as e:
             log_event("warning", "inventory_update_failed",
                       f"Failed to get net position: {e}")
+            return self.get_inventory_state()
+
+        # Acquire CB lock briefly to pair with reset_position() so a reset
+        # can't land between this read and write and be silently overwritten.
+        with self._cb_lock:
+            self._net_position_cat = new_pos
 
         return self.get_inventory_state()
+
+    def reset_position(self) -> None:
+        """Reset net position and startup baseline atomically.
+
+        Used by the API position-reset endpoints. Resets the inherited
+        startup baseline too — otherwise the effective position limit
+        stays inflated by the old baseline and lets the bot exceed
+        MAX_POSITION_XCH after a reset.
+        """
+        with self._cb_lock:
+            self._net_position_cat = Decimal("0")
+            self._startup_position_xch = None
+            self._soft_position_warned = False
+        log_event("info", "position_reset",
+                  "Net position and startup baseline reset to zero")
 
     def record_snapshot(self, xch_balance: Optional[Decimal] = None,
                         cat_balance: Optional[Decimal] = None,
@@ -346,12 +367,47 @@ class RiskManager:
     def _get_volatility(self) -> Decimal:
         """Get recent price volatility, with caching.
 
-        Refreshes every 5 minutes from the price engine.
+        Refreshes every 5 minutes. Uses two sources, in order of
+        preference:
+
+          1. F37 (2026-04-08) — Dexie v3 historical_trades. Real
+             trade-flow variance for the actual pair. This is the
+             most accurate signal because it's based on actual
+             executed trades, not bot-observed mid snapshots.
+
+          2. price_engine.get_volatility — fallback that infers
+             volatility from price snapshots stored in the local DB.
         """
         now = time.time()
         if now - self._volatility_updated < 300 and self._cached_volatility > 0:
             return self._cached_volatility
 
+        # F37: try Dexie v3 historical trades first
+        try:
+            dm = getattr(self, "_dexie_manager", None)
+            ticker_id = getattr(cfg, "CAT_TICKER_ID", "")
+            if dm and ticker_id:
+                metrics = dm.compute_v3_trade_metrics(
+                    ticker_id, hours=float(cfg.VOLATILITY_WINDOW_HOURS)
+                )
+                if metrics and metrics.get("trades_in_window", 0) >= 5:
+                    # Convert percent to fraction (e.g. 3.5% → 0.035)
+                    vol_pct = float(metrics.get("price_stdev_pct", 0))
+                    vol_dec = Decimal(str(vol_pct / 100.0))
+                    if vol_dec > 0:
+                        self._cached_volatility = vol_dec
+                        self._volatility_updated = now
+                        log_event(
+                            "debug",
+                            "vol_from_v3_trades",
+                            f"Volatility from Dexie v3 trades: "
+                            f"{vol_pct:.2f}% (n={metrics['trades_in_window']})",
+                        )
+                        return vol_dec
+        except Exception:
+            pass
+
+        # Fallback: legacy price_engine snapshot-based volatility
         if self._price_engine:
             try:
                 vol = self._price_engine.get_volatility(
@@ -500,35 +556,25 @@ class RiskManager:
     def get_tier_size(self, tier: str, side: str = "sell") -> Decimal:
         """Get the order size for a given tier.
 
-        Default (sell side): larger orders near mid (inner), smaller at extremes.
-        This concentrates sell-side liquidity where fills are most likely.
-
-        Buy side (when BUY_LADDER_REVERSED=True): tier sizes are inverted so the
-        smallest commitment is closest to price and the largest is furthest away.
-        This limits XCH exposure when sellers hit the top of the book, and
-        reserves large buy commitments for genuine support-level drops.
+        F62 (2026-04-09): per-side tier sizes. Reads through the per-side
+        helpers in config.py which prefer BUY_/SELL_ specific fields and
+        fall back to the shared legacy keys (with reverse-buy flipping)
+        when the per-side fields are zero. This lets Smart Settings size
+        each side independently from its own balance — the buy ladder can
+        have smaller offers than the sell ladder (or vice versa) so the
+        full wallet gets deployed.
         """
         if not cfg.TIER_ENABLED:
             return cfg.DEFAULT_TRADE_XCH
 
-        tier_sizes = {
-            "inner": cfg.INNER_SIZE_XCH,
-            "mid":   cfg.MID_SIZE_XCH,
-            "outer": cfg.OUTER_SIZE_XCH,
-            "extreme": cfg.EXTREME_SIZE_XCH,
-        }
-
-        # On buy side with reversal: flip inner↔extreme and mid↔outer so the
-        # smallest offers sit closest to price and the largest sit furthest away.
-        if side == "buy" and getattr(cfg, "BUY_LADDER_REVERSED", False):
-            tier_sizes = {
-                "inner":   cfg.EXTREME_SIZE_XCH,
-                "mid":     cfg.OUTER_SIZE_XCH,
-                "outer":   cfg.MID_SIZE_XCH,
-                "extreme": cfg.INNER_SIZE_XCH,
-            }
-
-        return tier_sizes.get(tier, cfg.DEFAULT_TRADE_XCH)
+        from config import get_buy_tier_size_xch, get_sell_tier_size_xch
+        if side == "buy":
+            val = get_buy_tier_size_xch(tier)
+        else:
+            val = get_sell_tier_size_xch(tier)
+        if val and val > 0:
+            return val
+        return cfg.DEFAULT_TRADE_XCH
 
     # -------------------------------------------------------------------
     # Circuit breakers
@@ -631,6 +677,14 @@ class RiskManager:
             elif self._net_position_cat < 0:
                 blocked_side = "sell"  # over-short: block more sells, keep buying
             else:
+                # F4 (2026-04-08): defensive dead branch.
+                # position_xch = abs(net_position_cat * price), so if
+                # net_position_cat == 0 then position_xch == 0 and the
+                # hard_limit > 0 check above cannot be true. We keep this
+                # branch as defense-in-depth in case future refactoring
+                # decouples position_xch from net_position_cat (e.g. adding
+                # a fee/funding component). Full halt is the safest fallback
+                # because we have no signal about which side to throttle.
                 blocked_side = ""      # unknown — full halt to be safe
             self._trip_circuit_breaker(
                 f"Position hard limit exceeded: {position_xch:.4f} XCH > "
@@ -768,6 +822,25 @@ class RiskManager:
                 return False
             return self._circuit_breaker_type != "position"
 
+    def trip_price_rail_breach(self, reason: str) -> None:
+        """Trip the price circuit breaker for a price-engine rail breach.
+
+        Used by bot_loop when price_engine.get_price() returns None because
+        _apply_safety_guards rejected the latest fetch (dynamic band, hard
+        min/max, or step-change). The bot_loop early-return path would
+        otherwise leave stale offers exposed at the now-wrong mid; routing
+        the breach through the CB lets _safeguard_offers_for_circuit_breaker
+        cancel them.
+
+        Always full-halt (blocked_side="") because a rejected price means
+        we don't trust the value enough to keep ANY side quoting.
+        """
+        self._trip_circuit_breaker(
+            reason=reason,
+            cb_type="price",
+            blocked_side="",
+        )
+
     # -------------------------------------------------------------------
     # Side enablement (inventory-aware)
     # -------------------------------------------------------------------
@@ -796,12 +869,13 @@ class RiskManager:
             "sell" — only sell creation is blocked (position CB, over-short)
             ""     — both sides blocked (price CB) OR no CB active
         """
-        return {
-            "active": self._circuit_breaker_active,
-            "blocked_side": self._circuit_breaker_blocked_side,
-            "type": self._circuit_breaker_type,
-            "reason": self._circuit_breaker_reason,
-        }
+        with self._cb_lock:
+            return {
+                "active": self._circuit_breaker_active,
+                "blocked_side": self._circuit_breaker_blocked_side,
+                "type": self._circuit_breaker_type,
+                "reason": self._circuit_breaker_reason,
+            }
 
     def should_enable_side(self, side: str, mid_price: Decimal = Decimal("0")) -> bool:
         """Check if a side should be enabled based on inventory and circuit breakers.
@@ -814,8 +888,10 @@ class RiskManager:
              INVENTORY_ENABLED is True.
         """
         # --- 1. Circuit breaker (hard stop, always enforced) ---
-        if self._circuit_breaker_active:
+        with self._cb_lock:
+            cb_active = self._circuit_breaker_active
             blocked = self._circuit_breaker_blocked_side
+        if cb_active:
             if blocked == "":
                 # Full halt (price CB or unknown type) — both sides blocked
                 return False
@@ -858,8 +934,13 @@ class RiskManager:
     # Market Health Assessment (Dashboard Command Centre)
     # -------------------------------------------------------------------
 
-    def get_market_health(self) -> Dict:
+    def get_market_health(self, loop_count: int = 0) -> Dict:
         """Evaluate overall market health for the dashboard traffic light.
+
+        Args:
+            loop_count: Current bot loop count. During the first few loops
+                        (< 3) certain amber warnings are suppressed to let
+                        the bot settle in (e.g. arb gap while sniper closes it).
 
         Returns a dict with:
         - status: "green", "amber", or "red"
@@ -899,6 +980,37 @@ class RiskManager:
         metrics["pool_depth_ratio"] = str(self._pool_depth_ratio)
         metrics["fill_rate_per_hour"] = str(self._recent_fill_rate)
         metrics["volatility"] = str(self._cached_volatility)
+
+        # F44 (2026-04-08): wire Dexie v3 historical-trades market metrics
+        # so the dashboard / Smart Settings / Advisor can compare the
+        # bot's own fills against the broader market. trades_per_hour
+        # is the *whole-market* fill rate for this CAT pair across all
+        # Dexie traders. price_stdev_pct is the realised market
+        # volatility (already used by _get_volatility but exposed here
+        # too so the GUI can show "Market vs Bot"). All keys are
+        # written even when v3 is unavailable so callers don't need
+        # try/except — they get nullable strings.
+        metrics["market_fill_rate_per_hour"] = None
+        metrics["market_volatility_pct"] = None
+        metrics["market_trades_in_window"] = None
+        metrics["market_high_low_pct"] = None
+        metrics["market_data_source"] = "unavailable"
+        try:
+            dm = getattr(self, "_dexie_manager", None)
+            ticker_id = getattr(cfg, "CAT_TICKER_ID", "")
+            if dm and ticker_id:
+                v3 = dm.compute_v3_trade_metrics(
+                    ticker_id,
+                    hours=float(getattr(cfg, "VOLATILITY_WINDOW_HOURS", 24.0)),
+                )
+                if v3:
+                    metrics["market_fill_rate_per_hour"] = f"{v3.get('trades_per_hour', 0):.3f}"
+                    metrics["market_volatility_pct"] = f"{v3.get('price_stdev_pct', 0):.3f}"
+                    metrics["market_trades_in_window"] = int(v3.get("trades_in_window", 0))
+                    metrics["market_high_low_pct"] = f"{v3.get('high_low_pct', 0):.3f}"
+                    metrics["market_data_source"] = "dexie_v3"
+        except Exception:
+            pass
 
         # --- Competitor & orderbook data (from market_intel if available) ---
         metrics["competitor_count"] = 0
@@ -978,7 +1090,9 @@ class RiskManager:
         # Treat gaps above 2.0% as attention-worthy in Market Health.
         # Smaller gaps can be normal on thinner CAT pairs and shouldn't
         # flip the dashboard amber on their own.
-        if self._arb_gap_bps > Decimal("200"):
+        # Suppress during first 3 loops — the sniper is still actively
+        # closing the gap and the bot needs time to settle.
+        if self._arb_gap_bps > Decimal("200") and loop_count >= 3:
             conditions.append(("amber", f"Arb gap {_bps_to_pct(self._arb_gap_bps)} between Dexie & TibetSwap — sniper is active. Check SNIPER_* settings if this persists."))
 
         # Competitor count — informational only, more competitors = healthier market
@@ -1006,6 +1120,12 @@ class RiskManager:
 
         if metrics.get("market_intel_state") != "ready" and not has_red and not has_amber:
             message = "Searching market orderbook..."
+
+        # During settling period (first 3 loops), show a calmer status
+        if loop_count > 0 and loop_count < 3 and not has_red:
+            if status == "green":
+                message = "Bot settling in — calibrating spreads and market data..."
+            # Don't override amber if there are non-arb-gap warnings (e.g. circuit breaker)
 
         return {
             "status": status,

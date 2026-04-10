@@ -305,19 +305,46 @@ class SplashNode:
                 log_event("warning", "splash_node_stale",
                           f"Failed to kill stale process: {e}")
         else:
-            # Unix: use lsof + kill
+            # Unix: use lsof + kill, but verify process name before killing
             try:
                 result = subprocess.run(
                     ["lsof", "-ti", f":{port}"],
                     capture_output=True, text=True, timeout=5
                 )
                 pids = result.stdout.strip().split()
+                killed_any = False
                 for pid in pids:
-                    if pid.isdigit():
-                        log_event("info", "splash_node_stale",
-                                  f"Killing stale PID {pid} on port {port}")
-                        os.kill(int(pid), signal.SIGTERM)
-                if pids:
+                    if not pid.isdigit():
+                        continue
+                    # Verify this is a splash process before killing — /proc
+                    # on Linux, ps fallback elsewhere.
+                    is_splash = False
+                    try:
+                        proc_cmd_path = f"/proc/{pid}/cmdline"
+                        if os.path.exists(proc_cmd_path):
+                            with open(proc_cmd_path, "rb") as _pf:
+                                cmdline = _pf.read().decode("utf-8", errors="replace")
+                            is_splash = "splash" in cmdline.lower()
+                        else:
+                            ps_res = subprocess.run(
+                                ["ps", "-p", pid, "-o", "comm="],
+                                capture_output=True, text=True, timeout=3
+                            )
+                            is_splash = "splash" in (ps_res.stdout or "").lower()
+                    except Exception:
+                        is_splash = False
+
+                    if not is_splash:
+                        log_event("warning", "splash_node_stale",
+                                  f"Refusing to kill PID {pid} on port {port} — "
+                                  f"not a splash process")
+                        continue
+
+                    log_event("info", "splash_node_stale",
+                              f"Killing stale PID {pid} on port {port}")
+                    os.kill(int(pid), signal.SIGTERM)
+                    killed_any = True
+                if killed_any:
                     time.sleep(1.5)
             except Exception as e:
                 log_event("warning", "splash_node_stale",
@@ -439,8 +466,24 @@ class SplashNode:
 
                     # Log interesting lines
                     lower = line.lower()
+                    # F62 (2026-04-09): suppress noisy startup burst.
+                    # When the bot rebroadcasts its existing offers on start,
+                    # Splash hasn't finished building its peer list yet and
+                    # returns "InsufficientPeers" for every single offer.
+                    # That produces 70+ warnings in the first second. Treat
+                    # them as debug during the first 30 s after the process
+                    # started, and only escalate to warning if they keep
+                    # coming after Splash has had time to bootstrap.
+                    _since_start = time.time() - float(self._start_time or 0)
+                    _is_startup_burst = (
+                        _since_start < 30
+                        and "insufficientpeers" in lower.replace(" ", "")
+                    )
                     if "duplicate" in lower:
                         log_event("debug", "splash_node_output", f"Splash: {line}")
+                    elif _is_startup_burst:
+                        log_event("debug", "splash_node_output",
+                                  f"Splash (startup): {line}")
                     elif "error" in lower or "failed" in lower:
                         log_event("warning", "splash_node_output", f"Splash: {line}")
                     elif "listening" in lower or "connected" in lower or "peer" in lower:
@@ -461,6 +504,18 @@ class SplashNode:
     def check_health(self) -> Dict:
         """Check Splash node health by pinging the submission endpoint."""
         submit_url = getattr(cfg, "SPLASH_SUBMIT_URL", "http://localhost:4000")
+
+        # If the user never clicked "Start Splash Node", _binary_path is
+        # still None because find_binary() only runs inside start(). Run
+        # a lazy lookup here so the health check reflects the real state
+        # of the filesystem rather than a stale "No binary" label when
+        # splash.exe is sitting right next to the app. Cheap — it's an
+        # os.path.isfile on a couple of known paths.
+        if self._binary_path is None:
+            try:
+                self.find_binary()
+            except Exception:
+                pass
 
         result = {
             "binary_found": self._binary_path is not None,

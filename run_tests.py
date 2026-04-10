@@ -166,7 +166,7 @@ def _run_simulation_tests() -> int:
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Chia Market Maker — Simulation Test Suite",
+        description="CATalyst — Simulation Test Suite",
         add_help=True,
     )
     mode = parser.add_mutually_exclusive_group()
@@ -222,7 +222,7 @@ def _run_simulation_tests() -> int:
     n_plan = (n_mat if run_parametric else 0) + n_api + n_str
 
     print()
-    print("Chia Market Maker — Simulation Test Suite")
+    print("CATalyst — Simulation Test Suite")
     print("=" * 42)
     parts = []
     if run_parametric:
@@ -321,7 +321,7 @@ def _sim_run_single(name: str) -> int:
 def _sim_run_matrix(full: bool = False, seed: int = 42):
     """Run parametric matrix. Returns (passed, failed, failures)."""
     from simulation.test_matrix import (
-        generate_matrix, generate_quick, generate_subset, run_matrix_scenario
+        generate_matrix, generate_quick, run_matrix_scenario
     )
     scenarios = generate_matrix() if full else generate_quick(n=50)
     total = len(scenarios)
@@ -376,7 +376,7 @@ def _sim_print_summary(elapsed, mx_p, mx_f, mx_fl, ap_p, ap_f, ap_fl, st_p, st_f
     total_p = total_f = 0
     all_fl = []
     print()
-    print("Chia Market Maker — Simulation Test Suite")
+    print("CATalyst — Simulation Test Suite")
     print("=" * 42)
     rows = []
     if mx_p is not None:

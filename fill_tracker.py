@@ -435,7 +435,7 @@ class FillTracker:
             elif verification == "rejected":
                 # Lifecycle: FILL_REJECTED signal → phantom_rejected terminal state.
                 try:
-                    from offer_lifecycle import OfferState, OfferSignal, apply_fill_verification
+                    from offer_lifecycle import OfferState
                     from database import update_offer_lifecycle_state as _uls
                     _uls(trade_id, str(OfferState.PHANTOM_REJECTED))
                 except Exception:
@@ -675,14 +675,63 @@ class FillTracker:
                       f"(coin {coin_id[:16]}...) — phantom fill prevented!")
             return "rejected"
         else:
-            # Fail closed here. None means the on-chain check did not produce
-            # a decisive external-fill answer for any candidate coin. That can
-            # happen because the explorer is unavailable, or because all spends
-            # look ambiguous (change-address pinning off).
+            # F63 (2026-04-10): Spacescan returned None (inconclusive). Before
+            # giving up, try two fallback verification paths — this is what
+            # the operator does manually when checking if a fill was real.
+
+            # Fallback 1: Ask Sage directly if the offer is confirmed/completed.
+            # This catches fills where Spacescan can't determine direction
+            # (common during AMM-mediated fills via TibetSwap where the on-chain
+            # spend pattern doesn't match direct peer-to-peer fills).
+            try:
+                sage_confirmed = self._check_sage_offer_confirmed(trade_id)
+                if sage_confirmed:
+                    log_event("success", "fill_verified_via_sage",
+                              f"Spacescan inconclusive BUT Sage confirms FILL for "
+                              f"{trade_id[:16]}... — recording fill.")
+                    return "filled"
+            except Exception as _sage_err:
+                log_event("debug", "fill_sage_fallback_failed",
+                          f"Sage fallback check failed for {trade_id[:16]}...: {_sage_err}")
+
+            # Fallback 2: Check Dexie API for the offer's completion status.
+            # If Dexie reports the offer as completed (status=4), that's
+            # authoritative — Dexie processes the on-chain spend bundle and
+            # knows definitively whether the offer was taken.
+            try:
+                dexie_id = (db_offer or {}).get("dexie_id")
+                if dexie_id:
+                    from dexie_manager import get_offer_detail
+                    detail = get_offer_detail(dexie_id, cache_ttl_secs=0, timeout=5)
+                    if detail and isinstance(detail, dict):
+                        # Validate the Dexie detail matches our trade_id
+                        # to prevent cross-offer confusion
+                        _dexie_trade = str(detail.get("trade_id") or "").lower().replace("0x", "")
+                        _our_trade = str(trade_id).lower().replace("0x", "")
+                        _trade_match = (
+                            _dexie_trade == _our_trade
+                            or not _dexie_trade  # no trade_id in response = trust dexie_id match
+                        )
+                        dexie_status = detail.get("status")
+                        if dexie_status == 4 and _trade_match:  # Dexie: 4 = completed/filled
+                            log_event("success", "fill_verified_via_dexie",
+                                      f"Spacescan inconclusive BUT Dexie confirms FILL "
+                                      f"(status=4) for {trade_id[:16]}... — recording fill.")
+                            return "filled"
+                        elif dexie_status == 0:  # Dexie: 0 = cancelled
+                            log_event("info", "fill_rejected_via_dexie",
+                                      f"Dexie reports CANCELLED (status=0) for "
+                                      f"{trade_id[:16]}... — not a fill.")
+                            return "rejected"
+            except Exception as _dexie_err:
+                log_event("debug", "fill_dexie_fallback_failed",
+                          f"Dexie fallback check failed for {trade_id[:16]}...: {_dexie_err}")
+
+            # All sources inconclusive — fail closed.
             log_event("warning", "fill_unverified",
                       f"On-chain verification inconclusive for {side} fill "
-                      f"{trade_id[:16]}... — NOT recording until the spend can be "
-                      f"distinguished from a self-spend")
+                      f"{trade_id[:16]}... — Spacescan, Sage, and Dexie all "
+                      f"inconclusive. NOT recording.")
             return "unverified"
 
     def _check_sage_offer_confirmed(self, trade_id: str) -> bool:

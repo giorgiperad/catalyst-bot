@@ -1,5 +1,5 @@
 """
-Notification Manager — Native OS notifications for the Chia Market Maker.
+Notification Manager — Native OS notifications for the CATalyst.
 
 Uses plyer for cross-platform notifications (Windows toast, macOS Notification
 Center, Linux libnotify). Supports per-category enable/disable and rate limiting
@@ -67,7 +67,7 @@ class NotificationManager:
     Sends native OS notifications with rate limiting and category control.
 
     Usage:
-        notifier = NotificationManager(app_name="Chia Market Maker")
+        notifier = NotificationManager(app_name="CATalyst")
 
         # Send a notification
         notifier.notify(
@@ -83,7 +83,7 @@ class NotificationManager:
         notifier.enabled = False
     """
 
-    def __init__(self, app_name: str = "Chia Market Maker"):
+    def __init__(self, app_name: str = "CATalyst"):
         if not PLYER_AVAILABLE:
             raise ImportError("plyer is not installed")
 

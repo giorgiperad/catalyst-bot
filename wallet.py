@@ -57,8 +57,6 @@ if WALLET_TYPE == "chia":
         split_coins_bulk,
         wait_for_coin_confirmations,
         get_transaction,
-        prepare_coins_for_offers_v2,
-        prepare_coins_for_trading,
         # Chia-specific coin queries (stubs for compatibility)
         get_owned_coins,
         get_selectable_coins_map,
@@ -134,8 +132,6 @@ else:
         split_coins_bulk,
         wait_for_coin_confirmations,
         get_transaction,
-        prepare_coins_for_offers_v2,
-        prepare_coins_for_trading,
         # Sage-specific coin queries (owned + selectable maps)
         get_owned_coins,
         get_owned_coins_detailed,

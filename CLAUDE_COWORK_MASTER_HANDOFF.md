@@ -23,14 +23,14 @@ This project is a desktop Chia market-making bot with:
 - wallet backends for both Chia and Sage
 
 Primary files:
-- [desktop_app.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/desktop_app.py)
-- [api_server.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/api_server.py)
-- [bot_loop.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/bot_loop.py)
-- [database.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/database.py)
-- [wallet.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet.py)
-- [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py)
-- [wallet_chia.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_chia.py)
-- [chia_node.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/chia_node.py)
+- [desktop_app.py](./desktop_app.py)
+- [api_server.py](./api_server.py)
+- [bot_loop.py](./bot_loop.py)
+- [database.py](./database.py)
+- [wallet.py](./wallet.py)
+- [wallet_sage.py](./wallet_sage.py)
+- [wallet_chia.py](./wallet_chia.py)
+- [chia_node.py](./chia_node.py)
 
 Important runtime characteristics:
 - desktop mode runs Flask and UI locally
@@ -41,7 +41,7 @@ Important runtime characteristics:
 
 ### 1. Unauthenticated control API exposed on all interfaces
 - Files:
-  - [api_server.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/api_server.py)
+  - [api_server.py](./api_server.py)
 - Problem:
   - Flask binds to `0.0.0.0`
   - sensitive routes have no auth
@@ -51,8 +51,8 @@ Important runtime characteristics:
 
 ### 2. Config API can persist unsafe or dead settings
 - Files:
-  - [api_server.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/api_server.py)
-  - [config.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/config.py)
+  - [api_server.py](./api_server.py)
+  - [config.py](./config.py)
 - Problem:
   - generic config writes can rewrite network endpoint settings
   - some config keys written by the API are not actually consumed by runtime
@@ -61,10 +61,10 @@ Important runtime characteristics:
 
 ### 3. Broken or drifting adapter contracts
 - Files:
-  - [app_bridge.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/app_bridge.py)
-  - [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py)
-  - [wallet_chia.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_chia.py)
-  - [database.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/database.py)
+  - [app_bridge.py](./app_bridge.py)
+  - [wallet_sage.py](./wallet_sage.py)
+  - [wallet_chia.py](./wallet_chia.py)
+  - [database.py](./database.py)
 - Problem:
   - broken bridge methods point at nonexistent functions
   - duplicate function definitions shadow earlier implementations
@@ -74,7 +74,7 @@ Important runtime characteristics:
 
 ### 4. Polling/status paths perform side effects and expensive work
 - Files:
-  - [api_server.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/api_server.py)
+  - [api_server.py](./api_server.py)
 - Problem:
   - `/api/status` performs network calls and logs during polling
   - expensive operational endpoints have no rate limiting
@@ -83,8 +83,8 @@ Important runtime characteristics:
 
 ### 5. Sage integration has documented mismatches and missing safeguards
 - Files:
-  - [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py)
-  - [chia_node.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/chia_node.py)
+  - [wallet_sage.py](./wallet_sage.py)
+  - [chia_node.py](./chia_node.py)
 - Problem:
   - missing explicit Sage lifecycle handling
   - duplicate endpoint helpers override documented behavior
@@ -98,8 +98,8 @@ Important runtime characteristics:
 
 #### Config update path writes keys the runtime does not actually read
 - Files:
-  - [api_server.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/api_server.py)
-  - [config.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/config.py)
+  - [api_server.py](./api_server.py)
+  - [config.py](./config.py)
 - Examples:
   - `REQUOTE_COOLDOWN` vs `REQUOTE_COOLDOWN_SECS`
   - `ARB_THRESHOLD_BPS` vs `ARB_ALERT_THRESHOLD_BPS`
@@ -112,22 +112,22 @@ Important runtime characteristics:
 
 #### `AppBridge` methods reference nonexistent APIs
 - File:
-  - [app_bridge.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/app_bridge.py)
+  - [app_bridge.py](./app_bridge.py)
 - Required outcome:
   - remove broken methods or remap them to real implementations
 
 #### Duplicate definitions silently override earlier behavior
 - Files:
-  - [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py)
-  - [wallet_chia.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_chia.py)
-  - [database.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/database.py)
+  - [wallet_sage.py](./wallet_sage.py)
+  - [wallet_chia.py](./wallet_chia.py)
+  - [database.py](./database.py)
 - Required outcome:
   - one implementation per public function name
 
 #### Notification wiring is broken
 - Files:
-  - [desktop_app.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/desktop_app.py)
-  - [api_server.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/api_server.py)
+  - [desktop_app.py](./desktop_app.py)
+  - [api_server.py](./api_server.py)
 - Required outcome:
   - notifications must consume the actual `EventBus` interface correctly
 
@@ -135,7 +135,7 @@ Important runtime characteristics:
 
 #### `api_server.py` is a monolith with duplicated business logic
 - File:
-  - [api_server.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/api_server.py)
+  - [api_server.py](./api_server.py)
 - Required outcome:
   - no broad refactor in one go
   - only extract or simplify when needed for a specific fix
@@ -159,7 +159,7 @@ Important runtime characteristics:
 
 #### Bind API to localhost by default and add authentication
 - File:
-  - [api_server.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/api_server.py)
+  - [api_server.py](./api_server.py)
 - Required outcome:
   - default bind `127.0.0.1`
   - auth for operational routes
@@ -167,18 +167,18 @@ Important runtime characteristics:
 
 #### Lock down config writes
 - Files:
-  - [api_server.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/api_server.py)
-  - [config.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/config.py)
+  - [api_server.py](./api_server.py)
+  - [config.py](./config.py)
 - Required outcome:
   - do not allow arbitrary HTTP writes to `.env`
   - block remote mutation of endpoint base URLs through generic config routes
 
 #### Fix secret and TLS handling in Sage integration
 - Files:
-  - [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py)
-  - [wallet_chia.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_chia.py)
-  - [sage_client_ssl/client.key](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/sage_client_ssl/client.key)
-  - [sage_client_ssl/client.crt](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/sage_client_ssl/client.crt)
+  - [wallet_sage.py](./wallet_sage.py)
+  - [wallet_chia.py](./wallet_chia.py)
+  - [sage_client_ssl/client.key](./sage_client_ssl/client.key)
+  - [sage_client_ssl/client.crt](./sage_client_ssl/client.crt)
 - Required outcome:
   - no secret key material stored under the project tree
   - no unverified TLS as the normal trust model
@@ -187,13 +187,13 @@ Important runtime characteristics:
 
 #### Protect operational read endpoints and SSE
 - File:
-  - [api_server.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/api_server.py)
+  - [api_server.py](./api_server.py)
 - Required outcome:
   - auth for logs, backups, wallet status, balances, SSE, and related routes
 
 #### Add rate limiting and abuse protections
 - File:
-  - [api_server.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/api_server.py)
+  - [api_server.py](./api_server.py)
 - Required outcome:
   - throttle expensive endpoints
   - limit SSE fanout
@@ -201,14 +201,14 @@ Important runtime characteristics:
 ## Sage-Specific Workstream
 
 Start here for full Sage detail:
-- [sage_docs/SAGE_MASTER_HANDOFF_FOR_CLAUDE.md](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/sage_docs/SAGE_MASTER_HANDOFF_FOR_CLAUDE.md)
+- [sage_docs/SAGE_MASTER_HANDOFF_FOR_CLAUDE.md](./sage_docs/SAGE_MASTER_HANDOFF_FOR_CLAUDE.md)
 
 Supporting Sage docs:
-- [sage_docs/SAGE_EXECUTIVE_SUMMARY.md](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/sage_docs/SAGE_EXECUTIVE_SUMMARY.md)
-- [sage_docs/SAGE_V4_MISMATCH_REPORT.md](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/sage_docs/SAGE_V4_MISMATCH_REPORT.md)
-- [sage_docs/SAGE_V4_PATCH_CHECKLIST.md](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/sage_docs/SAGE_V4_PATCH_CHECKLIST.md)
-- [sage_docs/SAGE_V4_ACCEPTANCE_CRITERIA.md](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/sage_docs/SAGE_V4_ACCEPTANCE_CRITERIA.md)
-- [sage_docs/SAGE_V4_REVIEW_RULES.md](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/sage_docs/SAGE_V4_REVIEW_RULES.md)
+- [sage_docs/SAGE_EXECUTIVE_SUMMARY.md](./sage_docs/SAGE_EXECUTIVE_SUMMARY.md)
+- [sage_docs/SAGE_V4_MISMATCH_REPORT.md](./sage_docs/SAGE_V4_MISMATCH_REPORT.md)
+- [sage_docs/SAGE_V4_PATCH_CHECKLIST.md](./sage_docs/SAGE_V4_PATCH_CHECKLIST.md)
+- [sage_docs/SAGE_V4_ACCEPTANCE_CRITERIA.md](./sage_docs/SAGE_V4_ACCEPTANCE_CRITERIA.md)
+- [sage_docs/SAGE_V4_REVIEW_RULES.md](./sage_docs/SAGE_V4_REVIEW_RULES.md)
 
 Top Sage issues:
 - missing explicit `initialize` lifecycle
@@ -220,7 +220,7 @@ Top Sage issues:
 - readiness logic invents `synced=None` semantics
 
 Recommended first Sage batch:
-- Pending and spendable endpoint corrections in [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py)
+- Pending and spendable endpoint corrections in [wallet_sage.py](./wallet_sage.py)
 
 ## Recommended Overall Implementation Order
 

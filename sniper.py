@@ -89,9 +89,13 @@ class Sniper:
         if (now - self._last_snipe_time) < cfg.SNIPER_COOLDOWN_SECS:
             return []
 
-        # Cap check — don't pile up endless sniper offers
-        if len(self._active_snipe_ids) >= self._max_active_snipes:
-            return []
+        # Cap check + per-side counts — read under the lock so they agree
+        # with writes from other threads (watcher vs main loop).
+        with self._snipe_lock:
+            if len(self._active_snipe_ids) >= self._max_active_snipes:
+                return []
+            _buy_count = sum(1 for s in self._active_snipe_sides.values() if s == "buy")
+            _sell_count = sum(1 for s in self._active_snipe_sides.values() if s == "sell")
 
         # Skip if coin operations are running
         if self._offer_manager and hasattr(self._offer_manager, '_lock'):
@@ -120,7 +124,6 @@ class Sniper:
         )
 
         # ---- Sniper BUY (per-side cap check) ----
-        _buy_count = sum(1 for s in self._active_snipe_sides.values() if s == "buy")
         if (cfg.ENABLE_BUY and _buy_count < self._max_per_side
                 and self._should_snipe_side("buy")
                 and _cb_blocked_side != "buy"):
@@ -129,7 +132,6 @@ class Sniper:
                 created.append(buy_result)
 
         # ---- Sniper SELL (per-side cap check) ----
-        _sell_count = sum(1 for s in self._active_snipe_sides.values() if s == "sell")
         if (cfg.ENABLE_SELL and _sell_count < self._max_per_side
                 and self._should_snipe_side("sell")
                 and _cb_blocked_side != "sell"):
@@ -143,7 +145,7 @@ class Sniper:
             self._last_snipe_time = now
             self._total_snipes += 1
 
-            # Track active sniper offer IDs with side
+            # Track active sniper offer IDs with side and record history
             with self._snipe_lock:
                 for offer in created:
                     tid = offer.get("trade_id", "")
@@ -153,18 +155,19 @@ class Sniper:
                         if side:
                             self._active_snipe_sides[tid] = side
 
-            # Record to history
-            for offer in created:
-                self._snipe_history.insert(0, {
-                    "side": offer.get("side"),
-                    "price": str(offer.get("price")),
-                    "size_xch": str(trade_xch),
-                    "arb_gap_bps": str(arb_gap_bps),
-                    "timestamp": now,
-                })
+                for offer in created:
+                    self._snipe_history.insert(0, {
+                        "side": offer.get("side"),
+                        "price": str(offer.get("price")),
+                        "size_xch": str(trade_xch),
+                        "arb_gap_bps": str(arb_gap_bps),
+                        "timestamp": now,
+                    })
 
-            if len(self._snipe_history) > self._max_history:
-                self._snipe_history = self._snipe_history[:self._max_history]
+                # In-place trim so readers holding a reference still see
+                # the same list object.
+                if len(self._snipe_history) > self._max_history:
+                    del self._snipe_history[self._max_history:]
 
             log_event("info", "sniper_fired",
                       f"⚡ Sniper created {len(created)} offers "
@@ -196,12 +199,11 @@ class Sniper:
         if (now - self._last_snipe_time) < cfg.SNIPER_COOLDOWN_SECS:
             return []
 
-        # Global cap check
-        if len(self._active_snipe_ids) >= self._max_active_snipes:
-            return []
-
-        # Per-side cap check
-        _side_count = sum(1 for s in self._active_snipe_sides.values() if s == side)
+        # Global cap + per-side count — read under the lock for consistency
+        with self._snipe_lock:
+            if len(self._active_snipe_ids) >= self._max_active_snipes:
+                return []
+            _side_count = sum(1 for s in self._active_snipe_sides.values() if s == side)
         if _side_count >= self._max_per_side:
             return []
 
@@ -247,16 +249,16 @@ class Sniper:
                         self._active_snipe_ids.append(tid)
                         self._active_snipe_sides[tid] = side
 
-            self._snipe_history.insert(0, {
-                "side": side,
-                "price": str(price),
-                "size_xch": str(trade_xch),
-                "arb_gap_bps": str(arb_gap_bps),
-                "timestamp": now,
-                "mode": "single_side",
-            })
-            if len(self._snipe_history) > self._max_history:
-                self._snipe_history = self._snipe_history[:self._max_history]
+                self._snipe_history.insert(0, {
+                    "side": side,
+                    "price": str(price),
+                    "size_xch": str(trade_xch),
+                    "arb_gap_bps": str(arb_gap_bps),
+                    "timestamp": now,
+                    "mode": "single_side",
+                })
+                if len(self._snipe_history) > self._max_history:
+                    del self._snipe_history[self._max_history:]
 
             log_event("info", "sniper_fired",
                       f"⚡ Sniper {side.upper()} at {price:.8f} "
@@ -401,8 +403,14 @@ class Sniper:
                           f"DB insert failed for sniper {trade_id[:16]}..., cancelling on-chain offer")
                 try:
                     self._offer_manager.cancel_offers([trade_id], reason="db_insert_failed")
-                except Exception:
-                    pass
+                except Exception as _cancel_err:
+                    # Compensating cancel failed — this IS the scenario the
+                    # cancel was meant to prevent (wallet/DB divergence). Log
+                    # loudly so recovery/reconciliation can clean it up later.
+                    log_event("error", "sniper_compensating_cancel_failed",
+                              f"Sniper compensating cancel FAILED for "
+                              f"{trade_id[:16]}... — offer now orphaned in "
+                              f"wallet (not in DB): {_cancel_err}")
                 return None
             if locked_coin_id:
                 lock_coin(locked_coin_id, trade_id)
@@ -462,9 +470,10 @@ class Sniper:
                           f"{len(self._active_snipe_ids)}/{self._max_active_snipes} total)")
 
     def get_stats(self) -> Dict:
-        """Get sniper statistics for GUI."""
+        """Get sniper statistics for GUI (thread-safe snapshot)."""
         with self._snipe_lock:
             active_count = len(self._active_snipe_ids)
+            recent = list(self._snipe_history[:10])
         return {
             "total_snipes": self._total_snipes,
             "total_skipped": self._total_skipped,
@@ -473,5 +482,5 @@ class Sniper:
             "cooldown_secs": cfg.SNIPER_COOLDOWN_SECS,
             "size_xch": str(getattr(cfg, "SNIPER_SIZE_XCH", "0.2")),
             "last_snipe_time": self._last_snipe_time,
-            "recent_snipes": self._snipe_history[:10],
+            "recent_snipes": recent,
         }

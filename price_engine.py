@@ -69,6 +69,17 @@ class PriceEngine:
         self._reference_price_time: float = 0
         self._ema_alpha = Decimal("0.01")  # 1% weight per update = slow drift
 
+        # --- Rail-breach tracking (for bot_loop to route to the CB safeguard) ---
+        # When _apply_safety_guards rejects a price, it records the direction
+        # and rejected value here so bot_loop can trip the risk_manager CB
+        # and cancel stale offers, rather than silently returning.
+        #   direction: "below" | "above" | "step" | None (no breach)
+        #   price:     the rejected mid price (for logging / alerting)
+        #   kind:      "dyn_min" | "dyn_max" | "hard_min" | "hard_max" | "step" | None
+        self._last_rail_breach: Optional[str] = None
+        self._last_rail_breach_price: Optional[Decimal] = None
+        self._last_rail_breach_kind: Optional[str] = None
+
         # Thread safety — multiple threads read price state; main loop writes it
         self._price_lock = threading.Lock()
 
@@ -95,7 +106,7 @@ class PriceEngine:
             tibet_available: Whether Tibet data was available
         """
         asset_id = cat_asset_id or cfg.CAT_ASSET_ID
-        decimals = cat_decimals or cfg.CAT_DECIMALS
+        decimals = cat_decimals if cat_decimals is not None else cfg.CAT_DECIMALS
         ticker = ticker_id or cfg.CAT_TICKER_ID
 
         # Fetch from both sources
@@ -248,15 +259,25 @@ class PriceEngine:
     def get_tibet_pool_info(self, cat_asset_id: str = None) -> Optional[Dict]:
         """Get TibetSwap pool details (reserves, price, liquidity).
 
-        Used for the GUI's TibetSwap card display.
+        Used for the GUI's TibetSwap card display.  `xch_reserve` and
+        `token_reserve` are returned in their human-readable units (XCH
+        and CAT tokens) so the price equals XCH-per-token and agrees with
+        `_fetch_tibet_price`.
         """
         asset_id = cat_asset_id or cfg.CAT_ASSET_ID
         pair = self._find_tibet_pair(asset_id)
         if not pair:
             return None
 
+        # CAT_DECIMALS for the active CAT (almost always 3 on Chia)
+        decimals = int(getattr(cfg, "CAT_DECIMALS", 3) or 3)
+        cat_scale = Decimal(10) ** Decimal(decimals)
+
         xch_reserve = Decimal(str(pair.get("xch_reserve", 0))) / Decimal("1e12")
-        token_reserve = Decimal(str(pair.get("token_reserve", 0)))
+        # Raw token_reserve is in token mojos — scale down to display units
+        # so price = xch_reserve / token_reserve is in XCH-per-token.
+        token_reserve_mojos = Decimal(str(pair.get("token_reserve", 0)))
+        token_reserve = token_reserve_mojos / cat_scale if cat_scale > 0 else token_reserve_mojos
 
         price = xch_reserve / token_reserve if token_reserve > 0 else Decimal("0")
 
@@ -299,6 +320,15 @@ class PriceEngine:
                 return None
 
             ticker = tickers[0]
+
+            # Verify the returned ticker matches our requested pair
+            returned_tid = str(ticker.get("ticker_id", "")).lower().strip()
+            expected_tid = str(ticker_id).lower().strip()
+            if returned_tid and expected_tid and returned_tid != expected_tid:
+                log_event("warning", "dexie_ticker_mismatch",
+                          f"Dexie returned ticker '{returned_tid}' but we asked "
+                          f"for '{expected_tid}' — rejecting")
+                return None
 
             # Prefer bid/ask midpoint (real market price) over last_price
             # which can be an outlier trade far from the current market.
@@ -417,8 +447,9 @@ class PriceEngine:
             if pair_asset.startswith("0x"):
                 pair_asset = pair_asset[2:]
 
-            # Match exact or with trailing zeros stripped
-            if pair_asset == normalized or pair_asset.rstrip("0") == normalized.rstrip("0"):
+            # Match exact only — never strip trailing zeros from hex asset IDs
+            # as distinct CATs can differ only in trailing hex digits.
+            if pair_asset == normalized:
                 return pair
 
         return None
@@ -770,8 +801,19 @@ class PriceEngine:
 
         Returns None if price fails any check.
         Warnings throttled to once per 60 seconds per guard type.
+
+        Side effect on rejection: stores breach direction/kind/price on
+        self._last_rail_breach* so bot_loop can route the rail breach
+        into the risk_manager CB path and cancel stale offers.
         """
         now = time.time()
+
+        # Start each call with a clean breach state. A successful fetch
+        # clears any previous rejection so we only latch the most recent
+        # attempt's outcome.
+        self._last_rail_breach = None
+        self._last_rail_breach_price = None
+        self._last_rail_breach_kind = None
 
         # --- Dynamic limits (primary protection) ---
         dyn_min, dyn_max = self.get_dynamic_limits()
@@ -781,17 +823,23 @@ class PriceEngine:
                           f"Price {price:.10f} below dynamic minimum {dyn_min:.10f} "
                           f"(ref: {self._reference_price:.10f}, band: ±{cfg.DYNAMIC_LIMIT_PCT}%)")
                 self._last_dynmin_warn = now
-            # Nudge reference EMA very slowly toward rejected price so a genuine
-            # sustained large move can eventually unlock quoting without immediately
-            # accepting a potentially manipulated price.
+            # Nudge reference EMA very slowly toward the band edge (NOT the
+            # rejected price) so a genuine sustained large move can eventually
+            # unlock quoting.  Clamping to the band edge prevents an attacker
+            # from dragging the reference arbitrarily far via persistent extreme
+            # prices — the reference can only drift toward dyn_min, never past it.
             slow_alpha = getattr(cfg, "PRICE_LIMIT_NUDGE_ALPHA", Decimal("0.02"))
+            nudge_target = dyn_min  # clamp to band edge
             self._reference_price = (
                 (Decimal("1") - slow_alpha) * self._reference_price
-                + slow_alpha * price
+                + slow_alpha * nudge_target
             )
             log_event("warning", "price_limit_nudge",
                       f"Price {price:.10f} outside dynamic limits — rejected but nudging "
-                      f"reference EMA toward it (alpha={slow_alpha})")
+                      f"reference EMA toward band edge {nudge_target:.10f} (alpha={slow_alpha})")
+            self._last_rail_breach = "below"
+            self._last_rail_breach_price = price
+            self._last_rail_breach_kind = "dyn_min"
             return None
 
         if dyn_max is not None and price > dyn_max:
@@ -800,15 +848,20 @@ class PriceEngine:
                           f"Price {price:.10f} above dynamic maximum {dyn_max:.10f} "
                           f"(ref: {self._reference_price:.10f}, band: ±{cfg.DYNAMIC_LIMIT_PCT}%)")
                 self._last_dynmax_warn = now
-            # Nudge reference EMA very slowly toward rejected price (same rationale as above).
+            # Nudge toward band edge (same rationale — clamp to dyn_max, not the
+            # rejected price, to prevent slow-burn reference manipulation).
             slow_alpha = getattr(cfg, "PRICE_LIMIT_NUDGE_ALPHA", Decimal("0.02"))
+            nudge_target = dyn_max  # clamp to band edge
             self._reference_price = (
                 (Decimal("1") - slow_alpha) * self._reference_price
-                + slow_alpha * price
+                + slow_alpha * nudge_target
             )
             log_event("warning", "price_limit_nudge",
                       f"Price {price:.10f} outside dynamic limits — rejected but nudging "
-                      f"reference EMA toward it (alpha={slow_alpha})")
+                      f"reference EMA toward band edge {nudge_target:.10f} (alpha={slow_alpha})")
+            self._last_rail_breach = "above"
+            self._last_rail_breach_price = price
+            self._last_rail_breach_kind = "dyn_max"
             return None
 
         # --- Hard limits (absolute backstop from .env) ---
@@ -817,6 +870,9 @@ class PriceEngine:
                 log_event("warning", "price_guard",
                           f"Price {price:.10f} below hard minimum {cfg.HARD_MIN_PRICE_XCH}")
                 self._last_min_warn = now
+            self._last_rail_breach = "below"
+            self._last_rail_breach_price = price
+            self._last_rail_breach_kind = "hard_min"
             return None
 
         if cfg.HARD_MAX_PRICE_XCH > 0 and price > cfg.HARD_MAX_PRICE_XCH:
@@ -824,6 +880,9 @@ class PriceEngine:
                 log_event("warning", "price_guard",
                           f"Price {price:.10f} above hard maximum {cfg.HARD_MAX_PRICE_XCH}")
                 self._last_max_warn = now
+            self._last_rail_breach = "above"
+            self._last_rail_breach_price = price
+            self._last_rail_breach_kind = "hard_max"
             return None
 
         # --- Step-change guard (reject sudden jumps) ---
@@ -835,6 +894,12 @@ class PriceEngine:
                     log_event("warning", "price_guard",
                               f"Price step too large: {change:.4f} > {cfg.MAX_STEP_CHANGE_FRACTION}")
                     self._last_step_warn = now
+                # Step rejection direction = sign of the move from last mid
+                self._last_rail_breach = (
+                    "above" if price > self._last_mid_price else "below"
+                )
+                self._last_rail_breach_price = price
+                self._last_rail_breach_kind = "step"
                 return None
 
         return price

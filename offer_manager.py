@@ -21,18 +21,16 @@ from typing import Optional, Dict, List, Tuple, Callable, Any
 
 from config import cfg
 from database import (
-    add_offer, update_offer_status, update_offer_coin_id,
-    update_offer_lifecycle_state, transition_offer,
+    add_offer, update_offer_status,
+    transition_offer,
     get_open_offers, get_offer, log_event, lock_coin
 )
 from wallet import (
     create_offer, cancel_offer, cancel_offers_batch,
     get_all_offers, classify_offers_from_list,
-    is_offer_time_expired, get_offer_expiry_info,
     get_offer_bech32, cleanup_expired_offers,
     get_exact_spendable_coins_rpc, get_wallet_type,
     get_owned_coins_detailed,
-    WALLET_ID_XCH
 )
 
 
@@ -130,6 +128,16 @@ class OfferManager:
         # Cleared at the start of every cycle via clear_cycle_coins().
         self._cycle_used_coin_ids: set = set()
 
+        # ----- Fix F: Slot suspension for coin exhaustion self-heal -----
+        # When a specific slot fails to get a unique coin 3 consecutive times,
+        # suspend it to prevent infinite retry loops. Slots are unsuspended
+        # when coins become available again.
+        # Key: f"{side}_{slot}" → consecutive failure count
+        self._slot_fail_counts: Dict[str, int] = {}
+        # Set of f"{side}_{slot}" keys that are currently suspended
+        self._suspended_slots: set = set()
+        self._slot_suspend_threshold: int = 3  # consecutive failures before suspension
+
         # ----- Wallet sync fail-closed cache -----
         # When Sage get_offers times out, we must not treat that as an empty
         # book. Keep the last successful classified view so callers can fail
@@ -162,6 +170,93 @@ class OfferManager:
         excluded until the cycle boundary.
         """
         self._cycle_used_coin_ids.clear()
+
+    # -------------------------------------------------------------------
+    # Fix F: Slot suspension management
+    # -------------------------------------------------------------------
+
+    def record_slot_coin_failure(self, side: str, slot: int):
+        """Record a coin preselection failure for a slot.
+
+        After _slot_suspend_threshold consecutive failures, the slot is
+        suspended to prevent infinite retry loops in recovery mode.
+        Suspended slots auto-clear after 20 cycles (self-heal) so the
+        ladder doesn't permanently degrade if the topup worker restocks.
+        """
+        key = f"{side}_{slot}"
+        count = self._slot_fail_counts.get(key, 0) + 1
+        self._slot_fail_counts[key] = count
+        if count >= self._slot_suspend_threshold and key not in self._suspended_slots:
+            self._suspended_slots.add(key)
+            self._slot_suspended_at = getattr(self, '_slot_suspended_at', {})
+            self._slot_suspended_at[key] = time.time()
+            log_event("warning", "slot_suspended",
+                      f"Slot {side} #{slot} suspended after {count} consecutive "
+                      f"coin failures — will retry when coins are available")
+        # F63: auto-clear after 20 cycles (~10 minutes at typical loop speed).
+        # This prevents permanent ladder degradation if unsuspend_slots
+        # never fires or coins are replenished via topup without triggering
+        # the explicit unsuspend check.
+        if count > self._slot_suspend_threshold + 20:
+            self._slot_fail_counts[key] = 0
+            self._suspended_slots.discard(key)
+            log_event("info", "slot_suspension_expired",
+                      f"Slot {side} #{slot} suspension expired after {count} "
+                      f"cycles — re-enabling for next attempt")
+
+    def clear_slot_failure(self, side: str, slot: int):
+        """Clear the failure counter for a slot after successful creation."""
+        key = f"{side}_{slot}"
+        self._slot_fail_counts.pop(key, None)
+        self._suspended_slots.discard(key)
+
+    def is_slot_suspended(self, side: str, slot: int) -> bool:
+        """Check if a slot is currently suspended due to coin exhaustion."""
+        return f"{side}_{slot}" in self._suspended_slots
+
+    def get_suspended_slot_count(self, side: str) -> int:
+        """Count how many slots are suspended for a given side."""
+        prefix = f"{side}_"
+        return sum(1 for k in self._suspended_slots if k.startswith(prefix))
+
+    def unsuspend_slots_if_coins_available(self, side: str):
+        """Unsuspend slots for a side if spare coins have become available.
+
+        Called by bot_loop at the start of each cycle to check whether
+        previously exhausted coin pools have been replenished.
+        """
+        prefix = f"{side}_"
+        suspended_for_side = [k for k in self._suspended_slots if k.startswith(prefix)]
+        if not suspended_for_side:
+            return
+
+        # Check if any coins are now available
+        wallet_id = cfg.CAT_WALLET_ID if side == "sell" else cfg.WALLET_ID_XCH
+        try:
+            coins_resp = get_exact_spendable_coins_rpc(wallet_id)
+            if not coins_resp:
+                return
+            coins_list = (coins_resp.get("confirmed_records",
+                          coins_resp.get("coin_records",
+                          coins_resp.get("records", []))))
+            spare_count = len(coins_list) if coins_list else 0
+            if get_wallet_type() != "sage":
+                try:
+                    open_count = len(get_open_offers(side=side,
+                                                     cat_asset_id=cfg.CAT_ASSET_ID))
+                    spare_count = max(0, spare_count - open_count)
+                except Exception:
+                    pass
+            if spare_count > 0:
+                for key in suspended_for_side:
+                    self._suspended_slots.discard(key)
+                    self._slot_fail_counts.pop(key, None)
+                log_event("info", "slots_unsuspended",
+                          f"Unsuspended {len(suspended_for_side)} {side} slots — "
+                          f"{spare_count} spare coins now available")
+        except Exception as e:
+            log_event("debug", "slot_unsuspend_check_failed",
+                      f"Could not check coins for slot unsuspension: {e}")
 
     # -------------------------------------------------------------------
     # Coin ID Extraction (for before/after snapshot)
@@ -346,8 +441,11 @@ class OfferManager:
                 log_event("debug", "coin_select_none",
                           f"No eligible designated {wallet_type.upper()} coins for "
                           f"{amount_mojos} mojos (preferred_tier={preferred_tier or 'any'}, "
-                          f"{len(db_free_coins)} DB free, {len(used_coins)} used)")
-                return None
+                          f"{len(db_free_coins)} DB free, {len(used_coins)} used) "
+                          f"— falling through to any available coin")
+                # Don't return None here — fall through to fallback candidates
+                # so that coins from other tiers can be used rather than failing
+                # the entire offer creation.
 
             if strict_pref:
                 log_event("debug", "coin_select_none",
@@ -515,7 +613,7 @@ class OfferManager:
 
         tier_slots: Dict[str, List[int]] = {}
         for slot in range(total_slots):
-            tier = self._classify_tier(slot, total_slots)
+            tier = self._classify_tier(slot, total_slots, side=side)
             tier_slots.setdefault(tier, []).append(slot)
 
         if not cfg.TIER_ENABLED:
@@ -566,15 +664,33 @@ class OfferManager:
             normalized = "0x" + normalized
         return normalized
 
-    def _sort_open_offers_for_requote(self, offers: List[Dict], side: str) -> List[Dict]:
-        """Sort live ladder offers into canonical ladder slot order.
+    def _sort_open_offers_for_requote(self, offers: List[Dict], side: str,
+                                      mid_price: Decimal = None) -> List[Dict]:
+        """Sort live ladder offers so the most at-risk are cancelled first.
 
-        Requote replaces slots from the inside out (slot 0, 1, 2, ...). If we
-        cancel the DB's default `created_at DESC` order instead, we end up
-        retiring the newest/extreme offers first while recreating the
-        inner/mid ladder slots first. That can skew the live book after partial
-        requotes or delayed cancel retries.
+        Fix D: During a requote triggered by AMM drift, the offers closest to
+        the new mid price are most at risk of being taken at stale prices.
+        Sort by distance from the new mid price (ascending) so these inner
+        offers are cancelled first.
+
+        When mid_price is not provided, falls back to tier-based inner-out
+        ordering (legacy behaviour).
         """
+        if mid_price is not None and mid_price > 0:
+            # Sort by distance from new mid price — closest first (most at risk)
+            def _key_distance(offer: Dict):
+                try:
+                    price = Decimal(str(offer.get("price_xch") or "0"))
+                except Exception:
+                    price = Decimal("0")
+                distance = abs(price - mid_price)
+                # Tiebreaker: created_at so order is deterministic
+                created_at = str(offer.get("created_at") or "")
+                return (distance, created_at)
+
+            return sorted(list(offers or []), key=_key_distance)
+
+        # Fallback: tier-based inner-out ordering
         tier_rank = {
             "inner": 0,
             "mid": 1,
@@ -1075,6 +1191,60 @@ class OfferManager:
         else:
             num = num_offers or cfg.MAX_ACTIVE_SELL_OFFERS
 
+        # F25 (2026-04-08): position rebalance hard guard.
+        # Risk_manager already enforces MAX_POSITION_XCH as a soft limit
+        # via spread skew. This is a HARD backstop: if creating these
+        # offers would push the bot's position past 110% of the
+        # configured max position (a 10% buffer above the soft limit),
+        # refuse the entire batch.
+        #
+        # The directional logic:
+        #   - net_position > 0  → bot is LONG CAT
+        #   - Each BUY offer (if filled) → MORE long  → +size_xch worth of CAT
+        #   - Each SELL offer (if filled) → LESS long → -size_xch worth of CAT
+        #
+        # If we're already long and trying to create buys → check ceiling
+        # If we're already short and trying to create sells → check floor
+        # The opposite direction is always safe (it reduces position).
+        if risk_manager is not None:
+            try:
+                max_pos_xch = Decimal(str(getattr(cfg, "MAX_POSITION_XCH", "5") or "5"))
+                hard_pos_xch = max_pos_xch * Decimal("1.1")
+                # net_position is in CAT — convert to XCH equivalent
+                net_pos_cat = Decimal(str(risk_manager._net_position_cat))
+                if mid_price > 0:
+                    net_pos_xch = abs(net_pos_cat) * mid_price
+                else:
+                    net_pos_xch = Decimal("0")
+                # Project the position INCREASE if all these offers fill
+                projected_increase_xch = (default_size or Decimal("0")) * Decimal(num)
+                # Only block if we're adding to the position in the wrong direction
+                add_long_dir = (side == "buy" and net_pos_cat >= 0) or \
+                               (side == "sell" and net_pos_cat <= 0)
+                if (
+                    add_long_dir
+                    and net_pos_xch + projected_increase_xch > hard_pos_xch
+                    and max_pos_xch > 0
+                ):
+                    log_event(
+                        "error",
+                        "position_hard_guard_blocked",
+                        f"BLOCKED ladder creation: side={side}, num={num}, "
+                        f"size={default_size}, current_position={net_pos_xch:.4f} XCH "
+                        f"(net {net_pos_cat:+.0f} CAT), would add up to "
+                        f"{projected_increase_xch:.4f} XCH worth → projected "
+                        f"{(net_pos_xch + projected_increase_xch):.4f} XCH > "
+                        f"hard limit {hard_pos_xch:.4f} XCH (110% of "
+                        f"MAX_POSITION_XCH={max_pos_xch}). Allow position to "
+                        f"unwind via the opposite side first.",
+                    )
+                    return []
+            except Exception as _pg_err:
+                # Fail-open: never block trading on a guard bug
+                log_event("debug", "position_hard_guard_failed",
+                          f"Position rebalance guard check failed (proceeding): "
+                          f"{_pg_err}")
+
         # total_slots = the full ladder size (for price spacing and tier classification)
         # When called normally: total_slots == num (full ladder in one call)
         # When called from requote: total_slots = 40 but num = 5 (one batch)
@@ -1134,7 +1304,7 @@ class OfferManager:
         planned_counts_by_tier = {}
         for i in range(num):
             slot = slot_sequence[i] if slot_sequence is not None else (slot_start + i)
-            tier = self._classify_tier(slot, total_slots)
+            tier = self._classify_tier(slot, total_slots, side=side)
             planned_counts_by_tier[tier] = planned_counts_by_tier.get(tier, 0) + 1
 
         # ── Phase 1: Pre-compute all offer specs ──────────────────────────
@@ -1149,6 +1319,11 @@ class OfferManager:
                 break
 
             slot = slot_sequence[i] if slot_sequence is not None else (slot_start + i)
+
+            # Fix F: skip suspended slots (coin exhaustion self-heal)
+            if self.is_slot_suspended(side, slot):
+                continue
+
             price = self._get_ladder_price(slot, side, mid_price, half_spread, total_slots)
             price = self._apply_price_bounds(
                 price,
@@ -1176,7 +1351,7 @@ class OfferManager:
                               f"AMM buffer check failed for {side} — skipping slot")
                     continue  # Fail closed on errors too
 
-            tier = self._classify_tier(slot, total_slots)
+            tier = self._classify_tier(slot, total_slots, side=side)
             if cfg.TIER_ENABLED and risk_manager:
                 size_xch = risk_manager.get_tier_size(tier, side=side)
             else:
@@ -1200,6 +1375,16 @@ class OfferManager:
                 )
 
             cat_amount = size_xch / price
+
+            # Sanity: reject astronomically large CAT amounts that would
+            # result from near-zero prices slipping through bounds checks.
+            max_cat_sanity = size_xch / Decimal("0.0000001")  # 1e-7 XCH floor
+            if cat_amount > max_cat_sanity:
+                log_event("warning", "cat_amount_sanity",
+                          f"Skipping {side} slot {slot}: cat_amount {cat_amount:.2f} "
+                          f"exceeds sanity limit (price {price:.12f} too small)")
+                continue
+
             cat_mojos = cat_to_mojos(cat_amount, decimals)
             cat_amount = mojos_to_cat(cat_mojos, decimals)
             xch_mojos = xch_to_mojos(size_xch)
@@ -1270,11 +1455,19 @@ class OfferManager:
                         spend_amount = abs(int(amt))
                         break
 
+                # Translate the slot's POSITION tier into the COIN SIZE tier
+                # the prepared coin pool actually labels its coins with. Under
+                # BUY_LADDER_REVERSED an "extreme position" buy slot needs an
+                # inner-sized coin (and so on). Single source of truth: the
+                # live BUY_*_TIER_COUNT + BUY_LADDER_REVERSED settings drive
+                # both prep and selection.
+                from coin_manager import coin_size_tier_for_slot_position as _coin_tier
+                coin_size_pref = _coin_tier(spec["tier"], side=side)
                 coin_id = self._select_coin_for_offer(
                     spec_spend_wallet_id or spend_wallet_id,
                     spend_amount,
                     used_coin_ids,
-                    preferred_tier=spec["tier"],
+                    preferred_tier=coin_size_pref,
                     spendable_records=spendable_records,
                 )
                 spec["coin_id"] = coin_id
@@ -1358,6 +1551,8 @@ class OfferManager:
                 msg = (f"No unique pre-selected coin available for {side} "
                        f"slot {spec['slot']} — skipping to avoid overlap")
                 log_event("warning", "coin_select_skip", msg)
+                # Fix F: track consecutive failures for this slot
+                self.record_slot_coin_failure(side, spec["slot"])
                 return spec["i"], {"success": False, "error": "no_unique_coin_preselected"}
 
             res = self.create_offer_with_retry(
@@ -1374,6 +1569,8 @@ class OfferManager:
                     with _used_coins_lock:
                         used_coin_ids.add(locked_coin_id)
                         self._cycle_used_coin_ids.add(locked_coin_id)
+                # Fix F: clear failure counter on successful creation
+                self.clear_slot_failure(side, spec["slot"])
             try:
                 delay_ms = int(getattr(cfg, "LADDER_CREATE_DELAY_MS", 0) or 0)
             except Exception:
@@ -1576,19 +1773,40 @@ class OfferManager:
                 price = max(price, floor)
         return price
 
-    def _classify_tier(self, slot: int, total: int) -> str:
-        """Classify an offer's tier based on its position in the ladder."""
+    def _classify_tier(self, slot: int, total: int, side: str = None) -> str:
+        """Classify an offer's tier based on its position in the ladder.
+
+        `side` selects per-side BUY_*_TIER_COUNT vs SELL_*_TIER_COUNT keys
+        so the buy and sell ladders can have independent tier shapes.
+        Falls back to per-tier MAX of both sides if `side` is None — this
+        keeps existing call sites that don't yet pass side from breaking.
+        """
         if not cfg.TIER_ENABLED:
             return "mid"
         if total <= 0:
             return "mid"
 
-        configured = {
-            "inner": int(getattr(cfg, "INNER_TIER_COUNT", 0) or 0),
-            "mid": int(getattr(cfg, "MID_TIER_COUNT", 0) or 0),
-            "outer": int(getattr(cfg, "OUTER_TIER_COUNT", 0) or 0),
-            "extreme": int(getattr(cfg, "EXTREME_TIER_COUNT", 0) or 0),
-        }
+        side_norm = (side or "").lower()
+        if side_norm == "buy":
+            prefix = "BUY_"
+        elif side_norm == "sell":
+            prefix = "SELL_"
+        else:
+            prefix = None
+
+        if prefix is None:
+            configured = {
+                tier: max(
+                    int(getattr(cfg, f"BUY_{tier.upper()}_TIER_COUNT", 0) or 0),
+                    int(getattr(cfg, f"SELL_{tier.upper()}_TIER_COUNT", 0) or 0),
+                )
+                for tier in ("inner", "mid", "outer", "extreme")
+            }
+        else:
+            configured = {
+                tier: int(getattr(cfg, f"{prefix}{tier.upper()}_TIER_COUNT", 0) or 0)
+                for tier in ("inner", "mid", "outer", "extreme")
+            }
         if any(v > 0 for v in configured.values()):
             remaining = total
             running = 0
@@ -1688,7 +1906,8 @@ class OfferManager:
         if live_offer_ids is not None:
             open_offers = [o for o in open_offers
                            if o.get("trade_id") in live_offer_ids]
-        open_offers = self._sort_open_offers_for_requote(open_offers, side)
+        open_offers = self._sort_open_offers_for_requote(open_offers, side,
+                                                          mid_price=current_price)
         total_to_replace = len(open_offers)
 
         log_event("info", "requote_start",
@@ -1704,6 +1923,20 @@ class OfferManager:
                                        coin_ids_enabled=cfg.COIN_IDS_ENABLED,
                                        price_cap=price_cap,
                                        price_floor=price_floor)
+            # CRITICAL: queue these to Dexie/Splash. The batched paths below
+            # do this themselves, but this early-return path was historically
+            # missing the queue step — every cold-start cycle (no existing
+            # offers to replace) created the ladder but never published it.
+            # Symptom: bot_health_dexie_gap warning "wallet N/N vs Dexie 0/0".
+            if dexie_manager and fresh:
+                for offer in fresh:
+                    bech32 = offer.get("offer_bech32", "")
+                    trade_id = offer.get("trade_id", "")
+                    if bech32 and trade_id:
+                        dexie_manager.queue_post(bech32, trade_id)
+                log_event("info", "requote_no_cancel_queued",
+                          f"Queued {len(fresh)} fresh {side} offers to Dexie "
+                          f"(cold-start path)")
             return {
                 "offers": fresh,
                 "fully_replaced": True,
@@ -1711,45 +1944,50 @@ class OfferManager:
                 "target_count": 0,
             }
 
-        # Check how many spare coins we have to bootstrap the first batch
+        # Helper: count spare coins available right now for this side
         wallet_id = cfg.CAT_WALLET_ID if side == "sell" else cfg.WALLET_ID_XCH
-        spare_count = 0
-        try:
-            coins_resp = get_exact_spendable_coins_rpc(wallet_id)
-            if coins_resp:
-                coins_list = coins_resp.get("confirmed_records",
-                             coins_resp.get("coin_records",
-                             coins_resp.get("records", [])))
-                spare_count = len(coins_list) if coins_list else 0
+
+        def _count_spare_coins() -> int:
+            """Re-count spare coins available for create-first mode."""
+            try:
+                _resp = get_exact_spendable_coins_rpc(wallet_id)
+                if not _resp:
+                    return 0
+                _coins = (_resp.get("confirmed_records",
+                          _resp.get("coin_records",
+                          _resp.get("records", []))))
+                _count = len(_coins) if _coins else 0
                 # On Chia wallet, spendable includes locked coins — subtract open offers.
                 # On Sage, get_exact_spendable_coins_rpc uses filter_mode="selectable"
                 # which already excludes locked coins — do NOT double-deduct.
                 if get_wallet_type() != "sage":
                     try:
-                        # get_open_offers is imported at module level — do NOT
-                        # re-import locally here, as that creates a local binding
-                        # that causes UnboundLocalError at line 1622 above.
-                        open_count = len(get_open_offers(side=side,
-                                                         cat_asset_id=cfg.CAT_ASSET_ID))
-                        spare_count = max(0, spare_count - open_count)
+                        _open = len(get_open_offers(side=side,
+                                                     cat_asset_id=cfg.CAT_ASSET_ID))
+                        _count = max(0, _count - _open)
                     except Exception:
-                        pass  # Conservative: leave spare_count as-is
-        except Exception as e:
-            log_event("warning", "requote_spare_coin_count_failed",
-                      f"Could not count spare coins for requote ({side}): {e} "
-                      f"— falling back to cancel-first mode")
+                        pass
+                return _count
+            except Exception:
+                return 0
+
+        spare_count = _count_spare_coins()
 
         log_event("info", "requote_spare_coins",
                   f"Spare {side} coins available: {spare_count} "
-                  f"(need {cfg.REQUOTE_BATCH_SIZE} for create-first)")
+                  f"(need any >0 for rolling-wave create-first)")
 
-        # Split into batches
+        # Split into batches — rolling wave approach (Fix E).
+        # Instead of requiring a full batch_size worth of spares, use
+        # whatever spares are available to create a partial wave, then
+        # cancel old offers to free coins for the next wave.
         batch_size = cfg.REQUOTE_BATCH_SIZE
         all_new_offers = []
         batches_done = 0
-        can_create_first = spare_count >= batch_size
+        offers_remaining = list(open_offers)  # mutable working copy
+        initial_had_spares = spare_count > 0
 
-        for batch_start in range(0, total_to_replace, batch_size):
+        while offers_remaining:
             # Check stop signal between batches
             if self._stop_requested:
                 log_event("warning", "requote_interrupted",
@@ -1757,14 +1995,28 @@ class OfferManager:
                           f"{batches_done} batches ({len(all_new_offers)} new offers)")
                 break
 
-            batch_end = min(batch_start + batch_size, total_to_replace)
-            batch_offers = open_offers[batch_start:batch_end]
-            batch_count = len(batch_offers)
             batch_num = batches_done + 1
-            total_batches = (total_to_replace + batch_size - 1) // batch_size
-            batch_trade_ids = [o["trade_id"] for o in batch_offers]
+            total_batches_est = (len(offers_remaining) + batch_size - 1) // batch_size + batches_done
+
+            # Re-count spare coins at the start of each wave (Fix E)
+            # After a cancel, freed coins may now be available.
+            if batches_done > 0:
+                # Clear cycle-used coins so freed coins from cancels are eligible
+                self._cycle_used_coin_ids.clear()
+                spare_count = _count_spare_coins()
+
+            # Determine this wave's size: use available spares (up to batch_size)
+            # for create-first, or fall back to cancel-first if zero spares
+            wave_size = min(batch_size, len(offers_remaining))
+            can_create_first = spare_count > 0
 
             if can_create_first:
+                # Rolling wave: create using whatever spares we have
+                create_count = min(wave_size, spare_count)
+                batch_offers = offers_remaining[:create_count]
+                batch_count = len(batch_offers)
+                batch_trade_ids = [o["trade_id"] for o in batch_offers]
+
                 # ---- CREATE-FIRST: new offers go up before old ones come down ----
 
                 # Guard: if repeated failed cancels left us over-allocated, stop
@@ -1773,24 +2025,24 @@ class OfferManager:
                             else cfg.MAX_ACTIVE_SELL_OFFERS)
                 current_open = len(get_open_offers(side=side,
                                                    cat_asset_id=cfg.CAT_ASSET_ID))
-                batch_limit = max_side + cfg.REQUOTE_BATCH_SIZE  # allow one batch of overhang
+                batch_limit = max_side + cfg.REQUOTE_BATCH_SIZE
                 if current_open >= batch_limit:
                     log_event("warning", "requote_overalloc_guard",
                               f"Requote {side}: open={current_open} >= cap={batch_limit}, "
                               f"skipping new offer creation this batch to prevent "
                               f"over-allocation")
-                    # Still attempt to cancel old offers to bring the count down,
-                    # then stop for this cycle — next requote will create replacements.
                     self.cancel_offers(batch_trade_ids, reason="requote_overalloc")
                     break
 
-                # Step 1: Create new offers using spare coins
+                # Step 1: Create new offers using available spare coins
+                slot_start_idx = total_to_replace - len(offers_remaining)
                 log_event("info", "requote_batch_create",
-                          f"Requote {side} batch {batch_num}/{total_batches}: "
-                          f"creating {batch_count} new offers FIRST (create-first mode)")
+                          f"Rolling wave {side} batch {batch_num}: "
+                          f"creating {batch_count} new offers using {spare_count} "
+                          f"available spares (create-first)")
                 new_offers = self.create_ladder(
                     current_price, side, num_offers=batch_count,
-                    slot_start=batch_start, total_slots=total_to_replace,
+                    slot_start=slot_start_idx, total_slots=total_to_replace,
                     risk_manager=risk_manager,
                     spread_fraction=spread_fraction,
                     coin_ids_enabled=cfg.COIN_IDS_ENABLED,
@@ -1802,7 +2054,7 @@ class OfferManager:
                 # roll back partial offers and keep old ones live.
                 if len(new_offers) < batch_count:
                     log_event("error", "requote_undercreated",
-                              f"Requote {side} batch {batch_num}/{total_batches}: "
+                              f"Rolling wave {side} batch {batch_num}: "
                               f"only created {len(new_offers)}/{batch_count} offers — "
                               f"rolling back partial creates, keeping old offers live")
                     if new_offers:
@@ -1830,42 +2082,40 @@ class OfferManager:
 
                 # Step 3: NOW cancel the old offers (orderbook stays populated)
                 log_event("info", "requote_batch_cancel",
-                          f"Requote {side} batch {batch_num}/{total_batches}: "
+                          f"Rolling wave {side} batch {batch_num}: "
                           f"cancelling {batch_count} old offers")
                 cancel_results = self.cancel_offers(batch_trade_ids, reason="requote")
 
-                # Check how many cancels actually succeeded
                 cancel_ok = sum(1 for r in cancel_results.values()
                                 if r and r.get("success"))
                 cancel_failed = batch_count - cancel_ok
 
                 if cancel_failed > 0:
-                    # Some old offers couldn't be cancelled — we now have
-                    # more offers than intended (new ones created + old ones
-                    # still alive).  Stop creating more batches to avoid
-                    # piling up even more orphaned offers.  The failed
-                    # cancels are already queued for retry by cancel_offers().
-                    log_event("warning", "requote_cancel_failed_stop",
-                              f"Requote {side} batch {batch_num}: "
+                    log_event("warning", "requote_cancel_failed_continue",
+                              f"Rolling wave {side} batch {batch_num}: "
                               f"{cancel_failed}/{batch_count} cancels failed — "
-                              f"stopping requote to prevent offer pile-up. "
-                              f"Failed cancels queued for retry.")
-                    # After retry succeeds the offer count will correct itself.
-                    # Next cycle's requote will pick up any remaining batches.
-                    break
+                              f"queued for background retry, continuing requote. "
+                              f"Trim pass will correct any over-cap state.")
 
                 log_event("info", "requote_batch_done",
-                          f"Requote {side} batch {batch_num}/{total_batches}: "
-                          f"created {len(new_offers)}, then cancelled {batch_count} "
-                          f"(create-first)")
+                          f"Rolling wave {side} batch {batch_num}: "
+                          f"created {len(new_offers)}, cancelled {batch_count}, "
+                          f"{cancel_ok} coins freed (create-first)")
+
+                # Remove processed offers from the working list
+                offers_remaining = offers_remaining[batch_count:]
 
             else:
                 # ---- CANCEL-FIRST FALLBACK: no spare coins available ----
-                # Must free coins from old offers before we can create new ones.
+                batch_offers = offers_remaining[:wave_size]
+                batch_count = len(batch_offers)
+                batch_trade_ids = [o["trade_id"] for o in batch_offers]
+                slot_start_idx = total_to_replace - len(offers_remaining)
+
                 log_event("info", "requote_batch_cancel",
-                          f"Requote {side} batch {batch_num}/{total_batches}: "
-                          f"cancelling {batch_count} offers (cancel-first fallback — "
-                          f"not enough spare coins)")
+                          f"Rolling wave {side} batch {batch_num}: "
+                          f"cancelling {batch_count} offers (cancel-first — "
+                          f"0 spare coins)")
                 self.cancel_offers(batch_trade_ids, reason="requote")
 
                 # Wait for wallet to free the coins from cancelled offers
@@ -1895,10 +2145,13 @@ class OfferManager:
                               f"Coins not yet freed after {max_poll_secs}s — "
                               f"creating offers anyway (may partially fail)")
 
+                # Clear cycle-used coins so freed coins are eligible
+                self._cycle_used_coin_ids.clear()
+
                 # Create replacement offers
                 new_offers = self.create_ladder(
                     current_price, side, num_offers=batch_count,
-                    slot_start=batch_start, total_slots=total_to_replace,
+                    slot_start=slot_start_idx, total_slots=total_to_replace,
                     risk_manager=risk_manager,
                     spread_fraction=spread_fraction,
                     coin_ids_enabled=cfg.COIN_IDS_ENABLED,
@@ -1916,46 +2169,21 @@ class OfferManager:
                             dexie_manager.queue_post(bech32, trade_id)
 
                 log_event("info", "requote_batch_done",
-                          f"Requote {side} batch {batch_num}/{total_batches}: "
+                          f"Rolling wave {side} batch {batch_num}: "
                           f"cancelled {batch_count}, created {len(new_offers)} "
                           f"(cancel-first fallback)")
 
+                # Remove processed offers from the working list
+                offers_remaining = offers_remaining[batch_count:]
+
             batches_done += 1
 
-            # Step 4: Brief wait for cancelled coins to recycle before next batch.
-            # After secure cancel, the locked coins are destroyed and NEW coins
-            # with DIFFERENT IDs are created on-chain. We need a short wait for
-            # these recycled coins to appear as spendable.
-            if batches_done < total_batches:
+            # Brief wait for cancelled coins to recycle before next wave.
+            if offers_remaining:
                 time.sleep(3)
-                # After first cancel-first batch, we should now have freed coins
-                # for create-first on subsequent batches
-                if not can_create_first:
-                    try:
-                        coins_resp = get_exact_spendable_coins_rpc(wallet_id)
-                        if coins_resp:
-                            coins_list = coins_resp.get("confirmed_records",
-                                         coins_resp.get("coin_records",
-                                         coins_resp.get("records", [])))
-                            new_spare = len(coins_list) if coins_list else 0
-                            # Only subtract on Chia wallet (Sage selectable already excludes locked)
-                            if get_wallet_type() != "sage":
-                                try:
-                                    _remaining_open = len(get_open_offers(
-                                        side=side, cat_asset_id=cfg.CAT_ASSET_ID))
-                                    new_spare = max(0, new_spare - _remaining_open)
-                                except Exception:
-                                    pass
-                            if new_spare >= batch_size:
-                                can_create_first = True
-                                log_event("info", "requote_upgrade",
-                                          f"Freed {new_spare} coins (after offset) — "
-                                          f"switching to create-first for remaining batches")
-                    except Exception as e:
-                        log_event("debug", "requote_upgrade_check_failed",
-                                  f"Create-first upgrade check failed (continuing cancel-first): {e}")
 
-        mode = "create-first" if spare_count >= batch_size else "cancel-first → create-first"
+        mode = ("rolling-wave create-first" if initial_had_spares
+                else "cancel-first → rolling-wave")
         log_event("info", "requote_done",
                   f"Requote {side} complete: "
                   f"replaced {total_to_replace} old → {len(all_new_offers)} new "
@@ -1971,14 +2199,48 @@ class OfferManager:
     # Cancellation
     # -------------------------------------------------------------------
 
-    def cancel_offers(self, trade_ids: List[str], reason: str = "manual") -> Dict:
+    def cancel_offers(self, trade_ids: List[str], reason: str = "manual",
+                      force_storm: bool = False) -> Dict:
         """Cancel a list of offers.
 
         Marks them as bot-cancelled so fill detection doesn't count them as fills.
         Sequential cancellation with delays (parallel breaks the wallet).
+
+        F20 (2026-04-08): cancel-storm protection. If a single call asks
+        to cancel more than CANCEL_STORM_THRESHOLD_PCT of the live book
+        in one shot AND the caller didn't pass force_storm=True, the
+        call is REFUSED with a critical alert. Reasons that legitimately
+        cancel large fractions (Cancel All button, reserve floor breach,
+        circuit breaker, shutdown) all explicitly pass force_storm=True.
+        Routine requote/expiry/sniper paths do NOT — so a bug there
+        that tries to nuke the book gets caught here instead of executing.
         """
         if not trade_ids:
             return {}
+
+        # F20: cancel-storm protection
+        if not force_storm:
+            try:
+                # Count how many offers we currently have live (DB view)
+                from database import get_open_offers as _gso
+                live_count = len(_gso(cat_asset_id=cfg.CAT_ASSET_ID))
+            except Exception:
+                live_count = 0
+            if live_count > 0:
+                pct = (len(trade_ids) / live_count) * 100
+                threshold_pct = float(getattr(cfg, "CANCEL_STORM_THRESHOLD_PCT", 80) or 80)
+                if pct >= threshold_pct and len(trade_ids) >= 5:
+                    log_event(
+                        "error",
+                        "cancel_storm_blocked",
+                        f"BLOCKED cancel storm: caller {reason} tried to cancel "
+                        f"{len(trade_ids)}/{live_count} offers ({pct:.0f}%) in one "
+                        f"shot. Threshold is {threshold_pct:.0f}%. Refusing — pass "
+                        f"force_storm=True if this is intentional (e.g. Cancel All, "
+                        f"reserve floor breach, shutdown).",
+                    )
+                    return {tid: {"success": False, "error": "cancel_storm_blocked"}
+                            for tid in trade_ids}
 
         log_event("info", "cancel_start",
                   f"Cancelling {len(trade_ids)} offers (reason: {reason})")
@@ -2169,16 +2431,63 @@ class OfferManager:
                 all_results.update(batch_results)
                 apply_batch_results(batch_results)
 
-                batch_successes = sum(1 for r in batch_results.values()
-                                      if r and r.get("success"))
-                batch_failures = len(batch) - batch_successes
-                running_successes = sum(1 for r in all_results.values()
-                                        if r and r.get("success"))
-                running_failures = len(all_results) - running_successes
-                log_event("info", "cancel_all_batch",
-                          f"Batch {batch_num}/{total_batches}: "
-                          f"{batch_successes}/{len(batch)} cancelled")
-                if batch_failures > 0:
+                # F50 (2026-04-09): distinguish on-chain-confirmed cancels
+                # from still-in-flight cancels (cancel TX submitted to
+                # mempool but not yet confirmed). The old code counted
+                # both as "cancelled", which was misleading when the
+                # mempool was congested and half the cancels were
+                # actually pending or outright failing due to conflicts.
+                #
+                # Confirmed methods mean the offer is definitively gone
+                # from Sage's active list. Pending methods mean the
+                # cancel TX exists but the offer is still ACTIVE in
+                # Sage's status until the block confirms. Failed means
+                # the cancel didn't even reach the mempool or was
+                # rejected.
+                CONFIRMED_METHODS = {
+                    "confirmed_by_status",
+                    "confirmed_by_unlock",
+                    "bulk",  # bulk-cancel RPC reports its own confirmation
+                }
+                PENDING_METHODS = {
+                    "submitted_pending_confirm",
+                }
+
+                def _classify(r):
+                    if not isinstance(r, dict):
+                        return "failed"
+                    if not r.get("success"):
+                        return "failed"
+                    method = r.get("method", "")
+                    if method in CONFIRMED_METHODS:
+                        return "confirmed"
+                    if method in PENDING_METHODS:
+                        return "pending"
+                    return "confirmed"  # unknown success method — assume confirmed
+
+                batch_confirmed = sum(1 for r in batch_results.values() if _classify(r) == "confirmed")
+                batch_pending   = sum(1 for r in batch_results.values() if _classify(r) == "pending")
+                batch_failures  = sum(1 for r in batch_results.values() if _classify(r) == "failed")
+                # Legacy "batch_successes" for UI backwards compat = confirmed + pending
+                batch_successes = batch_confirmed + batch_pending
+
+                running_confirmed = sum(1 for r in all_results.values() if _classify(r) == "confirmed")
+                running_pending   = sum(1 for r in all_results.values() if _classify(r) == "pending")
+                running_failures  = sum(1 for r in all_results.values() if _classify(r) == "failed")
+                running_successes = running_confirmed + running_pending
+
+                if batch_pending > 0:
+                    log_event("info", "cancel_all_batch",
+                              f"Batch {batch_num}/{total_batches}: "
+                              f"{batch_confirmed}/{len(batch)} cancels confirmed on-chain, "
+                              f"{batch_pending} pending (cancel TX in mempool), "
+                              f"{batch_failures} failed")
+                else:
+                    log_event("info", "cancel_all_batch",
+                              f"Batch {batch_num}/{total_batches}: "
+                              f"{batch_confirmed}/{len(batch)} cancels confirmed on-chain "
+                              f"({batch_failures} failed)")
+                if batch_failures > 0 or batch_pending > 0:
                     next_batch_delay = 10.0
                 emit_progress(
                     running=True,
@@ -2189,12 +2498,18 @@ class OfferManager:
                     total_batches=total_batches,
                     current_batch=batch_num,
                     batch_cancelled=batch_successes,
+                    batch_confirmed=batch_confirmed,
+                    batch_pending=batch_pending,
                     batch_failed=batch_failures,
                     cancelled=running_successes,
+                    confirmed=running_confirmed,
+                    pending=running_pending,
                     failed=running_failures,
                     message=(
                         f"Batch {batch_num}/{total_batches}: "
-                        f"{batch_successes}/{len(batch)} cancelled."
+                        f"{batch_confirmed} confirmed"
+                        + (f", {batch_pending} pending" if batch_pending else "")
+                        + (f", {batch_failures} failed" if batch_failures else "")
                     ),
                 )
             except Exception as e:
@@ -2242,12 +2557,68 @@ class OfferManager:
                 )
                 time.sleep(next_batch_delay)
 
-        # Summarise final results after the per-batch updates above
-        successes = sum(1 for result in all_results.values()
-                        if result and result.get("success"))
-        failures = total - successes
-        log_event("info", "cancel_all_done",
-                  f"Cancel all complete: {successes} succeeded, {failures} failed")
+        # F50 (2026-04-09): summarise by confirmed vs pending vs failed.
+        # Previously we lumped confirmed + pending together as "succeeded"
+        # which misled the operator into thinking cancels completed on-chain
+        # when they were actually stuck in a congested mempool. The user hit
+        # this after a stop-then-cancel-all flow where only ~half the cancels
+        # made it into a block — the UI cheerfully reported "46 succeeded"
+        # but Sage still showed 23 active. Now we distinguish.
+        CONFIRMED_METHODS = {
+            "confirmed_by_status",
+            "confirmed_by_unlock",
+            "bulk",
+        }
+        PENDING_METHODS = {
+            "submitted_pending_confirm",
+        }
+
+        def _classify(r):
+            if not isinstance(r, dict):
+                return "failed"
+            if not r.get("success"):
+                return "failed"
+            method = r.get("method", "")
+            if method in CONFIRMED_METHODS:
+                return "confirmed"
+            if method in PENDING_METHODS:
+                return "pending"
+            return "confirmed"
+
+        confirmed_count = sum(1 for r in all_results.values() if _classify(r) == "confirmed")
+        pending_count   = sum(1 for r in all_results.values() if _classify(r) == "pending")
+        failed_count    = sum(1 for r in all_results.values() if _classify(r) == "failed")
+        # successes = anything accepted by Sage (confirmed + pending) for
+        # backwards-compat with callers that don't know about pending.
+        successes = confirmed_count + pending_count
+        failures = failed_count
+
+        if pending_count > 0:
+            # Some cancels are still in the mempool — warn the operator to
+            # wait a block or two and re-check before concluding.
+            log_event(
+                "warning",
+                "cancel_all_done",
+                f"Cancel all finished: {confirmed_count} confirmed on-chain, "
+                f"{pending_count} PENDING in mempool (may still fail due to "
+                f"mempool conflict or fee rejection), {failed_count} failed. "
+                f"Re-check offers in 1-2 minutes to verify pending cancels "
+                f"actually confirmed."
+            )
+            final_message = (
+                f"Cancel all finished: {confirmed_count} confirmed, "
+                f"{pending_count} pending on-chain, {failed_count} failed. "
+                f"Wait 1-2 minutes then re-check."
+            )
+        else:
+            log_event("info", "cancel_all_done",
+                      f"Cancel all complete: {confirmed_count} confirmed on-chain, "
+                      f"{failed_count} failed")
+            final_message = (
+                f"Cancel all complete: {confirmed_count} confirmed"
+                + (f", {failed_count} failed" if failed_count else "") + "."
+            )
+
         emit_progress(
             running=False,
             complete=True,
@@ -2257,8 +2628,10 @@ class OfferManager:
             total_batches=total_batches,
             current_batch=total_batches,
             cancelled=successes,
+            confirmed=confirmed_count,
+            pending=pending_count,
             failed=failures,
-            message=f"Cancel all complete: {successes} succeeded, {failures} failed.",
+            message=final_message,
         )
 
         return all_results
@@ -2297,11 +2670,14 @@ class OfferManager:
         for k in expired:
             del self._recently_created[k]
 
-        # Clear inflight coin tracking — these are short-lived within a
-        # single create_offer call. If any leaked (e.g., exception path),
-        # clearing at cycle boundaries prevents permanent starvation.
-        with self._lock:
-            self._inflight_coin_ids.clear()
+        # NOTE: _inflight_coin_ids is deliberately NOT cleared here.
+        # Each _create_offer_with_retry_inner call adds a coin under
+        # self._lock and has its own try/finally that discards it on
+        # every exit path (success, failure, exception). A periodic
+        # `clear()` here would race with slow in-flight creates that
+        # have released the lock for the RPC call — clearing during
+        # that RPC window would let another thread re-pick the same
+        # coin and cause a MEMPOOL_CONFLICT or double-spend.
 
     # -------------------------------------------------------------------
     # Expiry management
@@ -2416,6 +2792,114 @@ class OfferManager:
                       f"Found {len(expiring)} offers expiring within {refresh_before_secs}s")
 
         return expiring
+
+    # -------------------------------------------------------------------
+    # Trim excess offers (Fix 3: belt-and-braces overshoot guard)
+    # -------------------------------------------------------------------
+
+    def trim_excess_offers(self, mid_price: Decimal) -> int:
+        """Cancel any offers above the configured per-side cap.
+
+        Belt-and-braces guard against the requote overshoot the bot got
+        into on 2026-04-07: when cancels were slow to confirm, repeated
+        create-first requote rounds left the live book at 29 sells against
+        a 24 cap. The over-allocation guard only blocked NEW creation; it
+        never trimmed the excess. This method does the trim.
+
+        Strategy: pick the offers furthest from `mid_price` on each side
+        (least useful market-making) and cancel them until count == cap.
+
+        Returns: total number of offers asked to cancel (across both sides).
+        """
+        # SINGLE SOURCE OF TRUTH: cap comes from the sum of tier counts in
+        # the live ladder settings, not a separate MAX_ACTIVE_* key. This
+        # ensures trim never fights the ladder the user asked for.
+        def _ladder_cap(side: str) -> int:
+            try:
+                if side == "buy":
+                    total = (
+                        int(getattr(cfg, "BUY_INNER_TIER_COUNT", 0) or 0)
+                        + int(getattr(cfg, "BUY_MID_TIER_COUNT", 0) or 0)
+                        + int(getattr(cfg, "BUY_OUTER_TIER_COUNT", 0) or 0)
+                        + int(getattr(cfg, "BUY_EXTREME_TIER_COUNT", 0) or 0)
+                    )
+                else:
+                    total = (
+                        int(getattr(cfg, "SELL_INNER_TIER_COUNT", 0) or 0)
+                        + int(getattr(cfg, "SELL_MID_TIER_COUNT", 0) or 0)
+                        + int(getattr(cfg, "SELL_OUTER_TIER_COUNT", 0) or 0)
+                        + int(getattr(cfg, "SELL_EXTREME_TIER_COUNT", 0) or 0)
+                    )
+                if total > 0:
+                    return total
+            except Exception:
+                pass
+            # Fallback to legacy caps if tier counts are not available
+            if side == "buy":
+                return int(getattr(cfg, "MAX_ACTIVE_BUY_OFFERS", 25) or 25)
+            return int(getattr(cfg, "MAX_ACTIVE_SELL_OFFERS", 25) or 25)
+
+        max_buy = _ladder_cap("buy")
+        max_sell = _ladder_cap("sell")
+
+        try:
+            mid_d = Decimal(str(mid_price or 0))
+        except Exception:
+            mid_d = Decimal("0")
+
+        total_trimmed = 0
+
+        for side, cap in (("buy", max_buy), ("sell", max_sell)):
+            try:
+                open_offers_all = get_open_offers(side=side,
+                                                  cat_asset_id=cfg.CAT_ASSET_ID) or []
+            except Exception as e:
+                log_event("warning", "trim_excess_query_failed",
+                          f"trim_excess_offers: could not query open {side} offers: {e}")
+                continue
+
+            # Exclude sniper-tier offers from the ladder cap check — snipers
+            # are a separate pool and must not cause ladder offers to be
+            # cancelled.
+            open_offers = [
+                o for o in open_offers_all
+                if (o.get("tier") or "").lower() != "sniper"
+            ]
+
+            excess = len(open_offers) - cap
+            if excess <= 0:
+                continue
+
+            def _distance_from_mid(o):
+                try:
+                    p = Decimal(str(o.get("price_xch") or o.get("price") or 0))
+                    if p <= 0 or mid_d <= 0:
+                        return Decimal("0")
+                    return abs(p - mid_d)
+                except Exception:
+                    return Decimal("0")
+
+            # Sort furthest-from-mid first; those carry the least
+            # market-making value, so they're the safest to drop.
+            sorted_offers = sorted(open_offers, key=_distance_from_mid, reverse=True)
+            to_cancel = sorted_offers[:excess]
+            cancel_ids = [o.get("trade_id") for o in to_cancel if o.get("trade_id")]
+
+            if not cancel_ids:
+                continue
+
+            log_event("warning", "trim_excess_offers",
+                      f"Trim pass: {side} open={len(open_offers)} > cap={cap}, "
+                      f"cancelling {len(cancel_ids)} furthest-from-mid offer(s)")
+
+            try:
+                self.cancel_offers(cancel_ids, reason="trim_excess")
+                total_trimmed += len(cancel_ids)
+            except Exception as e:
+                log_event("error", "trim_excess_cancel_failed",
+                          f"trim_excess_offers: cancel call failed for {side}: {e}")
+
+        return total_trimmed
 
     # -------------------------------------------------------------------
     # Retry failed cancels (V1 parity: retry_failed_cancels)

@@ -2,7 +2,7 @@
 
 ## Sage Review And Editing Rules
 
-When reviewing or editing Sage-related code, you must apply the review rules in [sage_docs/SAGE_V4_REVIEW_RULES.md](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/sage_docs/SAGE_V4_REVIEW_RULES.md).
+When reviewing or editing Sage-related code, you must apply the review rules in [sage_docs/SAGE_V4_REVIEW_RULES.md](./sage_docs/SAGE_V4_REVIEW_RULES.md).
 
 Treat these checks as mandatory:
 
@@ -37,8 +37,8 @@ Treat these checks as mandatory:
 
 Apply these rules to Sage-related changes in at least these files when relevant:
 
-- [wallet_sage.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet_sage.py)
-- [chia_node.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/chia_node.py)
-- [wallet.py](/C:/Users/t_you/Pictures/01%20Monkeyzoo/chia_liquidity_bot_v2/v4/wallet.py)
+- [wallet_sage.py](./wallet_sage.py)
+- [chia_node.py](./chia_node.py)
+- [wallet.py](./wallet.py)
 - any Sage-specific tests
 - any API or orchestration code that changes Sage startup, login, offer creation, sending, sync handling, or coin-state reconciliation

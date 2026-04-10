@@ -722,199 +722,6 @@ def wait_for_coin_confirmations(wallet_id: int, target_coin_size_mojos: int,
     return False
 
 
-def prepare_coins_for_offers_v2(
-    xch_wallet_id: int,
-    cat_wallet_id: int,
-    num_buy_offers: int,
-    num_sell_offers: int,
-    xch_per_offer_mojos: int,
-    cat_per_offer_mojos: int,
-    xch_spendable_mojos: int,
-    cat_spendable_mojos: int,
-    xch_reserve_mojos: int = 0,
-    cat_reserve_mojos: int = 0,
-    progress_callback=None
-) -> Dict:
-    """
-    SMART COIN PREPARATION - V2
-    
-    Prepares coins for offers by:
-    1. Calculating exact requirements
-    2. Checking existing suitable coins
-    3. Splitting only what's needed
-    4. Leaving large "reserve" coin for future expansion
-    5. Waiting for confirmations
-    
-    Args:
-        progress_callback: Optional function(status_dict) for GUI updates
-    
-    Returns:
-        {
-            'success': bool,
-            'xch_coins_created': int,
-            'cat_coins_created': int,
-            'xch_coins_ready': int,
-            'cat_coins_ready': int,
-            'message': str
-        }
-    """
-    result = {
-        'success': False,
-        'xch_coins_created': 0,
-        'cat_coins_created': 0,
-        'xch_coins_ready': 0,
-        'cat_coins_ready': 0,
-        'message': ''
-    }
-    
-    def update_progress(status: str, xch_done: int = 0, xch_total: int = 0,
-                       cat_done: int = 0, cat_total: int = 0):
-        if progress_callback:
-            progress_callback({
-                'status': status,
-                'xch_progress': {'done': xch_done, 'total': xch_total},
-                'cat_progress': {'done': cat_done, 'total': cat_total}
-            })
-    
-    try:
-        # ========== PHASE 1: Calculate Requirements ==========
-        update_progress("Calculating requirements...")
-        
-        xch_needed_total = num_buy_offers * xch_per_offer_mojos
-        cat_needed_total = num_sell_offers * cat_per_offer_mojos
-        
-        # Check if we have enough balance
-        if (xch_spendable_mojos - xch_needed_total) < xch_reserve_mojos:
-            result['message'] = f"Insufficient XCH balance. Need {(xch_needed_total + xch_reserve_mojos) / 1e12:.4f} XCH"
-            return result
-        
-        if (cat_spendable_mojos - cat_needed_total) < cat_reserve_mojos:
-            result['message'] = f"Insufficient CAT balance. Need {cat_needed_total} mojos + reserve"
-            return result
-        
-        # ========== PHASE 2: Check Existing Coins ==========
-        update_progress("Checking existing coins...")
-        
-        xch_existing = count_suitable_coins(xch_wallet_id, xch_per_offer_mojos, tolerance=0.25)
-        cat_existing = count_suitable_coins(cat_wallet_id, cat_per_offer_mojos, tolerance=0.25)
-        
-        xch_to_create = max(0, num_buy_offers - xch_existing)
-        cat_to_create = max(0, num_sell_offers - cat_existing)
-        
-        print(f"📊 XCH: Have {xch_existing} suitable coins, need {num_buy_offers}, will create {xch_to_create}")
-        print(f"📊 CAT: Have {cat_existing} suitable coins, need {num_sell_offers}, will create {cat_to_create}")
-        
-        result['xch_coins_ready'] = xch_existing
-        result['cat_coins_ready'] = cat_existing
-        
-        if xch_to_create == 0 and cat_to_create == 0:
-            result['success'] = True
-            result['message'] = "All coins already prepared!"
-            return result
-        
-        # ========== PHASE 3: Split XCH Coins ==========
-        if xch_to_create > 0:
-            update_progress(f"Splitting {xch_to_create} XCH coins...", 0, xch_to_create, cat_existing, num_sell_offers)
-            
-            split_result = split_coins_bulk(
-                wallet_id=xch_wallet_id,
-                num_coins=xch_to_create,
-                coin_size_mojos=xch_per_offer_mojos,
-                fee_mojos=get_effective_transaction_fee_mojos()
-            )
-            
-            if not split_result or not split_result.get("success"):
-                result['message'] = f"Failed to split XCH coins: {split_result}"
-                return result
-            
-            result['xch_coins_created'] = xch_to_create
-            
-            # Wait for confirmations
-            update_progress("Waiting for XCH coin confirmations...", 0, xch_to_create, cat_existing, num_sell_offers)
-            
-            def xch_progress(confirmed, total):
-                update_progress(
-                    f"XCH coins confirming: {confirmed}/{num_buy_offers}",
-                    confirmed, num_buy_offers,
-                    cat_existing, num_sell_offers
-                )
-            
-            xch_confirmed = wait_for_coin_confirmations(
-                wallet_id=xch_wallet_id,
-                target_coin_size_mojos=xch_per_offer_mojos,
-                target_count=num_buy_offers,
-                tolerance=0.25,
-                max_wait_seconds=180,
-                poll_interval=10,
-                progress_callback=xch_progress
-            )
-            
-            if not xch_confirmed:
-                result['message'] = "Timeout waiting for XCH coins to confirm"
-                return result
-            
-            result['xch_coins_ready'] = count_suitable_coins(xch_wallet_id, xch_per_offer_mojos)
-        
-        # ========== PHASE 4: Split CAT Coins ==========
-        if cat_to_create > 0:
-            update_progress(f"Splitting {cat_to_create} CAT coins...", result['xch_coins_ready'], num_buy_offers, 0, cat_to_create)
-            
-            split_result = split_coins_bulk(
-                wallet_id=cat_wallet_id,
-                num_coins=cat_to_create,
-                coin_size_mojos=cat_per_offer_mojos,
-                fee_mojos=get_effective_transaction_fee_mojos()
-            )
-            
-            if not split_result or not split_result.get("success"):
-                result['message'] = f"Failed to split CAT coins: {split_result}"
-                return result
-            
-            result['cat_coins_created'] = cat_to_create
-            
-            # Wait for confirmations
-            update_progress("Waiting for CAT coin confirmations...", result['xch_coins_ready'], num_buy_offers, 0, num_sell_offers)
-            
-            def cat_progress(confirmed, total):
-                update_progress(
-                    f"CAT coins confirming: {confirmed}/{num_sell_offers}",
-                    result['xch_coins_ready'], num_buy_offers,
-                    confirmed, num_sell_offers
-                )
-            
-            cat_confirmed = wait_for_coin_confirmations(
-                wallet_id=cat_wallet_id,
-                target_coin_size_mojos=cat_per_offer_mojos,
-                target_count=num_sell_offers,
-                tolerance=0.25,
-                max_wait_seconds=180,
-                poll_interval=10,
-                progress_callback=cat_progress
-            )
-            
-            if not cat_confirmed:
-                result['message'] = "Timeout waiting for CAT coins to confirm"
-                return result
-            
-            result['cat_coins_ready'] = count_suitable_coins(cat_wallet_id, cat_per_offer_mojos)
-        
-        # ========== SUCCESS ==========
-        result['success'] = True
-        result['message'] = f"✅ Created {result['xch_coins_created']} XCH coins and {result['cat_coins_created']} CAT coins. Ready to trade!"
-        update_progress("Coins ready!", result['xch_coins_ready'], num_buy_offers, result['cat_coins_ready'], num_sell_offers)
-        
-        return result
-        
-    except Exception as e:
-        result['message'] = f"Error preparing coins: {e}"
-        import traceback
-        print(traceback.format_exc())
-        return result
-
-
-# ============================================================================
-# EXISTING FUNCTIONS (unchanged)
-# ============================================================================
 
 def get_balances_parallel(wallet_ids: list = None):
     """Fetch multiple wallet balances in parallel"""
@@ -981,7 +788,7 @@ def send_transaction_multi(payments: list, fee_mojos: int = 0):
 
 
 def create_offer(offer_dict: dict, validate_only: bool = True, max_time: int = None,
-                  reuse_puzhash: bool = False,
+                  _reuse_puzhash: bool = False,
                   min_coin_amount: int = None, max_coin_amount: int = None,
                   coin_ids: list = None):
     """Create offer for tokens
@@ -1354,6 +1161,22 @@ def cat_to_mojos(amount: Decimal, decimals: int) -> int:
     return int((amount * scale).to_integral_value(ROUND_DOWN))
 
 
+def xch_to_mojos(amount) -> int:
+    """Convert XCH amount (Decimal or numeric) to mojos (1 XCH = 1e12 mojos)."""
+    return int((Decimal(str(amount)) * Decimal(10) ** 12).to_integral_value(ROUND_DOWN))
+
+
+def mojos_to_xch(mojos: int) -> Decimal:
+    """Convert mojos to XCH Decimal."""
+    return Decimal(int(mojos)) / (Decimal(10) ** 12)
+
+
+def mojos_to_cat(mojos: int, decimals: int) -> Decimal:
+    """Convert CAT mojos to Decimal amount."""
+    scale = Decimal(10) ** Decimal(decimals)
+    return Decimal(int(mojos)) / scale
+
+
 def count_suitable_coins(wallet_id: int, target_size_mojos: int, 
                         is_cat: bool = False, decimals: int = 3,
                         tolerance: float = 0.1) -> int:
@@ -1382,163 +1205,6 @@ def count_suitable_coins(wallet_id: int, target_size_mojos: int,
     return suitable
 
 
-def prepare_coins_for_trading(
-    xch_wallet_id: int,
-    cat_wallet_id: int,
-    num_buy_offers: int,
-    num_sell_offers: int,
-    xch_per_offer: Decimal,
-    cat_per_offer: Decimal,
-    cat_decimals: int = 3,
-    reserve_multiplier: float = 2.0,
-) -> Dict[str, Any]:
-    """
-    Prepare optimal coin structure for market making
-    
-    🚀 FAST: Uses native split_coins RPC (1 transaction instead of 50!)
-    🎯 SMART: Leaves reserve coins for "Close the Gap" expansion
-    
-    Strategy:
-    1. Calculate requirements
-    2. Check existing suitable coins
-    3. Split large coins if needed (keeping reserves!)
-    4. Wait for confirmations
-    
-    Args:
-        xch_wallet_id: XCH wallet ID (usually 1)
-        cat_wallet_id: CAT wallet ID
-        num_buy_offers: Number of buy offers to prepare for
-        num_sell_offers: Number of sell offers to prepare for
-        xch_per_offer: XCH amount per offer (e.g., Decimal("0.2"))
-        cat_per_offer: CAT amount per offer (e.g., Decimal("3575.48"))
-        cat_decimals: CAT decimals (default 3)
-        reserve_multiplier: Keep this much extra (2.0 = 200% = double)
-    
-    Returns:
-        Dict with success status and details
-    """
-    print("\n🪙 Starting smart coin preparation...")
-    print(f"📊 Requirements: {num_buy_offers} buy offers × {xch_per_offer} XCH = {num_buy_offers * xch_per_offer} XCH")
-    print(f"📊 Requirements: {num_sell_offers} sell offers × {cat_per_offer} CAT")
-    
-    # Calculate total requirements
-    total_xch_needed = num_buy_offers * xch_per_offer
-    total_cat_needed = num_sell_offers * cat_per_offer
-    
-    xch_mojos_per_coin = xch_to_mojos(xch_per_offer)
-    cat_mojos_per_coin = cat_to_mojos(cat_per_offer, cat_decimals)
-    
-    print("🪙 Calculating requirements...")
-    
-    # Check existing coins
-    print("🪙 Checking existing coins...")
-    
-    xch_coins = count_suitable_coins(xch_wallet_id, xch_mojos_per_coin, is_cat=False)
-    cat_coins = count_suitable_coins(cat_wallet_id, cat_mojos_per_coin, is_cat=True, decimals=cat_decimals)
-    
-    xch_needed = max(0, num_buy_offers - xch_coins)
-    cat_needed = max(0, num_sell_offers - cat_coins)
-    
-    print(f"📊 XCH: Have {xch_coins} suitable coins, need {num_buy_offers}, will create {xch_needed}")
-    print(f"📊 CAT: Have {cat_coins} suitable coins, need {num_sell_offers}, will create {cat_needed}")
-    
-    status = {
-        "xch": {"existing": xch_coins, "needed": xch_needed, "created": 0, "success": True},
-        "cat": {"existing": cat_coins, "needed": cat_needed, "created": 0, "success": True},
-    }
-    
-    # Split XCH if needed
-    if xch_needed > 0:
-        print(f"🪙 Splitting {xch_needed} XCH coins... | XCH: {xch_coins}/{num_buy_offers}, CAT: {cat_coins}/{num_sell_offers}")
-        
-        result = split_coins_bulk(
-            wallet_id=xch_wallet_id,
-            num_coins=xch_needed,
-            coin_size_mojos=xch_mojos_per_coin,
-            fee_mojos=get_effective_transaction_fee_mojos(),
-            reserve_multiplier=reserve_multiplier,
-            is_cat=False
-        )
-        
-        if result and result.get("success"):
-            status["xch"]["created"] = result.get("coins_created", 0)
-            status["xch"]["tx_id"] = result.get("transaction_id")
-        else:
-            status["xch"]["success"] = False
-            status["xch"]["error"] = result.get("error", "Unknown error") if result else "Split failed"
-            print(f"❌ XCH split failed: {status['xch']['error']}")
-            return {"success": False, "status": status}
-    
-    # Split CAT if needed
-    if cat_needed > 0:
-        print(f"🪙 Splitting {cat_needed} CAT coins... | XCH: {xch_coins + status['xch']['created']}/{num_buy_offers}, CAT: {cat_coins}/{num_sell_offers}")
-        
-        result = split_coins_bulk(
-            wallet_id=cat_wallet_id,
-            num_coins=cat_needed,
-            coin_size_mojos=int(cat_per_offer),  # For CATs, this is TOKEN amount, not mojos!
-            fee_mojos=get_effective_transaction_fee_mojos(),
-            reserve_multiplier=reserve_multiplier,
-            is_cat=True,
-            cat_decimals=cat_decimals
-        )
-        
-        if result and result.get("success"):
-            status["cat"]["created"] = result.get("coins_created", 0)
-            status["cat"]["tx_id"] = result.get("transaction_id")
-        else:
-            status["cat"]["success"] = False
-            status["cat"]["error"] = result.get("error", "Unknown error") if result else "Split failed"
-            print(f"❌ CAT split failed: {status['cat']['error']}")
-            return {"success": False, "status": status}
-    
-    # Wait for confirmations if we created any coins
-    if xch_needed > 0 or cat_needed > 0:
-        print("🪙 Waiting for coin confirmations...")
-        
-        # Wait for XCH confirmations
-        if xch_needed > 0:
-            print(f"🪙 XCH coins confirming: 0/{xch_needed}")
-            
-            max_wait = 300  # 5 minutes
-            start_time = time.time()
-            
-            while (time.time() - start_time) < max_wait:
-                current_xch = count_suitable_coins(xch_wallet_id, xch_mojos_per_coin, is_cat=False)
-                progress = current_xch - xch_coins
-                
-                if progress >= xch_needed:
-                    print(f"🪙 XCH coins confirming: {xch_needed}/{xch_needed} ✅")
-                    break
-                
-                print(f"🪙 XCH coins confirming: {progress}/{xch_needed}")
-                time.sleep(10)
-        
-        # Wait for CAT confirmations
-        if cat_needed > 0:
-            print(f"🪙 CAT coins confirming: 0/{cat_needed}")
-            
-            max_wait = 300
-            start_time = time.time()
-            
-            while (time.time() - start_time) < max_wait:
-                current_cat = count_suitable_coins(cat_wallet_id, cat_mojos_per_coin, is_cat=True, decimals=cat_decimals)
-                progress = current_cat - cat_coins
-                
-                if progress >= cat_needed:
-                    print(f"🪙 CAT coins confirming: {cat_needed}/{cat_needed} ✅")
-                    break
-                
-                print(f"🪙 CAT coins confirming: {progress}/{cat_needed}")
-                time.sleep(10)
-    
-    print("✅ Coin preparation complete!")
-    return {"success": True, "status": status}
-
-
-# ============================================================================
-# CHIA WALLET STUBS (for compatibility with Sage-specific functions)
-# ============================================================================
 
 def get_owned_coins(wallet_id: int) -> Optional[Dict]:
     """Stub function for Chia wallet.

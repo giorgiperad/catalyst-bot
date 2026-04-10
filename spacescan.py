@@ -42,8 +42,7 @@ _FREE_CALL_INTERVAL = 12.0  # seconds between calls on the free tier
 _calls_this_session = 0
 _session_start_time = time.time()
 
-# Free tier monthly budget — reserve most for fill verification
-_FREE_MONTHLY_BUDGET = 1000
+# Free tier daily budget — reserve most for fill verification
 _FREE_DAILY_BUDGET = 30  # ~1000/month, leave headroom
 _calls_today = 0
 _today_date = ""  # Track date for daily reset
@@ -468,6 +467,23 @@ def check_balance_discrepancy(our_address: str, wallet_xch: Decimal,
                                cat_asset_id: str = None) -> Dict:
     """Compare wallet balances against on-chain truth.
 
+    XCH comparison uses BASELINE CALIBRATION rather than raw diff:
+      The Spacescan /address/xch-balance/ endpoint returns the sum of ALL
+      coin value attributable to an address, including XCH locked inside
+      CAT, NFT and DID puzzle wrappers. A market-maker wallet that holds
+      any CAT/NFT will therefore always show a positive (on_chain − wallet)
+      delta equal to the wrapped puzzle value — this is expected, not drift.
+
+      On the first successful check we store `(on_chain − wallet)` as the
+      baseline under the bot_settings key `spacescan_xch_baseline_delta`.
+      On subsequent checks we alarm only if the current delta has moved
+      away from the baseline by more than `SPACESCAN_BALANCE_THRESHOLD_XCH`.
+      That catches real drift (coins unexpectedly appearing / disappearing)
+      while ignoring the constant overhead.
+
+      To force recalibration (after a sweep, wallet swap, etc.) delete the
+      `spacescan_xch_baseline_delta` row from bot_settings.
+
     Args:
         our_address: Our XCH wallet address
         wallet_xch: What the wallet reports as XCH balance
@@ -479,7 +495,9 @@ def check_balance_discrepancy(our_address: str, wallet_xch: Decimal,
         {
             "xch_onchain": Decimal or None,
             "xch_wallet": Decimal,
-            "xch_diff": Decimal or None,
+            "xch_diff": Decimal or None,          # raw (on_chain − wallet)
+            "xch_baseline_delta": Decimal or None,# expected constant delta
+            "xch_drift": Decimal or None,         # |current_delta − baseline|
             "xch_ok": bool,
             "cat_onchain": Decimal or None,
             "cat_wallet": Decimal or None,
@@ -490,7 +508,8 @@ def check_balance_discrepancy(our_address: str, wallet_xch: Decimal,
     threshold = getattr(cfg, "SPACESCAN_BALANCE_THRESHOLD_XCH", Decimal("0.1"))
     result = {
         "xch_onchain": None, "xch_wallet": wallet_xch,
-        "xch_diff": None, "xch_ok": True,
+        "xch_diff": None, "xch_baseline_delta": None, "xch_drift": None,
+        "xch_ok": True,
         "cat_onchain": None, "cat_wallet": wallet_cat,
         "cat_diff": None, "cat_ok": True,
     }
@@ -499,13 +518,59 @@ def check_balance_discrepancy(our_address: str, wallet_xch: Decimal,
     xch_onchain = get_xch_balance(our_address)
     if xch_onchain is not None:
         result["xch_onchain"] = xch_onchain
-        result["xch_diff"] = abs(xch_onchain - wallet_xch)
-        result["xch_ok"] = result["xch_diff"] <= threshold
+        current_delta = xch_onchain - wallet_xch  # signed
+        result["xch_diff"] = abs(current_delta)
 
-        if not result["xch_ok"]:
-            log_event("warning", "balance_discrepancy_xch",
-                      f"XCH balance mismatch! Wallet: {wallet_xch}, "
-                      f"On-chain: {xch_onchain}, Diff: {result['xch_diff']}")
+        # Look up (or establish) the baseline delta for this address.
+        # Key is address-specific so changing WALLET_ADDRESS forces
+        # automatic recalibration.
+        try:
+            from database import get_setting, set_setting  # local import to avoid cycles
+            baseline_key = f"spacescan_xch_baseline_delta:{our_address}"
+            baseline_str = get_setting(baseline_key, None)
+
+            if baseline_str is None:
+                # First observation — establish the baseline and treat as OK.
+                set_setting(baseline_key, str(current_delta))
+                result["xch_baseline_delta"] = current_delta
+                result["xch_drift"] = Decimal("0")
+                result["xch_ok"] = True
+                log_event("info", "spacescan_baseline_set",
+                          f"Spacescan XCH baseline delta established: "
+                          f"{current_delta} XCH (on-chain {xch_onchain} − "
+                          f"wallet {wallet_xch}). This represents XCH held "
+                          f"inside CAT/NFT/DID puzzles and is expected to "
+                          f"stay roughly constant. Drift from this baseline "
+                          f"beyond {threshold} XCH will raise a warning.")
+            else:
+                try:
+                    baseline_delta = Decimal(baseline_str)
+                except Exception:
+                    baseline_delta = current_delta
+                    set_setting(baseline_key, str(current_delta))
+
+                drift = abs(current_delta - baseline_delta)
+                result["xch_baseline_delta"] = baseline_delta
+                result["xch_drift"] = drift
+                result["xch_ok"] = drift <= threshold
+
+                if not result["xch_ok"]:
+                    log_event("warning", "balance_discrepancy_xch",
+                              f"XCH balance drift from baseline! "
+                              f"Wallet: {wallet_xch}, On-chain: {xch_onchain}, "
+                              f"Current delta: {current_delta}, "
+                              f"Baseline delta: {baseline_delta}, "
+                              f"Drift: {drift} XCH (threshold {threshold}).")
+        except Exception as e:
+            # Baseline plumbing failed — fall back to raw-diff check so the
+            # caller still gets a result, but note it.
+            log_event("debug", "spacescan_baseline_fallback",
+                      f"Baseline lookup failed ({e}); falling back to raw diff")
+            result["xch_ok"] = result["xch_diff"] <= threshold
+            if not result["xch_ok"]:
+                log_event("warning", "balance_discrepancy_xch",
+                          f"XCH balance mismatch! Wallet: {wallet_xch}, "
+                          f"On-chain: {xch_onchain}, Diff: {result['xch_diff']}")
 
     # Check CAT (if requested)
     if wallet_cat is not None and cat_asset_id:

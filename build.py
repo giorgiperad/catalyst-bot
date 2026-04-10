@@ -1,5 +1,5 @@
 """
-build.py — Chia Market Maker Windows build script
+build.py — CATalyst Windows build script
 
 Usage:
     python build.py              # Normal build
@@ -98,7 +98,7 @@ def _post_build():
 
     # Confirm HTML files are bundled (quick sanity check)
     missing_html = []
-    for html in ('bot_gui.html', 'bot_console.html', 'chia_dashboard.html'):
+    for html in ('bot_gui.html', 'bot_console.html'):
         if not os.path.isfile(os.path.join(OUTPUT_DIR, html)):
             missing_html.append(html)
     if missing_html:
@@ -136,11 +136,11 @@ def _print_success():
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description='Build Chia Market Maker for Windows')
+    parser = argparse.ArgumentParser(description='Build CATalyst for Windows')
     parser.add_argument('--no-clean', action='store_true', help='Skip cleaning dist/ and build/ before building')
     args = parser.parse_args()
 
-    print(f"\n  Chia Market Maker — Windows Build")
+    print(f"\n  CATalyst — Windows Build")
     print(f"  {'=' * 40}")
     print(f"  Python     : {sys.executable}")
     print(f"  Spec file  : {SPEC_FILE}")

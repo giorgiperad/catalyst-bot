@@ -36,7 +36,6 @@ from typing import Dict, Optional
 
 from config import cfg
 from database import (
-    init_database,
     log_event,
     get_stats,
     get_offer,
@@ -63,7 +62,7 @@ from market_intel import MarketIntel
 from runtime_monitor import RuntimeMonitor
 from amm_monitor import AMMMonitor
 from splash_receive import classify_offer_for_asset
-from wallet import get_all_offers, classify_offers_from_list, get_chia_health, cancel_offer
+from wallet import get_all_offers, get_chia_health
 try:
     import mempool_watcher as _mempool_watcher_mod
 except ImportError:
@@ -157,12 +156,20 @@ class BotLoop:
         self.splash_manager = SplashManager()
         self.splash_node = SplashNode()
         self.coinset_client = CoinsetClient()
+        # F34 (2026-04-08): wire coinset_client into offer_manager so
+        # fill_tracker can reach it for the Coinset fill verification
+        # fallback when Spacescan is unavailable.
+        self.offer_manager._coinset_client = self.coinset_client
         self.coin_manager = CoinManager()
         self.coin_manager._price_engine = self.price_engine  # For CAT size derivation
         self.risk_manager = RiskManager(
             price_engine=self.price_engine,
             market_intel=self.market_intel
         )
+        # F37 (2026-04-08): wire dexie_manager into risk_manager so the
+        # volatility calculation can use real Dexie v3 historical_trades
+        # instead of relying solely on price_engine snapshots.
+        self.risk_manager._dexie_manager = self.dexie_manager
         self.sniper = Sniper(
             offer_manager=self.offer_manager,
             risk_manager=self.risk_manager,
@@ -187,7 +194,6 @@ class BotLoop:
         self._thread: Optional[threading.Thread] = None
         self._loop_count: int = 0
         self._start_time: float = 0  # Set when bot starts, used for uptime
-        self._last_loop_time: float = 0
         self._last_loop_duration: float = 0
 
         # ---- Price tracking ----
@@ -234,6 +240,32 @@ class BotLoop:
         # ---- Housekeeping timer ----
         self._last_housekeeping: float = 0
         self._housekeeping_interval: int = 300  # 5 minutes
+
+        # ---- F19/F22/F23 hardening watchdog state ----
+        self._wal_oversize_streak: int = 0
+        self._position_baseline_cat: Optional[Decimal] = None
+        # F48 (2026-04-09): also snapshot the bot's own net_position_cat
+        # at the moment the wallet baseline is taken, so the sanity check
+        # compares deltas against deltas (since-session) rather than
+        # current-wallet against all-time-fills (mismatched windows).
+        self._position_baseline_net_cat: Optional[Decimal] = None
+        self._position_baseline_at: float = 0
+        self._last_daily_reconcile_at: float = 0
+        self._wallet_stale_streak: int = 0
+        self._wallet_stale_first_at: float = 0
+        self._trim_streak: int = 0
+        self._startup_self_test_results: Dict = {}
+
+        # ---- F27 (2026-04-08): per-step SLA tracking ----
+        # _current_cycle_step: name of the cycle step currently executing
+        # _cycle_step_started_at: monotonic timestamp when step started
+        # The housekeeping watchdog reads these to detect hung steps. We
+        # don't try to abort mid-step (state could be corrupted) — we just
+        # escalate alerts so the operator knows what's stuck.
+        self._current_cycle_step: str = "idle"
+        self._cycle_step_started_at: float = 0.0
+        self._step_sla_secs: float = 60.0  # warn if a single step exceeds 60s
+        self._step_sla_alerted_for: Optional[str] = None
 
         # ---- Sweep protection (Tier 3) ----
         # Maps side ("buy"/"sell") → wall-clock expiry time.
@@ -284,8 +316,6 @@ class BotLoop:
         self._coin_watcher_lock = threading.Lock()
         self._coin_watcher_interval: int = 30  # seconds between polls (reduced from 12s — read-only thread)
         self._coin_snapshot: Dict[str, Dict] = {}  # {coin_id: {amount, status, wallet_type}}
-        self._coin_watcher_polls: int = 0
-        self._coin_watcher_changes: int = 0
 
         # ---- Splash incoming watcher state ----
         self._splash_receive_thread: Optional[threading.Thread] = None
@@ -418,6 +448,20 @@ class BotLoop:
             metrics["spacescan_activity_level"] = spacescan.get("activity_level", "unknown")
             metrics["spacescan_risk_level"]  = spacescan.get("risk_level", "unknown")
             metrics["spacescan_price_gap_bps"] = str(spacescan.get("price_gap_bps", 0))
+            # F40 (2026-04-08): expose supply + market-cap metrics so the
+            # Advisor can warn about low-cap risk relative to trade size.
+            metrics["spacescan_circulating_supply"] = spacescan.get("circulating_supply", 0)
+            metrics["spacescan_total_supply"] = spacescan.get("total_supply", 0)
+            metrics["spacescan_activity_count"] = spacescan.get("activity_count", 0)
+            # Compute market cap in XCH = circulating_supply × current_mid_price
+            try:
+                cs = float(spacescan.get("circulating_supply", 0) or 0)
+                if cs > 0 and mid_price > 0:
+                    metrics["market_cap_xch"] = round(cs * mid_price, 4)
+                else:
+                    metrics["market_cap_xch"] = 0
+            except Exception:
+                metrics["market_cap_xch"] = 0
         except Exception as e:
             log_event("debug", "spacescan_augment_failed",
                       f"Spacescan health augment failed (non-critical): {e}")
@@ -546,6 +590,12 @@ class BotLoop:
         """Enter or clear recovery mode based on persistent degraded state."""
         state = self._recovery_state
         targets = self._get_expected_offer_targets(mid_price)
+        # Fix F: reduce targets by suspended slot count so coin-exhausted
+        # slots don't keep triggering recovery mode.
+        buy_suspended = self.offer_manager.get_suspended_slot_count("buy")
+        sell_suspended = self.offer_manager.get_suspended_slot_count("sell")
+        targets["buy"] = max(0, targets["buy"] - buy_suspended)
+        targets["sell"] = max(0, targets["sell"] - sell_suspended)
         buy_effective = int(current_buy_count) + int(self.offer_manager.get_recently_created_count("buy"))
         sell_effective = int(current_sell_count) + int(self.offer_manager.get_recently_created_count("sell"))
         buy_deficit = max(0, int(targets["buy"]) - buy_effective)
@@ -1256,26 +1306,20 @@ class BotLoop:
                 self._clear_alert("probe_status")
             else:
                 # ----------------------------------------------------------
-                # PROBE-FILL = POSITIVE SIGNAL logic
+                # PROBE-FILL = BOUNDARY NOT FOUND — widen and retry
                 #
                 # A probe disappearing after the visibility grace window means
-                # it was FILLED — someone took it. This is market confirmation
-                # that the price was right, NOT a failure.
+                # it was FILLED — someone took it. This means the price was
+                # too aggressive: the safe boundary hasn't been found yet.
                 #
-                # Old behaviour: always retry at a wider spread (wastes a coin
-                # and delays the main ladder by SNIPER_CONFIRM_SECS).
+                # The probe's purpose is to find the price where offers
+                # SURVIVE on the book. A fill means we overshot — widen the
+                # spread and try again. Only when a probe survives for
+                # SNIPER_CONFIRM_SECS do we know the edge is safe, and only
+                # then does the main ladder deploy behind it.
                 #
-                # New behaviour:
-                #   - First fill (attempt 0 → 1): treat as price confirmation.
-                #     Deploy main ladder at Tibet price immediately. The fill IS
-                #     the confirmation. Only surviving probes need to age out.
-                #   - Repeated fills (attempt ≥ 1): also confirm. If the market
-                #     keeps taking our probes, the price is clearly correct.
-                #     Stop retrying and build the book.
-                #
-                # Exception: only widen + retry if the probe disappeared during
-                # an extreme arb gap (>SNIPER_BUFFER_BPS), suggesting mispricing
-                # rather than genuine market interest.
+                # This prevents the ladder from being built at prices that
+                # immediately get taken (feeding arb bots or losing spread).
                 # ----------------------------------------------------------
 
                 taken_sides = []
@@ -1285,27 +1329,10 @@ class BotLoop:
                     taken_sides.append("sell")
 
                 arb_gap_bps_float = float(arb_gap or 0)
-                buffer_bps = float(getattr(cfg, "SNIPER_BUFFER_BPS", Decimal("50")) or 50)
-                is_extreme_arb = arb_gap_bps_float > (buffer_bps * 3)
 
-                if taken_sides and not is_extreme_arb:
-                    # Filled under normal market conditions = positive signal.
-                    # Confirm at Tibet price and deploy main ladder.
-                    confirmed_price = probe["tibet_price"]
-                    probe["confirmed_price"] = confirmed_price
-                    probe["confirmed_at"] = now_ts
-                    probe["active"] = False
-                    log_event("info", "probe_fill_confirmed",
-                              f"Probe {'+'.join(taken_sides)} filled at attempt "
-                              f"{probe['attempt']} — positive price signal. "
-                              f"Confirming at Tibet {confirmed_price:.8f} and "
-                              f"deploying main ladder (fill = market confirmation).")
-                    log_event("info", "probe_confirmed_status",
-                              "Price confirmed via fill - deploying main offers")
-                    self._clear_alert("probe_status")
-                else:
-                    # Either extreme arb gap (probe taken by arb bot not genuine
-                    # market interest) or retry is warranted. Widen and retry.
+                if taken_sides or not (buy_alive or sell_alive):
+                    # Probe was taken — the edge is further out than we tested.
+                    # Widen the buffer and retry to find the safe boundary.
                     attempt = probe["attempt"] + 1
                     base_buffer = getattr(cfg, "SNIPER_BUFFER_BPS", Decimal("50"))
                     adjusted_buffer = base_buffer + Decimal(str(attempt * 50))
@@ -1317,10 +1344,10 @@ class BotLoop:
 
                     log_event("info", "probe_retry",
                               f"Probe attempt {attempt}: {'+'.join(taken_sides) or 'none visible'} "
-                              f"taken during extreme arb ({arb_gap_bps_float:.0f} BPS), "
-                              f"widening buffer to {adjusted_buffer} BPS")
+                              f"taken (arb gap {arb_gap_bps_float:.0f} BPS) — safe edge "
+                              f"not found, widening buffer to {adjusted_buffer} BPS")
                     log_event("info", "probe_retry_status",
-                              f"Probe retry {attempt} - extreme arb, widening spread")
+                              f"Probe retry {attempt} - widening spread to find safe edge")
                     self._clear_alert("probe_status")
 
                     new_sell_price = self._apply_probe_retry_backoff(
@@ -1336,13 +1363,19 @@ class BotLoop:
 
                     sell_results = None
                     buy_results = None
-                    # Only retry sell if it was originally placed — don't hammer
-                    # CAT sniper creation when no CAT sniper coins exist
-                    if sell_tid and not sell_alive:
+                    # SYMMETRY (2026-04-08): both sides retry on either
+                    # "originally placed and now gone" OR "never placed".
+                    # The previous asymmetry — sell only retried if already
+                    # placed — biased discovery toward the buy side under
+                    # CAT shortage and could permanently stall sell-side
+                    # widening once a sell probe failed to place. The
+                    # sniper's own cooldown / per-side cap / coin checks
+                    # already bound retry frequency, so symmetric retries
+                    # don't hammer the wallet beyond what the sniper allows.
+                    if (sell_tid and not sell_alive) or not sell_tid:
+                        self.sniper._last_snipe_time = 0
                         sell_results = self.sniper.try_snipe_single(
                             "sell", new_sell_price, arb_gap)
-                    # Retry buy only if it was taken (alive→gone) OR was never
-                    # successfully placed (use truthy check to exclude empty string "")
                     if (buy_tid and not buy_alive) or not buy_tid:
                         self.sniper._last_snipe_time = 0
                         buy_results = self.sniper.try_snipe_single(
@@ -1946,7 +1979,6 @@ class BotLoop:
                 log_event("warning", "slow_iteration",
                           f"Slow cycle: {self._last_loop_duration:.0f}s — possible RPC hang. "
                           f"Normal cycles should complete in < {cfg.LOOP_SECONDS}s.")
-            self._last_loop_time = time.time()
             self._loop_count += 1
             self._set_state(loop_count=self._loop_count)
 
@@ -1964,39 +1996,56 @@ class BotLoop:
                           f"Fast wake — Tibet swap detected: {watcher_info}")
 
             # Process mempool watcher signals (pre-emptive price intelligence)
-            if _mempool_watcher_mod and self._running:
-                try:
-                    w = _mempool_watcher_mod._watcher_instance
-                    if w:
-                        for sig in w.get_pending_signals():
-                            sig_type = sig.get("type")
-                            if sig_type == "imminent_swap":
-                                log_event("info", "mempool_imminent_wake",
-                                          "Mempool: pending pool-coin spend detected — "
-                                          "pre-emptive requote cycle triggered")
-                                # Treat exactly like a price-watcher wake so the bot
-                                # reruns pricing/requote without waiting for next timer.
-                                # (We're already past the sleep so next cycle starts
-                                #  immediately in the next iteration.)
-                            elif sig_type == "fill_imminent":
-                                coin_id = sig.get("coin_id", "?")[:16]
-                                log_event("info", "mempool_fill_wake",
-                                          f"Mempool: offer coin {coin_id}... spent — "
-                                          f"waking early for fill detection")
-                                # Wake the bot immediately so fill_tracker can confirm
-                                # via wallet RPC and post a replacement this cycle
-                                # rather than waiting up to LOOP_SECONDS.
-                                self._watcher_event.set()
-                            elif sig_type == "price_move":
-                                direction = sig.get("direction", "?")
-                                pct = sig.get("magnitude_pct", 0)
-                                log_event("info", "mempool_price_confirmed",
-                                          f"Pool reserves confirmed: {direction} {pct:.3f}% "
-                                          f"(XCH {sig.get('delta_xch', 0):+d} mojos)")
-                except Exception:
-                    pass
+            self._drain_mempool_signals(in_cycle=False)
 
         log_event("info", "bot_loop_exit", "Bot loop exited cleanly")
+
+    def _drain_mempool_signals(self, in_cycle: bool = False) -> None:
+        """Drain pending mempool watcher signals and act on them.
+
+        Called from two places:
+          1. Between cycles (in_cycle=False) — original behaviour. Sets
+             _watcher_event on fill_imminent so the loop wakes early.
+          2. Mid-cycle, just before fill detection (in_cycle=True) — F11
+             fix. The wake is no longer needed because we're already running
+             the work; we still drain the signal so it doesn't pile up.
+        """
+        if not (_mempool_watcher_mod and self._running):
+            return
+        try:
+            w = _mempool_watcher_mod._watcher_instance
+            if not w:
+                return
+            for sig in w.get_pending_signals():
+                sig_type = sig.get("type")
+                if sig_type == "imminent_swap":
+                    log_event("info", "mempool_imminent_wake",
+                              "Mempool: pending pool-coin spend detected — "
+                              "pre-emptive requote cycle triggered")
+                    if not in_cycle:
+                        # Fix C: wake the bot immediately so we can requote
+                        # before the swap confirms, rather than sleeping up
+                        # to LOOP_SECONDS.
+                        self._watcher_event.set()
+                elif sig_type == "fill_imminent":
+                    coin_id = sig.get("coin_id", "?")[:16]
+                    log_event("info", "mempool_fill_wake",
+                              f"Mempool: offer coin {coin_id}... spent — "
+                              + ("processing fill detection now"
+                                 if in_cycle else "waking early for fill detection"))
+                    if not in_cycle:
+                        # Wake the bot immediately so fill_tracker can
+                        # confirm via wallet RPC and post a replacement
+                        # this cycle rather than waiting up to LOOP_SECONDS.
+                        self._watcher_event.set()
+                elif sig_type == "price_move":
+                    direction = sig.get("direction", "?")
+                    pct = sig.get("magnitude_pct", 0)
+                    log_event("info", "mempool_price_confirmed",
+                              f"Pool reserves confirmed: {direction} {pct:.3f}% "
+                              f"(XCH {sig.get('delta_xch', 0):+d} mojos)")
+        except Exception:
+            pass
 
     # -------------------------------------------------------------------
     # Startup sync
@@ -2026,6 +2075,18 @@ class BotLoop:
         except Exception as e:
             log_event("warning", "config_validation_failed",
                       f"Config validation raised an exception: {e}")
+
+        # F18 (2026-04-08): startup self-test of external services.
+        # Pings every external dependency the bot relies on (Sage,
+        # Coinset, TibetSwap, Dexie, Spacescan) and emits a warning
+        # alert for each one that's down. NEVER blocks startup —
+        # the user is informed about what will be missing and chooses
+        # whether to start the bot.
+        try:
+            self._run_startup_self_test()
+        except Exception as _self_test_err:
+            log_event("warning", "startup_self_test_failed",
+                      f"Startup self-test raised: {_self_test_err}")
 
         # ── Clear stale reservations from previous runtime ──────────
         try:
@@ -2298,7 +2359,7 @@ class BotLoop:
 
                 try:
                     health_data = self._augment_health_with_spacescan(
-                        self.risk_manager.get_market_health()
+                        self.risk_manager.get_market_health(loop_count=self._loop_count)
                     )
                     offer_edges = self._get_live_offer_edges(open_buys, open_sells)
                     cached_intel = {}
@@ -2390,18 +2451,16 @@ class BotLoop:
                     log_event("warning", "startup_coins_critical",
                               "COIN READINESS: CRITICAL — some tiers have zero coins! "
                               "Run coin prep before starting offers.")
-                else:
-                    severity = "info" if resumed_live_book else "warning"
-                    event_type = "startup_coins_low_resume" if resumed_live_book else "startup_coins_low"
-                    resume_note = (
-                        " Existing offers are still live, and topup will rebuild spares as needed."
-                        if resumed_live_book else ""
-                    )
+                elif not resumed_live_book:
+                    # Only fire LOW_SPARES on a cold start. On resume the per-tier
+                    # free counts naturally read as LOW because most coins are bound
+                    # to the existing offers, which is normal — topup handles it
+                    # transparently as offers cycle.
                     log_event(
-                        severity,
-                        event_type,
+                        "warning",
+                        "startup_coins_low",
                         f"COIN READINESS: {status} — some tiers are below target. "
-                        f"Topup will activate when needed.{resume_note}"
+                        f"Topup will activate when needed."
                     )
 
             # V3: Startup collateral advisory — tells user how XCH is allocated
@@ -2812,6 +2871,12 @@ class BotLoop:
 
         except Exception as e:
             log_event("error", "startup_sync_failed", f"Startup sync failed: {e}")
+            # Critical: do NOT continue trading without a proper baseline.
+            # Flag the bot as stopped so the main loop exits immediately.
+            self._running = False
+            self._set_state(status="error",
+                            error=f"Startup sync failed: {e}")
+            return
 
     # -------------------------------------------------------------------
     # One trading cycle
@@ -2821,6 +2886,7 @@ class BotLoop:
         """Execute one complete trading cycle."""
         self._recovery_state["cycle_probe_churn"] = False
         self._recovery_state["cycle_create_stalled"] = False
+        self._set_cycle_step("cycle_start")
 
         # ---- Step 0pre: Clear per-cycle coin exclusion set ----
         # Coins from the previous cycle's pending offers may now be confirmed
@@ -2896,14 +2962,58 @@ class BotLoop:
             pass  # Sweep coordinator is additive — never block main cycle
 
         # ---- Step 1: Fetch prices ----
+        self._set_cycle_step("step1_price_fetch")
         price_data = self.price_engine.get_price(
             cfg.CAT_ASSET_ID, cfg.CAT_DECIMALS, cfg.CAT_TICKER_ID
         )
 
         if price_data is None:
             # get_price() returns None when the price fails a safety guard
-            # (dynamic band, hard min/max, or step-change guard). The guard
-            # already logged the reason. Skip this cycle rather than crashing.
+            # (dynamic band, hard min/max, or step-change guard). Without
+            # any further action the cycle would return early and leave
+            # stale offers exposed at the now-wrong mid — easy money for
+            # arb takers if Tibet has spiked. Route the breach through
+            # the price CB so _safeguard_offers_for_circuit_breaker
+            # cancels everything before we skip.
+            rail_dir = getattr(self.price_engine, "_last_rail_breach", None)
+            rail_kind = getattr(self.price_engine, "_last_rail_breach_kind", None)
+            rail_price = getattr(self.price_engine, "_last_rail_breach_price", None)
+            if rail_dir in ("above", "below"):
+                _direction_note = {
+                    "above": "rail breach ABOVE — price spike past upper rail",
+                    "below": "rail breach BELOW — price drop past lower rail",
+                }.get(rail_dir, f"rail breach ({rail_dir})")
+                _kind_note = f" [{rail_kind}]" if rail_kind else ""
+                _price_note = f" at {rail_price}" if rail_price is not None else ""
+                _reason = f"{_direction_note}{_kind_note}{_price_note}"
+                try:
+                    self.risk_manager.trip_price_rail_breach(_reason)
+                    self._set_state(status="circuit_breaker")
+                    self._emit_alert(
+                        "circuit_breaker",
+                        "error",
+                        "Price Rail Breach",
+                        _reason,
+                        action="stop_bot",
+                        action_label="Stop Bot",
+                    )
+                    log_event(
+                        "critical", "rail_breach",
+                        f"Price rail breach detected — tripping price CB and "
+                        f"cancelling stale offers ({_reason})",
+                        data={
+                            "direction": rail_dir,
+                            "kind": rail_kind,
+                            "rejected_price": str(rail_price) if rail_price is not None else None,
+                        },
+                    )
+                    # _safeguard cancels ALL offers for a price CB. Without
+                    # this call, stale offers stay on the book at the old
+                    # mid until the CB clears or the operator intervenes.
+                    self._safeguard_offers_for_circuit_breaker()
+                except Exception as _e:
+                    log_event("error", "rail_breach_safeguard_failed",
+                              f"Rail breach safeguard failed: {_e}")
             log_event("warning", "no_price",
                       "Price rejected by safety guard — skipping cycle. "
                       "Check HARD_MAX_PRICE_XCH / HARD_MIN_PRICE_XCH or dynamic band settings.")
@@ -3072,6 +3182,7 @@ class BotLoop:
             self._circuit_breaker_offer_safed = False
 
         # ---- Step 3: Get current offers from wallet ----
+        self._set_cycle_step("step3_wallet_sync")
         print(f"   [3] Syncing offers from wallet...", end="", flush=True)
         log_event("debug", "step3_sync", "Syncing offers from wallet...")
         open_buys, open_sells, closed = self.offer_manager.sync_from_wallet()
@@ -3088,6 +3199,41 @@ class BotLoop:
         all_open_ids = current_buy_ids | current_sell_ids
         self.sniper.prune_active_snipes(all_open_ids)
         self.boost_manager.prune_active_boosts(all_open_ids)
+
+        # Safety sweep: any sniper trade_id that is STILL open but not
+        # tracked by _probe_state is an orphan from an abandoned probe
+        # cycle (e.g. a thread that landed its offer after being
+        # abandoned at 30s). These must be cancelled because they
+        # occupy a sniper slot and sit on the book untracked.
+        try:
+            with self._probe_lock:
+                _probe_known = set()
+                for _key in ("buy_tid", "sell_tid"):
+                    _tid = self._probe_state.get(_key)
+                    if _tid:
+                        _probe_known.add(_tid)
+            with self.sniper._snipe_lock:
+                _sniper_tracked = set(self.sniper._active_snipe_ids)
+            _orphan_snipes = (_sniper_tracked & all_open_ids) - _probe_known
+            if _orphan_snipes:
+                log_event("warning", "sniper_orphan_sweep",
+                          f"Sweep found {len(_orphan_snipes)} orphan sniper "
+                          f"offer(s) not tracked by probe state — cancelling")
+                try:
+                    self.offer_manager.cancel_offers(
+                        list(_orphan_snipes), reason="sniper_orphan_sweep"
+                    )
+                    with self.sniper._snipe_lock:
+                        for _tid in _orphan_snipes:
+                            if _tid in self.sniper._active_snipe_ids:
+                                self.sniper._active_snipe_ids.remove(_tid)
+                            self.sniper._active_snipe_sides.pop(_tid, None)
+                except Exception as _sweep_err:
+                    log_event("error", "sniper_orphan_sweep_failed",
+                              f"Failed to cancel orphan snipers: {_sweep_err}")
+        except Exception as _sweep_outer:
+            log_event("debug", "sniper_orphan_sweep_skipped",
+                      f"Orphan sweep skipped: {_sweep_outer}")
 
         self._set_state(open_buys=len(current_buy_ids), open_sells=len(current_sell_ids))
 
@@ -3122,17 +3268,55 @@ class BotLoop:
                     f"Wallet offer sync stale — using {cache_note} wallet snapshot "
                     f"({len(current_buy_ids)}b/{len(current_sell_ids)}s). {err}",
                 )
+                # Initialise stale-cycle counter on first stale cycle
+                self._wallet_stale_streak = 1
+                self._wallet_stale_first_at = time.time()
+            else:
+                self._wallet_stale_streak = getattr(self, "_wallet_stale_streak", 0) + 1
+            # F12 fix (2026-04-08): escalation timeout. The original code
+            # only ever showed a single warning-level alert. If wallet
+            # sync stays stale for many minutes the user might miss it.
+            # Now: escalate to error severity after 10 stale cycles
+            # (~7 minutes at LOOP_SECONDS=45) and to a CRITICAL alert
+            # after 20 stale cycles (~15 minutes), with the same
+            # action_label so the user can take action from either.
+            stale_streak = getattr(self, "_wallet_stale_streak", 1)
+            if stale_streak >= 20:
+                _alert_sev = "error"
+                _alert_title = "Wallet Sync CRITICAL"
+                _alert_msg = (
+                    f"Wallet offer sync has been stale for {stale_streak} cycles "
+                    f"(~{int((time.time() - getattr(self, '_wallet_stale_first_at', time.time())) / 60)} min). "
+                    f"Fill detection and coin management are blocked. "
+                    f"Please restart Sage now."
+                )
+            elif stale_streak >= 10:
+                _alert_sev = "warning"
+                _alert_title = "Wallet Sync Degraded (sustained)"
+                _alert_msg = (
+                    f"Wallet sync has been stale for {stale_streak} cycles. "
+                    f"Restart Sage if this persists."
+                )
+            else:
+                _alert_sev = "warning"
+                _alert_title = "Wallet Sync Degraded"
+                _alert_msg = (
+                    "Using the last known offer book until Sage responds again. "
+                    "New fills and coin-management actions are paused."
+                )
             self._emit_alert(
                 "wallet_offer_sync",
-                "warning",
-                "Wallet Sync Degraded",
-                "Using the last known offer book until Sage responds again. "
-                "New fills and coin-management actions are paused.",
+                _alert_sev,
+                _alert_title,
+                _alert_msg,
                 action="restart_sage",
                 action_label="Restart Sage",
             )
             self._wallet_sync_was_stale = True
         else:
+            # Reset stale streak counter on first fresh cycle
+            self._wallet_stale_streak = 0
+            self._wallet_stale_first_at = 0
             if self._wallet_sync_was_stale:
                 log_event("info", "wallet_sync_live_again",
                           "Wallet offer sync is fresh again — resuming normal trading actions")
@@ -3140,6 +3324,19 @@ class BotLoop:
             self._wallet_sync_was_stale = False
 
         # ---- Step 4: Detect fills ----
+        self._set_cycle_step("step4_fill_detection")
+        # F11 fix (2026-04-08): drain any pending mempool watcher signals
+        # right before fill detection. Originally signals were only checked
+        # at the TOP of the next iteration, meaning a fill_imminent that
+        # arrived mid-cycle would wait for the cycle to finish before being
+        # logged + waking the loop. Now we drain at this in-cycle sync point
+        # too — the wake itself is no longer needed because we're already
+        # running the fill detection that would have benefited from it,
+        # but the log entry + state update still happen.
+        try:
+            self._drain_mempool_signals(in_cycle=True)
+        except Exception:
+            pass  # Non-critical
         print(f"   [4] Checking fills...", end="", flush=True)
         fill_result = self.fill_tracker.detect_fills(
             current_buy_ids, current_sell_ids,
@@ -3166,6 +3363,11 @@ class BotLoop:
             # Coin snapshot after fills — coins consumed + new coins received
             self.coin_manager.snapshot_coins("offer_filled")
             self._emit_coin_update("offer_filled")
+            # Fix H: invalidate position sanity baseline so the next
+            # housekeeping tick re-snaps against the post-fill state.
+            # Without this, recorded fills change net_position but the
+            # stale baseline drifts, spamming position_sanity_drift warnings.
+            self._position_baseline_cat = None
 
         if not buy_fills and not sell_fills:
             print(" none", flush=True)
@@ -3175,19 +3377,36 @@ class BotLoop:
         # If AMMMonitor has data, check whether the current AMM price has
         # drifted far enough from our last quoted prices to make our offers
         # arb targets. If so, flag both sides for requote immediately.
+        #
+        # Fix 4: cooldown gate. The AMM drift trigger used to bypass
+        # REQUOTE_COOLDOWN_SECS, which combined with a stale baseline
+        # (which Fix 4's baseline-on-attempt advance also addresses) caused
+        # a feedback loop where every cycle re-fired the same drift,
+        # generating a requote storm. We now refuse to re-trigger drift
+        # requote within REQUOTE_COOLDOWN_SECS of the last AMM-drift force.
         try:
             if self.amm_monitor.is_available():
                 amm_drift_bps = self.amm_monitor.get_drift_bps()
                 if amm_drift_bps is not None:
-                    _drift_threshold = Decimal(str(getattr(cfg, "AMM_DRIFT_REQUOTE_BPS", "40")))
+                    _drift_threshold = Decimal(str(getattr(cfg, "AMM_DRIFT_REQUOTE_BPS", "80")))
                     if amm_drift_bps >= _drift_threshold:
-                        if not self._force_requote.get("buy") or not self._force_requote.get("sell"):
-                            log_event("info", "amm_drift_requote_triggered",
+                        _now = time.time()
+                        _cooldown = float(getattr(cfg, "REQUOTE_COOLDOWN_SECS", 60) or 60)
+                        _last_force = float(getattr(self, "_last_amm_drift_force_at", 0) or 0)
+                        if (_now - _last_force) < _cooldown:
+                            log_event("debug", "amm_drift_cooldown",
                                       f"AMM drift {amm_drift_bps:.1f}bps ≥ {_drift_threshold}bps "
-                                      f"— forcing requote both sides",
-                                      data={"drift_bps": str(amm_drift_bps.quantize(Decimal("0.1")))})
-                        self._force_requote["buy"] = True
-                        self._force_requote["sell"] = True
+                                      f"but within cooldown ({int(_now - _last_force)}s/"
+                                      f"{int(_cooldown)}s) — not re-firing")
+                        else:
+                            if not self._force_requote.get("buy") or not self._force_requote.get("sell"):
+                                log_event("info", "amm_drift_requote_triggered",
+                                          f"AMM drift {amm_drift_bps:.1f}bps ≥ {_drift_threshold}bps "
+                                          f"— forcing requote both sides",
+                                          data={"drift_bps": str(amm_drift_bps.quantize(Decimal("0.1")))})
+                            self._force_requote["buy"] = True
+                            self._force_requote["sell"] = True
+                            self._last_amm_drift_force_at = _now
         except Exception as _amm_drift_err:
             log_event("debug", "amm_drift_check_error",
                       f"AMM drift check error (non-critical): {_amm_drift_err}")
@@ -3281,28 +3500,28 @@ class BotLoop:
             try:
                 from spacescan import check_balance_discrepancy, should_check_balance
                 # Free tier: skip balance checks to preserve API budget for fills
-                if not should_check_balance():
+                if should_check_balance():
+                    # Get wallet's reported balance
+                    from wallet import get_wallet_balance
+                    wallet_bal = get_wallet_balance(cfg.WALLET_ID_XCH)
+                    wallet_xch = Decimal("0")
+                    if wallet_bal and wallet_bal.get("success"):
+                        _wb = wallet_bal.get("wallet_balance") or wallet_bal
+                        wallet_xch = Decimal(str(_wb.get("confirmed_wallet_balance", 0))) / Decimal("1000000000000")
+
+                    our_address = getattr(cfg, "WALLET_ADDRESS", "")
+                    if our_address and wallet_xch > 0:
+                        result = check_balance_discrepancy(our_address, wallet_xch)
+                        if result.get("xch_ok"):
+                            log_event("debug", "spacescan_balance_ok",
+                                      f"Balance check OK — Wallet: {wallet_xch:.4f}, "
+                                      f"On-chain: {result.get('xch_onchain', '?')}")
+                        else:
+                            print(f"\n   [WARN] BALANCE MISMATCH! Wallet: {wallet_xch:.4f} XCH, "
+                                  f"On-chain: {result.get('xch_onchain', '?')} XCH", flush=True)
+                else:
                     log_event("debug", "spacescan_balance_skip",
                               "Spacescan free tier — skipping balance check (budget reserved for fills)")
-                    raise ImportError("skip")  # Jump to except block cleanly
-                # Get wallet's reported balance
-                from wallet import get_wallet_balance
-                wallet_bal = get_wallet_balance(cfg.WALLET_ID_XCH)
-                wallet_xch = Decimal("0")
-                if wallet_bal and wallet_bal.get("success"):
-                    _wb = wallet_bal.get("wallet_balance") or wallet_bal
-                    wallet_xch = Decimal(str(_wb.get("confirmed_wallet_balance", 0))) / Decimal("1000000000000")
-
-                our_address = getattr(cfg, "WALLET_ADDRESS", "")
-                if our_address and wallet_xch > 0:
-                    result = check_balance_discrepancy(our_address, wallet_xch)
-                    if result.get("xch_ok"):
-                        log_event("debug", "spacescan_balance_ok",
-                                  f"Balance check OK — Wallet: {wallet_xch:.4f}, "
-                                  f"On-chain: {result.get('xch_onchain', '?')}")
-                    else:
-                        print(f"\n   [WARN] BALANCE MISMATCH! Wallet: {wallet_xch:.4f} XCH, "
-                              f"On-chain: {result.get('xch_onchain', '?')} XCH", flush=True)
             except ImportError:
                 pass  # spacescan module not available
             except Exception as e:
@@ -3634,6 +3853,14 @@ class BotLoop:
                     sell_tid = None
                     buy_tid = None
 
+                    # Snapshot the set of sniper IDs BEFORE the probe fires
+                    # so we can identify any orphan offers that land after
+                    # an abandoned cycle. `try_snipe_single` always appends
+                    # to _active_snipe_ids (even for an orphan), so by
+                    # diffing before/after we can find the orphans to cancel.
+                    with self.sniper._snipe_lock:
+                        _pre_probe_snipe_ids = set(self.sniper._active_snipe_ids)
+
                     # Fire both sides in parallel — halves the probe deployment time
                     self.sniper._last_snipe_time = 0  # Reset cooldown for both
                     _probe_results = {}
@@ -3651,18 +3878,29 @@ class BotLoop:
                     sell_thread.join(timeout=30)
                     buy_thread.join(timeout=30)
 
-                    if sell_thread.is_alive():
-                        log_event("warning", "probe_thread_timeout",
-                                  "Sell probe thread timed out after 30s — "
-                                  "proceeding with buy-only probe")
-                    if buy_thread.is_alive():
-                        _probe_cycle_valid[0] = False  # Abandon: late result would corrupt state
-                        log_event("warning", "probe_thread_timeout",
-                                  "Buy probe thread timed out after 30s — "
-                                  "probe skipped this cycle (cycle abandoned)")
+                    cycle_abandoned = sell_thread.is_alive() or buy_thread.is_alive()
 
-                    sell_results = _probe_results.get("sell")
-                    buy_results = _probe_results.get("buy")
+                    if cycle_abandoned:
+                        _probe_cycle_valid[0] = False
+                        log_event("warning", "probe_thread_timeout",
+                                  f"Probe thread(s) timed out after 30s "
+                                  f"(sell_alive={sell_thread.is_alive()}, "
+                                  f"buy_alive={buy_thread.is_alive()}) — "
+                                  f"cycle abandoned.")
+                        sell_results = None
+                        buy_results = None
+                    else:
+                        sell_results = _probe_results.get("sell")
+                        buy_results = _probe_results.get("buy")
+
+                    # Compute any sniper IDs that landed since our snapshot.
+                    # These may include orphans from an abandoned cycle OR
+                    # the legitimate offers from this probe's successful
+                    # threads. We'll only cancel the orphans below (after
+                    # the legitimate IDs are captured into probe_state).
+                    with self.sniper._snipe_lock:
+                        _post_probe_snipe_ids = set(self.sniper._active_snipe_ids)
+                    _new_snipe_ids = _post_probe_snipe_ids - _pre_probe_snipe_ids
 
                     if sell_results:
                         sell_tid = sell_results[0].get("trade_id", "")
@@ -3704,6 +3942,36 @@ class BotLoop:
                         current_buy_ids = probe_result["buy_ids"]
                         current_sell_ids = probe_result["sell_ids"]
                         sniper_fired = sniper_fired or probe_result.get("sniper_fired", False)
+
+                    # Cancel any orphan sniper offers that landed during an
+                    # abandoned cycle. These are sniper IDs that appeared
+                    # after our snapshot but are NOT the ones we just wrote
+                    # into _probe_state as the legitimate probe offers.
+                    _probe_tids = set()
+                    if buy_tid:
+                        _probe_tids.add(buy_tid)
+                    if sell_tid:
+                        _probe_tids.add(sell_tid)
+                    _orphan_tids = _new_snipe_ids - _probe_tids
+                    if _orphan_tids:
+                        log_event("warning", "probe_orphan_cleanup",
+                                  f"Cancelling {len(_orphan_tids)} orphan probe offer(s) "
+                                  f"that landed after cycle abandonment or race: "
+                                  f"{[t[:16] + '...' for t in _orphan_tids]}")
+                        try:
+                            self.offer_manager.cancel_offers(
+                                list(_orphan_tids), reason="probe_orphan_cleanup"
+                            )
+                            # Also prune from sniper's tracking so the cap
+                            # doesn't stay inflated.
+                            with self.sniper._snipe_lock:
+                                for _tid in _orphan_tids:
+                                    if _tid in self.sniper._active_snipe_ids:
+                                        self.sniper._active_snipe_ids.remove(_tid)
+                                    self.sniper._active_snipe_sides.pop(_tid, None)
+                        except Exception as _orphan_err:
+                            log_event("error", "probe_orphan_cleanup_failed",
+                                      f"Failed to cancel orphan probe offers: {_orphan_err}")
 
         elif arb_gap > cfg.SNIPER_MIN_GAP_BPS and not launch_reason:
             log_event("debug", "sniper_no_swap",
@@ -3809,10 +4077,15 @@ class BotLoop:
                                       f"Did not advance {eq_side} quote baseline: replaced "
                                       f"{requote_result.get('replaced_count', 0)}/"
                                       f"{requote_result.get('target_count', 0)} offers")
+                            # Fix 4: advance baseline on attempt — see _do_requote_side
+                            self._last_quoted_price[eq_side] = requote_mid
                     else:
                         # Legacy return format (list)
                         new_offers = requote_result if isinstance(requote_result, list) else []
                         if new_offers:
+                            self._last_quoted_price[eq_side] = requote_mid
+                        else:
+                            # Fix 4: advance baseline on attempt
                             self._last_quoted_price[eq_side] = requote_mid
                     buy_q = self._last_quoted_price.get("buy")
                     sell_q = self._last_quoted_price.get("sell")
@@ -4002,6 +4275,7 @@ class BotLoop:
                       flush=True)
 
         # ---- Step 9: Requote if price moved or forced by convergence ----
+        self._set_cycle_step("step9_requote")
         force_buy = self._force_requote.get("buy", False)
         force_sell = self._force_requote.get("sell", False)
         force_tag = f" FORCED!" if (force_buy or force_sell) else ""
@@ -4052,7 +4326,7 @@ class BotLoop:
                     )
                     _all_open = list(current_buy_ids | current_sell_ids)
                     if _all_open:
-                        self.offer_manager.cancel_offers(_all_open, reason="reserve_floor_breached")
+                        self.offer_manager.cancel_offers(_all_open, reason="reserve_floor_breached", force_storm=True)
                         current_buy_ids.clear()
                         current_sell_ids.clear()
                     _reserve_skip_create = True
@@ -4096,7 +4370,7 @@ class BotLoop:
                     )
                     _all_open = list(current_buy_ids | current_sell_ids)
                     if _all_open:
-                        self.offer_manager.cancel_offers(_all_open, reason="reserve_floor_breached")
+                        self.offer_manager.cancel_offers(_all_open, reason="reserve_floor_breached", force_storm=True)
                         current_buy_ids.clear()
                         current_sell_ids.clear()
                     _reserve_skip_create = True
@@ -4117,6 +4391,7 @@ class BotLoop:
                       f"Reserve floor check failed (non-fatal): {_rf_err}")
 
         # ---- Step 10: Create new offers if needed ----
+        self._set_cycle_step("step10_create_offers")
         print(f"   [10] Offers: buys {len(current_buy_ids)}/{cfg.MAX_ACTIVE_BUY_OFFERS}, "
               f"sells {len(current_sell_ids)}/{cfg.MAX_ACTIVE_SELL_OFFERS}", flush=True)
         log_event("debug", "step10_create",
@@ -4154,6 +4429,7 @@ class BotLoop:
         )
 
         # ---- Step 11: Direct post to Dexie first ----
+        self._set_cycle_step("step11_dexie_post")
         if cfg.DEXIE_AUTO_POST:
             q_len = len(self.dexie_manager._queue)
             if q_len > 0:
@@ -4197,6 +4473,47 @@ class BotLoop:
         print(" done", flush=True)
         log_event("debug", "step12_coins", "Coin health check done")
 
+        # ---- Step 12a: Trim excess offers (Fix 3) ----
+        # Belt-and-braces: if anything in steps 9-11 left the live book
+        # over the per-side cap (e.g. a slow-confirming cancel meant a
+        # create-first requote left both old and new offers alive), trim
+        # the furthest-from-mid offers back down to cap. With Fix 1 in
+        # place this should rarely fire — but when it does, it stops the
+        # overshoot from accumulating across cycles.
+        try:
+            trimmed = self.offer_manager.trim_excess_offers(mid_price)
+            if trimmed > 0:
+                log_event("info", "trim_excess_done",
+                          f"Trim pass cancelled {trimmed} excess offer(s)")
+                # F14 fix (2026-04-08): track trim activity. Repeated trim
+                # firing means create-first requote is leaving offers
+                # behind faster than they can be cancelled — likely a
+                # wallet sync issue or aggressive requote schedule. Alert
+                # if we trim >5 cycles in a row.
+                self._trim_streak = getattr(self, "_trim_streak", 0) + 1
+                if self._trim_streak >= 5:
+                    log_event("warning", "trim_excess_sustained",
+                              f"Trim pass has fired for {self._trim_streak} "
+                              f"consecutive cycles — create-first requote may "
+                              f"be leaking offers. Investigate cancel latency "
+                              f"or pause requotes.")
+                    self._emit_alert(
+                        "trim_sustained",
+                        "warning",
+                        "Offer Cleanup Lag",
+                        f"The create-first requote dance has been over-creating "
+                        f"offers for {self._trim_streak} cycles in a row. The "
+                        f"trim pass is cleaning up but cancel latency seems high.",
+                    )
+            else:
+                # Reset streak when a clean cycle happens
+                if getattr(self, "_trim_streak", 0) > 0:
+                    self._trim_streak = 0
+                    self._clear_alert("trim_sustained")
+        except Exception as e:
+            log_event("warning", "trim_excess_error",
+                      f"Trim excess pass failed (non-fatal): {e}")
+
         # ---- Step 12b: Recovery mode evaluation ----
         # Subtract any confirmed probe slots so the probe offer doesn't inflate
         # the apparent buy count and mask a genuine under-target condition.
@@ -4227,7 +4544,7 @@ class BotLoop:
         # Push dashboard command centre update (market health + performance)
         try:
             health_data = self._augment_health_with_spacescan(
-                self.risk_manager.get_market_health()
+                self.risk_manager.get_market_health(loop_count=self._loop_count)
             )
             offer_edges = self._get_live_offer_edges(open_buys, open_sells)
             # Include competitor spread + fill rate for Smart Advisor
@@ -4284,6 +4601,9 @@ class BotLoop:
                   f"Cycle #{self._loop_count} complete — "
                   f"{len(current_buy_ids)}b/{len(current_sell_ids)}s active"
                   f"{fill_str}{expired_str}")
+        # F27: clear step name on cycle exit so the SLA watchdog doesn't
+        # alert on the inter-cycle sleep period
+        self._set_cycle_step("idle")
 
     # -------------------------------------------------------------------
     # Requoting
@@ -4396,12 +4716,59 @@ class BotLoop:
             log_event("debug", "requote_skip", "Coin manager busy — skipping requote")
             return
 
-        # Don't requote while sniper probe is active
-        if self._probe_state.get("active", False):
-            log_event("debug", "requote_skip", "Sniper probe active — skipping requote")
+        # Sniper probe active: only defer requoting on SIDES that currently
+        # have a live probe offer. The other side can still requote — it's
+        # wrong to freeze the whole book for minutes while a probe widens
+        # or retries.
+        probe_active = self._probe_state.get("active", False)
+        probe_sides_blocked = set()
+        if probe_active:
+            try:
+                if self._probe_state.get("buy_tid"):
+                    probe_sides_blocked.add("buy")
+                if self._probe_state.get("sell_tid"):
+                    probe_sides_blocked.add("sell")
+            except Exception:
+                # Defensive fallback: if probe state is malformed, skip both
+                probe_sides_blocked = {"buy", "sell"}
+
+        # Stale wallet guard — same rule as _create_offers_if_needed below.
+        # If the wallet's offer view has been stale for several cycles, the
+        # requote path could double-post or recreate offers we already have.
+        # Block new requotes (existing offers stay open) until the view is
+        # fresh again.
+        _stale_streak = int(self._recovery_state.get("wallet_stale_streak", 0))
+        _stale_limit = getattr(cfg, "WALLET_STALE_CREATE_LIMIT", 3)
+        if self._wallet_sync_stale_cycle and _stale_streak >= _stale_limit:
+            log_event("warning", "stale_wallet_requote_blocked",
+                      f"Wallet sync stale for {_stale_streak} consecutive cycles — "
+                      f"blocking requote until data is fresh")
             return
 
         for side in ["buy", "sell"]:
+            if side in probe_sides_blocked:
+                log_event("debug", "requote_skip",
+                          f"Sniper probe active on {side} — skipping {side} requote")
+                continue
+
+            # Circuit breaker side-enable check — without this, a position
+            # CB on (e.g.) the buy side would still let _handle_requoting
+            # rebuild buy offers at the new price on Tibet drift, defeating
+            # the CB. _create_offers_if_needed already checks via
+            # should_enable_side; this path was the second road to the
+            # same action and was missing the gate.
+            try:
+                if not self.risk_manager.should_enable_side(side, mid_price):
+                    log_event("debug", "requote_skip_cb",
+                              f"{side} side disabled by risk manager (CB or "
+                              f"inventory limit) — skipping requote")
+                    continue
+            except Exception as _e:
+                # Fail-safe: if the check itself errors, log and continue
+                # (don't lock the bot out of requoting due to a CB read bug)
+                log_event("warning", "requote_cb_check_failed",
+                          f"should_enable_side({side}) raised {_e} — proceeding")
+
             last_price = self._last_quoted_price.get(side, Decimal("0"))
             forced = self._force_requote.get(side, False)
 
@@ -4466,11 +4833,39 @@ class BotLoop:
                                   f"Did not advance {side} quote baseline: replaced "
                                   f"{requote_result.get('replaced_count', 0)}/"
                                   f"{requote_result.get('target_count', 0)} offers")
+                        # Fix 4: even on partial requote, advance the AMM
+                        # drift baseline to the attempted mid. Otherwise the
+                        # next AMM drift comparison still uses the OLD
+                        # baseline, the same drift fires again next cycle,
+                        # and we get the storm/feedback loop seen on
+                        # 2026-04-07. The baseline is "what we last tried
+                        # to quote at", not "what we last successfully
+                        # quoted at".
+                        self._last_quoted_price[side] = requote_mid
                 else:
                     # Legacy return format (list)
                     new_offers = requote_result if isinstance(requote_result, list) else []
                     if new_offers:
                         self._last_quoted_price[side] = requote_mid
+                    else:
+                        # Fix 4: same baseline-advance even when nothing replaced
+                        self._last_quoted_price[side] = requote_mid
+                # Splash broadcast — requote_side queues to Dexie internally,
+                # but does NOT know about splash. Mirror the bot_loop create
+                # path (line ~4844) so requoted offers are also broadcast over
+                # Splash. Without this, every cycle that goes through requote
+                # (including the cold-start path) leaves Splash silent.
+                if new_offers and getattr(cfg, "SPLASH_ENABLED", False):
+                    for offer in new_offers:
+                        bech32 = offer.get("offer_bech32", "")
+                        trade_id = offer.get("trade_id", "")
+                        if bech32 and trade_id:
+                            try:
+                                self.splash_manager.queue_post(bech32, trade_id)
+                            except Exception as _se:
+                                log_event("warning", "requote_splash_queue_failed",
+                                          f"Splash queue failed for {trade_id}: {_se}")
+
                 _buy_q = self._last_quoted_price.get("buy")
                 _sell_q = self._last_quoted_price.get("sell")
                 self.amm_monitor.notify_quoted_price(_buy_q, _sell_q)
@@ -4492,6 +4887,11 @@ class BotLoop:
                                   skip_sell: bool = False):
         """Create new offers if we're below target count."""
         recovery_active = self._recovery_is_active()
+
+        # Fix F: check if suspended slots can be unsuspended (coins available)
+        for _side in ("buy", "sell"):
+            self.offer_manager.unsuspend_slots_if_coins_available(_side)
+
         if cfg.DRY_RUN:
             log_event("debug", "create_skip", "DRY_RUN is on — not creating offers")
             return
@@ -4620,11 +5020,18 @@ class BotLoop:
             )
             _parallel_results[side] = offers or []
 
+        # Fix F: reduce effective target by suspended slot count so the bot
+        # doesn't enter recovery mode for slots that are known coin-exhausted.
+        buy_suspended = self.offer_manager.get_suspended_slot_count("buy")
+        sell_suspended = self.offer_manager.get_suspended_slot_count("sell")
+
         work_items = []
         if buy_enabled:
-            buy_needed = cfg.MAX_ACTIVE_BUY_OFFERS - effective_buy_count
+            buy_target = max(0, cfg.MAX_ACTIVE_BUY_OFFERS - buy_suspended)
+            buy_needed = max(0, buy_target - effective_buy_count)
             buy_spread = self.risk_manager.get_adjusted_spread("buy")
-            work_items.append(("buy", buy_needed, buy_spread))
+            if buy_needed > 0:
+                work_items.append(("buy", buy_needed, buy_spread))
             self._clear_alert("buy_disabled")
         else:
             if cfg.ENABLE_BUY and effective_buy_count < cfg.MAX_ACTIVE_BUY_OFFERS and not self.risk_manager.should_enable_side("buy", mid_price):
@@ -4635,9 +5042,11 @@ class BotLoop:
                     action_label="View Position")
 
         if sell_enabled:
-            sell_needed = cfg.MAX_ACTIVE_SELL_OFFERS - effective_sell_count
+            sell_target = max(0, cfg.MAX_ACTIVE_SELL_OFFERS - sell_suspended)
+            sell_needed = max(0, sell_target - effective_sell_count)
             sell_spread = self.risk_manager.get_adjusted_spread("sell")
-            work_items.append(("sell", sell_needed, sell_spread))
+            if sell_needed > 0:
+                work_items.append(("sell", sell_needed, sell_spread))
             self._clear_alert("sell_disabled")
         else:
             if cfg.ENABLE_SELL and effective_sell_count < cfg.MAX_ACTIVE_SELL_OFFERS and not self.risk_manager.should_enable_side("sell", mid_price):
@@ -4874,6 +5283,120 @@ class BotLoop:
 
         self._last_housekeeping = now
 
+        # F15 fix (2026-04-08): background thread liveness watchdog. Each
+        # of the bot's background threads (health-monitor, price-watcher,
+        # coin-watcher, splash-receive) is a daemon — if one dies silently
+        # via an unhandled exception, no part of the rest of the bot
+        # notices. We check each registered thread on every housekeeping
+        # tick (5 min) and emit an alert if any have died. The bot then
+        # attempts to restart the dead thread on its next opportunity.
+        try:
+            self._check_background_thread_liveness()
+        except Exception as _live_err:
+            log_event("warning", "thread_liveness_check_failed",
+                      f"Background thread liveness check failed: {_live_err}")
+
+        # F16 fix (2026-04-08): bot loop heartbeat metric. Track the
+        # last successful cycle completion timestamp and warn if a cycle
+        # is taking >3× LOOP_SECONDS — likely a deadlock somewhere in
+        # the cycle. The watchdog is purely diagnostic; we don't try
+        # to forcibly recover because that's risky (state could be
+        # corrupted). The operator decides what to do.
+        try:
+            self._check_bot_loop_heartbeat()
+        except Exception as _hb_err:
+            log_event("warning", "loop_heartbeat_check_failed",
+                      f"Bot loop heartbeat check failed: {_hb_err}")
+
+        # F27 (2026-04-08): per-step SLA timer. Detects single steps
+        # that hang on a slow RPC or deadlock without aborting the
+        # cycle (which would risk corrupting state).
+        try:
+            self._check_step_sla()
+        except Exception as _sla_err:
+            log_event("warning", "step_sla_check_failed",
+                      f"Per-step SLA check failed: {_sla_err}")
+
+        # F17 fix (2026-04-08): daily DB-vs-wallet deep reconciliation.
+        # Runs once per 24h. Cross-checks every fill in the DB against
+        # the wallet's view of trade history. Backfills missing fills
+        # and flags fills that exist in DB but not in wallet (suggests
+        # a phantom record). Does not auto-correct — only logs + alerts.
+        try:
+            self._maybe_run_daily_reconcile()
+        except Exception as _rec_err:
+            log_event("warning", "daily_reconcile_failed",
+                      f"Daily reconciliation failed: {_rec_err}")
+
+        # F22 (2026-04-08): WAL size monitoring + auto-checkpoint.
+        # Long-running bots can build up large WAL files when checkpoints
+        # are slow. We check the WAL size each housekeeping tick and
+        # force a TRUNCATE checkpoint if it exceeds 50 MB. If the WAL
+        # keeps growing despite checkpoints we alert the operator.
+        try:
+            self._check_wal_size()
+        except Exception as _wal_err:
+            log_event("warning", "wal_check_failed",
+                      f"WAL size check failed: {_wal_err}")
+
+        # F23 (2026-04-08): atomic offer-coin link recovery sweep.
+        # add_offer + lock_coin run as separate transactions, so a
+        # failed lock_coin call leaves the offer with a coin_id
+        # reference but the coin row missing the locked status. Sweep
+        # finds these and re-runs lock_coin so coin counts stay
+        # accurate.
+        try:
+            self._repair_unlinked_offer_coins()
+        except Exception as _repair_err:
+            log_event("warning", "offer_coin_repair_failed",
+                      f"Offer-coin link repair failed: {_repair_err}")
+
+        # F19 (2026-04-08): position sanity check. Verify the bot's
+        # running net position estimate matches the wallet's actual
+        # CAT balance change since session start. Divergence indicates
+        # silently lost fills (or phantom fills).
+        try:
+            self._check_position_sanity()
+        except Exception as _pos_err:
+            log_event("warning", "position_sanity_check_failed",
+                      f"Position sanity check failed: {_pos_err}")
+
+        # F21 (2026-04-08): lifecycle FSM observability snapshot.
+        # Logs noop-transition counts so misuse of the state machine
+        # surfaces over time without forcing strict mode (which would
+        # break legacy callers).
+        try:
+            from database import (
+                get_lifecycle_observability_stats,
+                reset_lifecycle_observability_stats,
+            )
+            stats = get_lifecycle_observability_stats()
+            noops = stats.get("noop_transitions", {})
+            invalids = stats.get("invalid_signals", {})
+            if noops or invalids:
+                log_event(
+                    "info",
+                    "lifecycle_observability",
+                    f"Lifecycle FSM observability over last {self._housekeeping_interval}s: "
+                    f"{sum(noops.values())} noop transitions, "
+                    f"{sum(invalids.values())} invalid signals",
+                    data={"noops": noops, "invalids": invalids},
+                )
+                # Escalate if noop count is high
+                if sum(noops.values()) > 50:
+                    log_event(
+                        "warning",
+                        "lifecycle_observability_high_noops",
+                        f"High noop transition count detected. Top: "
+                        f"{sorted(noops.items(), key=lambda x: -x[1])[:5]}. "
+                        f"Likely a caller is sending the wrong signal for the "
+                        f"offer's current state. Investigate.",
+                    )
+                reset_lifecycle_observability_stats()
+        except Exception as _lc_err:
+            log_event("debug", "lifecycle_observability_failed",
+                      f"Lifecycle observability check failed: {_lc_err}")
+
         # Prune Dexie mappings — use DB open offers instead of re-fetching from wallet
         # (sync_from_wallet already ran in the main cycle)
         try:
@@ -4993,10 +5516,41 @@ class BotLoop:
             log_event("debug", "housekeeping_sanity_failed",
                       f"Coin sanity check failed: {hk_e}")
 
-        # ---- Sage offer cleanup: delete completed/cancelled offers ----
-        # Sage keeps ALL offers forever. Over time this bloats get_offers
-        # and can push open offers out of the result window. Clean up
-        # offers that are in terminal states (cancelled, completed, expired).
+        # ---- Sage offer cleanup (F47, 2026-04-09): CONSERVATIVE PURGE ----
+        #
+        # IMPORTANT HISTORY: an earlier version of this block (pre-F47)
+        # treated ANY status >= 2 as "terminal" and deleted it from Sage's
+        # local DB. That included status=4 (CONFIRMED == filled), which
+        # meant the bot was silently deleting records of every profitable
+        # trade before the operator could see them in Sage's UI. This
+        # masked a separate fill-rejection bug and made retroactive
+        # verification impossible. See the 2026-04-08 "9 phantom_rejected
+        # fills" incident for the full post-mortem.
+        #
+        # NEW POLICY (F47): only CANCELLED and EXPIRED offers are ever
+        # deleted, and only after THREE safety gates:
+        #
+        #   Gate A: Sage's reported status is explicitly 'cancelled',
+        #           'expired', or the Chia enum int 3 (CANCELLED).
+        #           COMPLETED/CONFIRMED/FILLED are NEVER touched — the
+        #           operator keeps those in Sage for bookkeeping.
+        #
+        #   Gate B: The offer has been in that terminal state for at
+        #           least 24 HOURS. This leaves a big observation window
+        #           so fill-detection, reconciliation, and manual audits
+        #           can all catch any surprises before the evidence
+        #           disappears.
+        #
+        #   Gate C: Our local DB has a matching row with the SAME
+        #           terminal status (cancelled/expired). If the local
+        #           record is missing, open, filled, or anything else
+        #           unexpected, we REFUSE to delete and log a warning —
+        #           the operator decides what to do.
+        #
+        # If any single offer fails its gate checks, we skip THAT offer
+        # but continue checking the rest. If Sage returns an offer we
+        # don't recognize at all, we log a 'sage_cleanup_anomaly' warning
+        # (which is visible in Recommendations) and leave it alone.
         try:
             from wallet import get_wallet_type
             if get_wallet_type() == "sage":
@@ -5004,13 +5558,27 @@ class BotLoop:
                 all_sage_offers = get_all_offers(include_completed=True,
                                                   start=0, end=500)
                 if all_sage_offers:
-                    TERMINAL_STATUSES = {
-                        "CANCELLED", "COMPLETED", "EXPIRED", "FAILED",
-                        "CONFIRMED", "SUCCEEDED",
-                    }
-                    # Also check integer statuses (Sage uses ints sometimes)
-                    # Status > 1 typically means completed/cancelled in Sage
+                    # SAFE = only explicit cancellations and expirations.
+                    # 'FAILED' / 'PENDING_CANCEL' are intentionally excluded
+                    # because they represent transitional or error states
+                    # that might still convert to a fill.
+                    SAFE_TO_DELETE_STRINGS = {"CANCELLED", "CANCELED", "EXPIRED"}
+                    # Chia TradeStatus enum: 3 == CANCELLED.
+                    # Explicitly NOT including 4 (CONFIRMED), 5 (FAILED),
+                    # or 2 (PENDING_CANCEL).
+                    SAFE_TO_DELETE_INTS = {3}
+
+                    # Local-DB statuses that are allowed to match a
+                    # Sage-terminal offer. If the local DB shows
+                    # anything else, refuse to delete.
+                    LOCAL_SAFE_STATUSES = {"cancelled", "canceled", "expired"}
+
+                    # 24h age gate — a terminal offer must have been in
+                    # that state for at least this long before deletion.
+                    MIN_AGE_SECS = 24 * 3600
+
                     to_delete = []
+                    anomalies = 0
                     now_ts = int(time.time())
 
                     for offer in all_sage_offers:
@@ -5019,35 +5587,102 @@ class BotLoop:
                         if not trade_id:
                             continue
 
-                        is_terminal = False
+                        # ---- Gate A: is this status explicitly deletable? ----
+                        is_safe_status = False
+                        reason = None
                         if isinstance(status_val, str):
-                            if status_val.upper() in TERMINAL_STATUSES:
-                                is_terminal = True
+                            if status_val.upper() in SAFE_TO_DELETE_STRINGS:
+                                is_safe_status = True
+                                reason = status_val.upper()
                         elif isinstance(status_val, int):
-                            if status_val >= 2:  # 2+ = completed/cancelled
-                                is_terminal = True
+                            if status_val in SAFE_TO_DELETE_INTS:
+                                is_safe_status = True
+                                reason = "CANCELLED_INT"
 
-                        local_offer = get_offer(trade_id)
-
-                        # Also check time expiry
-                        if not is_terminal:
+                        # Time-expiry bypass: offers past their max_time
+                        # are effectively EXPIRED even if Sage still
+                        # reports them active. Must be >=24h past expiry.
+                        if not is_safe_status:
                             valid_times = offer.get("valid_times") or {}
                             max_time = (valid_times.get("max_time", 0) or
-                                       offer.get("max_time", 0) or 0)
+                                        offer.get("max_time", 0) or 0)
                             if max_time and int(max_time) > 0:
-                                if now_ts > int(max_time) + 300:
-                                    is_terminal = True  # Expired >5min ago
+                                seconds_past_expiry = now_ts - int(max_time)
+                                if seconds_past_expiry >= MIN_AGE_SECS:
+                                    is_safe_status = True
+                                    reason = "EXPIRED_VALID_TIMES"
 
-                        if is_terminal:
-                            to_delete.append((
-                                trade_id,
-                                map_sage_terminal_offer_status(
-                                    status_val,
-                                    sage_offer=offer,
-                                    local_offer=local_offer,
-                                    now_ts=now_ts,
-                                ),
-                            ))
+                        if not is_safe_status:
+                            # Not cancelled, not expired — leave it alone.
+                            # This is the big departure from the old code:
+                            # filled/confirmed offers stay in Sage for the
+                            # operator to see.
+                            continue
+
+                        # ---- Gate B: is the offer at least 24h old? ----
+                        # Prefer the Sage-side creation timestamp; fall
+                        # back to our local DB timestamps.
+                        local_offer = get_offer(trade_id)
+                        age_secs = 0
+                        sage_ct = offer.get("creation_timestamp") or offer.get("created_at_height")
+                        if sage_ct:
+                            try:
+                                age_secs = now_ts - int(sage_ct)
+                            except Exception:
+                                pass
+                        if age_secs <= 0 and local_offer:
+                            try:
+                                from datetime import datetime as _dt
+                                created_raw = str(local_offer.get("created_at") or "")
+                                if created_raw:
+                                    _created = _dt.strptime(
+                                        created_raw[:19], "%Y-%m-%d %H:%M:%S"
+                                    )
+                                    age_secs = now_ts - int(_created.timestamp())
+                            except Exception:
+                                pass
+
+                        if age_secs < MIN_AGE_SECS:
+                            # Too young to delete — keep it visible in
+                            # Sage so the operator can audit.
+                            continue
+
+                        # ---- Gate C: does our local DB agree? ----
+                        if local_offer is None:
+                            log_event(
+                                "warning",
+                                "sage_cleanup_anomaly",
+                                f"Sage reports offer {trade_id[:16]}... as "
+                                f"{reason} but no local DB record exists. "
+                                f"Refusing to delete — check Recommendations.",
+                            )
+                            anomalies += 1
+                            continue
+
+                        local_status = str(local_offer.get("status") or "").lower()
+                        if local_status not in LOCAL_SAFE_STATUSES:
+                            # Local says something else — open, filled,
+                            # pending, etc. Don't touch it.
+                            log_event(
+                                "warning",
+                                "sage_cleanup_anomaly",
+                                f"Sage says {reason} for {trade_id[:16]}... "
+                                f"but local DB shows '{local_status}'. "
+                                f"Refusing to delete — manual review needed.",
+                            )
+                            anomalies += 1
+                            continue
+
+                        # All three gates passed.
+                        to_delete.append((
+                            trade_id,
+                            map_sage_terminal_offer_status(
+                                status_val,
+                                sage_offer=offer,
+                                local_offer=local_offer,
+                                now_ts=now_ts,
+                            ),
+                        ))
 
                     if to_delete:
                         deleted = 0
@@ -5065,11 +5700,20 @@ class BotLoop:
                         if deleted > 0:
                             log_event("info", "sage_offer_cleanup",
                                       f"Deleted {deleted}/{len(to_delete)} "
-                                      f"terminal offers from Sage")
+                                      f"safe-to-delete (cancelled/expired >24h, "
+                                      f"DB-verified) offers from Sage")
                             if status_updates > 0:
                                 log_event("debug", "sage_offer_cleanup_db",
                                           f"Updated {status_updates} local offer "
                                           f"statuses during Sage cleanup")
+                    if anomalies > 0:
+                        log_event(
+                            "warning",
+                            "sage_cleanup_anomalies_summary",
+                            f"Skipped {anomalies} Sage cleanup candidates due to "
+                            f"DB mismatch or missing records — review "
+                            f"sage_cleanup_anomaly events above.",
+                        )
 
                     repaired_fills = backfill_verified_fills_from_offers(
                         limit=50,
@@ -5135,6 +5779,961 @@ class BotLoop:
                       f"Sage offer cleanup failed: {sage_e}")
 
         log_event("debug", "housekeeping", "Periodic housekeeping completed")
+
+    # -------------------------------------------------------------------
+    # F15/F16: liveness watchdogs
+    # -------------------------------------------------------------------
+
+    def _check_background_thread_liveness(self) -> None:
+        """Check that all critical background threads are still alive.
+
+        Each daemon thread is checked. If any has died (e.g. unhandled
+        exception inside its run loop), an operator-visible alert fires
+        and the thread is marked for restart on the next opportunity.
+
+        Threads checked:
+          - health-monitor (Sage health watcher)
+          - price-watcher (fast Tibet poller)
+          - coin-watcher (DB↔wallet coin diff)
+          - splash-receive (Splash incoming offer poller)
+        """
+        critical_threads = (
+            ("health-monitor", "_health_thread", self._start_health_monitor),
+            ("price-watcher", "_watcher_thread", self._start_price_watcher),
+            ("coin-watcher", "_coin_watcher_thread", self._start_coin_watcher),
+        )
+        for name, attr, restart_fn in critical_threads:
+            t = getattr(self, attr, None)
+            # If thread was never started or is alive, no action needed
+            if t is None:
+                continue
+            if t.is_alive():
+                continue
+            # Thread is dead — log critical, attempt restart
+            log_event(
+                "error",
+                "background_thread_died",
+                f"CRITICAL: background thread '{name}' is dead. "
+                f"Attempting restart. The previous instance crashed silently — "
+                f"check the superlog for an unhandled exception in {name}.",
+            )
+            try:
+                self._emit_alert(
+                    f"thread_dead_{name}",
+                    "error",
+                    f"Background thread crashed: {name}",
+                    f"The {name} background thread is no longer running. "
+                    f"This usually means an unhandled exception inside its "
+                    f"run loop. The bot is attempting to restart it.",
+                )
+            except Exception:
+                pass
+            try:
+                restart_fn()
+                log_event("info", "background_thread_restarted",
+                          f"Successfully restarted background thread '{name}'")
+            except Exception as _restart_err:
+                log_event(
+                    "error",
+                    "background_thread_restart_failed",
+                    f"Failed to restart background thread '{name}': {_restart_err}",
+                )
+
+    def _set_cycle_step(self, name: str) -> None:
+        """F27 (2026-04-08): mark the start of a cycle step.
+
+        The housekeeping watchdog (in _check_step_sla) reads this and
+        warns if a single step has been running longer than the SLA.
+        Cheap call — just updates two instance vars. Sprinkle at the
+        start of each major cycle step for granular hung-step detection.
+        """
+        self._current_cycle_step = name
+        self._cycle_step_started_at = time.monotonic()
+        # Reset per-step alert tracker so a new step is allowed to alert
+        if self._step_sla_alerted_for and self._step_sla_alerted_for != name:
+            self._step_sla_alerted_for = None
+
+    def _check_step_sla(self) -> None:
+        """F27 (2026-04-08): SLA timer for individual cycle steps.
+
+        Called from housekeeping (every 5 min). If the bot has been
+        stuck on a single step for longer than _step_sla_secs (60s),
+        log a warning and fire an alert. Per-step alert dedup so we
+        don't spam the same step.
+        """
+        started = self._cycle_step_started_at
+        if not started:
+            return
+        elapsed = time.monotonic() - started
+        if elapsed < self._step_sla_secs:
+            return
+        step_name = self._current_cycle_step
+        # Already alerted for this exact step in this stuck window?
+        if self._step_sla_alerted_for == step_name:
+            return
+        self._step_sla_alerted_for = step_name
+        log_event(
+            "warning",
+            "step_sla_violation",
+            f"Cycle step '{step_name}' has been running for {elapsed:.1f}s "
+            f"(SLA {self._step_sla_secs:.0f}s). The bot may be stuck on a "
+            f"hung RPC, deadlock, or slow API. Investigate if this persists.",
+        )
+        try:
+            self._emit_alert(
+                "step_sla",
+                "warning",
+                f"Step hung: {step_name}",
+                f"Cycle step '{step_name}' has been running for {elapsed:.0f}s "
+                f"(SLA {self._step_sla_secs:.0f}s). Most likely a hung RPC. "
+                f"Check Sage/Coinset/Tibet connectivity.",
+            )
+        except Exception:
+            pass
+
+    def _check_bot_loop_heartbeat(self) -> None:
+        """Diagnostic: warn if cycles are taking >3× LOOP_SECONDS.
+
+        Doesn't try to recover (state could be corrupted) — just emits
+        a loud operator signal so the user knows to investigate.
+        """
+        loop_secs = float(getattr(cfg, "LOOP_SECONDS", 45) or 45)
+        max_acceptable = loop_secs * 3
+        last_dur = float(getattr(self, "_last_loop_duration", 0) or 0)
+        if last_dur > max_acceptable:
+            log_event(
+                "warning",
+                "loop_heartbeat_slow",
+                f"Bot loop is slow: last cycle took {last_dur:.0f}s "
+                f"(threshold {int(max_acceptable)}s = 3× LOOP_SECONDS). "
+                f"This may indicate a hung RPC, deadlock, or excessive "
+                f"queue depth. Investigate if this persists.",
+            )
+            try:
+                self._emit_alert(
+                    "loop_slow",
+                    "warning",
+                    "Bot Loop Slow",
+                    f"Cycle took {last_dur:.0f}s vs threshold {int(max_acceptable)}s. "
+                    f"Investigate for hung RPCs or queue overflow.",
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                self._clear_alert("loop_slow")
+            except Exception:
+                pass
+
+    def _run_startup_self_test(self) -> None:
+        """F18: ping every external service the bot needs and emit
+        warning alerts for each one that's down.
+
+        Never blocks startup. The user sees the alerts in the
+        Recommendations panel and decides whether to start trading
+        with degraded capability.
+
+        Services tested:
+          - Sage RPC (critical — required for everything)
+          - Coinset API (degrades fast fill detection if down)
+          - TibetSwap API (degrades pricing if down)
+          - Dexie API (degrades offer posting + competitor intel)
+          - Spacescan API (degrades fill verification + token context)
+          - SQLite DB write (critical — bot can't track state without it)
+
+        Results stored in self._startup_self_test_results so the
+        Recommendations panel + an API endpoint can show them later.
+        """
+        import requests as _req
+        results: Dict[str, Dict] = {}
+
+        def _check_http(name: str, url: str, timeout: float = 5.0,
+                        method: str = "GET", json_body=None) -> Dict:
+            """F32 (2026-04-08): a server is REACHABLE if it answers at all,
+            even with a 4xx. The previous version treated 404 as "down",
+            which falsely flagged Spacescan because the path used in the
+            test wasn't a real endpoint. We now distinguish:
+              - 2xx/3xx → reachable, endpoint working ✓
+              - 4xx     → reachable but endpoint mismatch (still ✓ for health)
+              - 5xx     → server has problems → DOWN
+              - timeout / connection refused → DOWN
+            401/403 are still treated as reachable (auth failure means the
+            server is alive and rejecting our request).
+            """
+            try:
+                if method == "POST":
+                    r = _req.post(url, json=(json_body or {}), timeout=(2, timeout))
+                else:
+                    r = _req.get(url, timeout=(2, timeout))
+                # 2xx/3xx clearly OK; 4xx means reachable; 5xx means server problem
+                if r.status_code < 500:
+                    return {
+                        "name": name, "url": url, "ok": True,
+                        "status_code": r.status_code,
+                        "error": None,
+                    }
+                return {
+                    "name": name, "url": url, "ok": False,
+                    "status_code": r.status_code,
+                    "error": f"HTTP {r.status_code} (server error)",
+                }
+            except _req.exceptions.Timeout:
+                return {"name": name, "url": url, "ok": False, "error": "timeout"}
+            except _req.exceptions.ConnectionError as e:
+                return {"name": name, "url": url, "ok": False,
+                        "error": f"connection refused ({type(e).__name__})"}
+            except Exception as e:
+                return {"name": name, "url": url, "ok": False,
+                        "error": f"{type(e).__name__}: {str(e)[:80]}"}
+
+        # 1. Sage RPC — already checked by sync, but report explicitly
+        try:
+            from wallet import get_wallet_sync_status
+            sage_info = get_wallet_sync_status() or {}
+            sage_ok = bool(sage_info.get("reachable") or sage_info.get("synced"))
+            results["sage"] = {
+                "name": "Sage Wallet RPC",
+                "ok": sage_ok,
+                "missing_if_down": (
+                    "EVERYTHING — fill detection, offer creation, cancellation, "
+                    "and balance checks all require Sage. Bot will not be able "
+                    "to trade."
+                ),
+                "critical": True,
+                "error": None if sage_ok else "Sage RPC not reachable",
+            }
+        except Exception as e:
+            results["sage"] = {
+                "name": "Sage Wallet RPC", "ok": False, "critical": True,
+                "missing_if_down": "EVERYTHING (see above).",
+                "error": f"check failed: {e}",
+            }
+
+        # 2. TibetSwap API — pricing source
+        # F32 fix: use the real /pairs endpoint that price_engine actually
+        # consumes (was /router which doesn't exist on tibetswap.io v2).
+        tibet_url = str(getattr(cfg, "TIBET_API_BASE", "https://api.v2.tibetswap.io")
+                        or "https://api.v2.tibetswap.io")
+        r = _check_http("TibetSwap API", f"{tibet_url}/pairs?skip=0&limit=1")
+        r["missing_if_down"] = (
+            "Real-time price feed. Bot will fall back to Dexie-only pricing "
+            "(less accurate) and AMM drift detection will not work."
+        )
+        r["critical"] = False
+        results["tibet"] = r
+
+        # 3. Dexie API — offer posting + competitor orderbook
+        # F32 fix: use the real /v1/offers endpoint that dexie_manager and
+        # market_intel actually consume (was /v2/prices/tickers which is
+        # a different surface and may not exist on the v1 base).
+        dexie_url = str(getattr(cfg, "DEXIE_API_BASE", "https://api.dexie.space")
+                        or "https://api.dexie.space")
+        r = _check_http("Dexie API", f"{dexie_url.rstrip('/')}/v1/offers?compact=true&page_size=1")
+        r["missing_if_down"] = (
+            "Offer posting to Dexie + competitor orderbook intelligence. "
+            "Offers will still be created on-chain but won't be visible on "
+            "the Dexie GUI to retail buyers/sellers. Splash broadcast still "
+            "works."
+        )
+        r["critical"] = False
+        results["dexie"] = r
+
+        # 4. Coinset API — fast fill detection + mempool watcher
+        # F32: this one was already correct — keeping the POST shape since
+        # /get_blockchain_state is the real endpoint coinset_client + tx_fees
+        # both consume.
+        if getattr(cfg, "COINSET_ENABLED", True):
+            coinset_url = str(getattr(cfg, "COINSET_API_URL", "https://api.coinset.org")
+                              or "https://api.coinset.org")
+            r = _check_http(
+                "Coinset API",
+                f"{coinset_url.rstrip('/')}/get_blockchain_state",
+                method="POST",
+                json_body={},
+            )
+            r["missing_if_down"] = (
+                "Fast fill detection (5–18s early warning before "
+                "block confirms). Fills will still be detected via "
+                "wallet RPC poll on the next 45s cycle. Mempool "
+                "watcher background thread will idle."
+            )
+            r["critical"] = False
+            results["coinset"] = r
+        else:
+            results["coinset"] = {
+                "name": "Coinset API", "ok": True, "skipped": True,
+                "missing_if_down": "n/a (disabled in config)",
+                "critical": False,
+            }
+
+        # 5. Spacescan API — fill verification + token context
+        # F32 fix: Spacescan has NO /health endpoint, and /coin/info/ with
+        # an all-zero coin ID can timeout because Spacescan scans the chain
+        # looking for it. The cheapest reachability check is the BARE API
+        # root: it returns HTTP 404 (no path matches) but the SERVER is up,
+        # which is what we care about. Our improved _check_http treats any
+        # non-5xx as reachable.
+        if getattr(cfg, "SPACESCAN_ENABLED", False):
+            spacescan_url = str(getattr(cfg, "SPACESCAN_API_BASE",
+                                        "https://api.spacescan.io")
+                                or "https://api.spacescan.io")
+            r = _check_http(
+                "Spacescan API",
+                f"{spacescan_url.rstrip('/')}/",
+            )
+            r["missing_if_down"] = (
+                "On-chain fill verification (golden source of truth) and "
+                "Spacescan token context. Bot will fall back to wallet-only "
+                "verification for fills. Some fills may be deferred or "
+                "marked unverified."
+            )
+            r["critical"] = False
+            results["spacescan"] = r
+        else:
+            results["spacescan"] = {
+                "name": "Spacescan API", "ok": True, "skipped": True,
+                "missing_if_down": "n/a (disabled in config)",
+                "critical": False,
+            }
+
+        # 6. SQLite DB writability
+        try:
+            from database import log_event as _le
+            _le("debug", "self_test_db_write", "Self-test DB write probe")
+            results["database"] = {
+                "name": "SQLite Database", "ok": True,
+                "missing_if_down": "Bot CANNOT operate without DB writes.",
+                "critical": True,
+            }
+        except Exception as e:
+            results["database"] = {
+                "name": "SQLite Database", "ok": False,
+                "error": f"{type(e).__name__}: {e}",
+                "missing_if_down": "Bot CANNOT operate without DB writes.",
+                "critical": True,
+            }
+
+        # ── Process results ──
+        self._startup_self_test_results = results
+        all_ok = all(r.get("ok", False) for r in results.values()
+                     if not r.get("skipped", False))
+        critical_failures = [
+            r for r in results.values()
+            if not r.get("ok", False) and r.get("critical", False)
+            and not r.get("skipped", False)
+        ]
+        warn_failures = [
+            r for r in results.values()
+            if not r.get("ok", False) and not r.get("critical", False)
+            and not r.get("skipped", False)
+        ]
+
+        if all_ok:
+            log_event("info", "self_test_pass",
+                      "Startup self-test PASSED — all external services reachable")
+            return
+
+        # Report each failure with what's missing
+        for r in critical_failures + warn_failures:
+            sev = "error" if r.get("critical") else "warning"
+            log_event(
+                sev,
+                "self_test_service_down",
+                f"{r['name']} is DOWN ({r.get('error', 'unknown error')}). "
+                f"Missing if you continue: {r.get('missing_if_down', 'unknown')}",
+            )
+            try:
+                self._emit_alert(
+                    f"self_test_{r['name'].lower().replace(' ', '_')}",
+                    sev,
+                    f"{r['name']} unreachable",
+                    f"{r.get('error', 'connection failed')}\n\n"
+                    f"What you'll be missing: {r.get('missing_if_down', 'unknown')}",
+                    action="run_doctor",
+                    action_label="Run Doctor",
+                )
+            except Exception:
+                pass
+
+        # Final summary
+        ok_count = sum(1 for r in results.values()
+                       if r.get("ok", False) and not r.get("skipped", False))
+        total = sum(1 for r in results.values() if not r.get("skipped", False))
+        log_event(
+            "warning" if warn_failures and not critical_failures else "error",
+            "self_test_partial",
+            f"Startup self-test: {ok_count}/{total} services OK. "
+            f"{len(critical_failures)} critical failure(s), "
+            f"{len(warn_failures)} non-critical failure(s). "
+            f"You can continue but some features will be unavailable — "
+            f"see Recommendations panel.",
+        )
+
+    def _check_wal_size(self) -> None:
+        """F22: monitor WAL size and force checkpoint if too large.
+
+        Tracks consecutive large-WAL events. If the WAL stays above the
+        threshold despite three consecutive checkpoint attempts, escalate
+        to a critical operator alert.
+        """
+        try:
+            from database import get_wal_size_mb, force_wal_checkpoint
+        except ImportError:
+            return
+
+        size_mb = get_wal_size_mb()
+        threshold_mb = 50.0
+        critical_mb = 500.0
+
+        if size_mb < threshold_mb:
+            # Healthy — reset escalation counter
+            if getattr(self, "_wal_oversize_streak", 0) > 0:
+                self._wal_oversize_streak = 0
+                self._clear_alert("wal_oversize")
+            return
+
+        # Above threshold — force a checkpoint and track the streak
+        self._wal_oversize_streak = getattr(self, "_wal_oversize_streak", 0) + 1
+        log_event("info", "wal_oversize_checkpoint",
+                  f"WAL is {size_mb:.1f} MB (>{threshold_mb} MB threshold) — "
+                  f"forcing TRUNCATE checkpoint (streak {self._wal_oversize_streak})")
+        ok = force_wal_checkpoint()
+        post_size_mb = get_wal_size_mb()
+
+        # If checkpoint didn't shrink the WAL meaningfully, escalate
+        if not ok or post_size_mb > threshold_mb * 0.8:
+            if self._wal_oversize_streak >= 3 or size_mb > critical_mb:
+                log_event(
+                    "error",
+                    "wal_oversize_persistent",
+                    f"WAL is {post_size_mb:.1f} MB after checkpoint and has "
+                    f"been oversized for {self._wal_oversize_streak} consecutive "
+                    f"housekeeping cycles. Long-running readers may be blocking "
+                    f"checkpoints. Restart the app or investigate.",
+                )
+                try:
+                    self._emit_alert(
+                        "wal_oversize",
+                        "error",
+                        "Database WAL too large",
+                        f"The SQLite write-ahead log is {post_size_mb:.0f} MB and "
+                        f"checkpoints aren't shrinking it. Long-running queries "
+                        f"may be blocking. Restart the app to clear it.",
+                    )
+                except Exception:
+                    pass
+        else:
+            log_event("info", "wal_checkpoint_succeeded",
+                      f"WAL shrunk from {size_mb:.1f} MB to {post_size_mb:.1f} MB")
+
+    def _check_position_sanity(self) -> None:
+        """F19: position sanity check.
+
+        Compares the bot's running net_position estimate against the
+        delta of the wallet's actual CAT balance since session start.
+        Significant divergence indicates either silently lost fills or
+        phantom recordings.
+
+        Tolerance: ±5% of the CONFIGURED max position. Bigger gaps
+        log a warning and fire an alert.
+        """
+        try:
+            from wallet import get_wallet_balance
+        except ImportError:
+            return
+
+        # Initialise baseline on first run after _startup_complete is set
+        if getattr(self, "_position_baseline_cat", None) is None:
+            try:
+                _bal_raw = get_wallet_balance(cfg.CAT_WALLET_ID)
+                _bal = (_bal_raw.get("wallet_balance") or _bal_raw) if _bal_raw else None
+                if _bal:
+                    _scale = Decimal(10) ** Decimal(str(cfg.CAT_DECIMALS))
+                    _baseline = Decimal(str(_bal.get("confirmed_wallet_balance", 0))) / _scale
+                    self._position_baseline_cat = _baseline
+                    # F48 (2026-04-09): also snapshot the bot's current
+                    # all-time net position so the sanity check compares
+                    # SINCE-baseline deltas against SINCE-baseline deltas.
+                    try:
+                        _net_at_baseline = self.risk_manager._net_position_cat
+                    except Exception:
+                        _net_at_baseline = Decimal("0")
+                    self._position_baseline_net_cat = Decimal(str(_net_at_baseline or 0))
+                    self._position_baseline_at = time.time()
+                    log_event("debug", "position_baseline_set",
+                              f"Position sanity baseline: wallet={_baseline:.2f} CAT, "
+                              f"bot_net={self._position_baseline_net_cat:+.2f} CAT "
+                              f"at session start")
+            except Exception:
+                pass
+            return  # First call only sets baseline; check on next housekeeping tick
+
+        # Read current wallet CAT balance
+        try:
+            _cat_raw = get_wallet_balance(cfg.CAT_WALLET_ID)
+            _cat_bal = (_cat_raw.get("wallet_balance") or _cat_raw) if _cat_raw else None
+            if not _cat_bal:
+                return
+            _scale = Decimal(10) ** Decimal(str(cfg.CAT_DECIMALS))
+            _current_cat = Decimal(str(_cat_bal.get("confirmed_wallet_balance", 0))) / _scale
+        except Exception:
+            return
+
+        # Bot's all-time net position (cumulative from fills table)
+        net_position_cat = Decimal("0")
+        try:
+            net_position_cat = self.risk_manager._net_position_cat
+        except Exception:
+            return
+
+        # F48 (2026-04-09): compute net position SINCE session baseline so
+        # we compare like-for-like. Previously we compared the wallet delta
+        # since baseline against the bot's ALL-TIME net position, which is
+        # guaranteed to drift by whatever net position existed before the
+        # session started.
+        baseline_net = getattr(self, "_position_baseline_net_cat", None)
+        if baseline_net is None:
+            baseline_net = Decimal("0")
+        net_position_since_baseline = net_position_cat - baseline_net
+
+        # F62 (2026-04-09, broadened 2026-04-10): stale-baseline self-healing.
+        # Original condition only re-snapped when baseline_net == 0, which
+        # missed the case where a daily reconcile sets baseline_net to a
+        # non-zero value and subsequent fills cause growing drift. Now
+        # re-snap whenever the baseline is older than 60 seconds AND the
+        # net position has changed since the baseline was taken. This
+        # catches both the reconcile case and the new-fills case.
+        _baseline_age = time.time() - (self._position_baseline_at or 0)
+        _net_changed = (net_position_cat != baseline_net)
+        if (
+            _net_changed
+            and _baseline_age > 60
+            and self._position_baseline_cat is not None
+        ):
+            # Re-snap both the wallet balance and the net-position baselines.
+            self._position_baseline_cat = _current_cat
+            self._position_baseline_net_cat = Decimal(str(net_position_cat or 0))
+            self._position_baseline_at = time.time()
+            log_event(
+                "info",
+                "position_baseline_resnap",
+                f"Position sanity baseline re-snapped (age={_baseline_age:.0f}s, "
+                f"baseline_net={baseline_net:+.2f} -> all-time net="
+                f"{net_position_cat:+.2f}). New baseline: wallet="
+                f"{_current_cat:.2f}, net={net_position_cat:+.2f}.",
+            )
+            return  # Don't run the drift check this tick; next tick uses fresh baseline
+
+        # Expected current = wallet baseline + changes since baseline
+        # If we bought 100 CAT since session start, wallet should be baseline+100
+        expected_current = self._position_baseline_cat + net_position_since_baseline
+        delta = _current_cat - expected_current
+
+        # Tolerance: ±5% of max position (configured), with a minimum
+        # absolute floor for tiny positions
+        try:
+            max_pos_xch = Decimal(str(getattr(cfg, "MAX_POSITION_XCH", "5") or "5"))
+        except Exception:
+            max_pos_xch = Decimal("5")
+        try:
+            mid = Decimal(str(getattr(self, "_current_mid_price", 0) or 0))
+        except Exception:
+            mid = Decimal("0")
+        if mid > 0:
+            max_pos_cat = max_pos_xch / mid
+        else:
+            max_pos_cat = Decimal("1000")
+        tolerance = max_pos_cat * Decimal("0.05")
+        # Floor: at least 100 CAT to avoid noise on tiny positions
+        if tolerance < Decimal("100"):
+            tolerance = Decimal("100")
+
+        if abs(delta) > tolerance:
+            log_event(
+                "warning",
+                "position_sanity_drift",
+                f"Position sanity check: bot estimate since baseline "
+                f"{net_position_since_baseline:+.2f} CAT (all-time "
+                f"{net_position_cat:+.2f}), wallet delta {delta:+.2f} CAT "
+                f"(tolerance ±{tolerance:.0f}). This usually means the bot "
+                f"silently missed a fill (likely a Spacescan-deferred fill "
+                f"that never confirmed) or a phantom fill was recorded. "
+                f"Check fills table for the gap.",
+            )
+            try:
+                self._emit_alert(
+                    "position_sanity",
+                    "warning",
+                    "Position drift detected",
+                    f"The bot's tracked position differs from your wallet's actual "
+                    f"CAT balance change by {delta:+.0f} CAT. Some fills may be "
+                    f"missing from PnL. Run a manual reconciliation.",
+                    action="run_doctor",
+                    action_label="Run Doctor",
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                self._clear_alert("position_sanity")
+            except Exception:
+                pass
+
+    def _repair_unlinked_offer_coins(self) -> None:
+        """F23: repair offer-coin links that didn't fully complete.
+
+        add_offer + lock_coin run as separate DB transactions in
+        offer_manager.create_ladder. If lock_coin fails (lock contention,
+        unique violation, etc.), the offer row has a coin_id but the
+        coin row doesn't have status='locked'. The fill detector still
+        works because it walks via offers.coin_id, but coin_manager
+        thinks the coin is free → may try to use it for another offer.
+
+        This sweep scans for offers where status='open' and the
+        referenced coin is NOT marked locked, and re-runs lock_coin.
+        """
+        try:
+            from database import get_connection, lock_coin, update_offer_status
+        except ImportError:
+            return
+
+        try:
+            conn = get_connection()
+            rows = conn.execute(
+                """
+                SELECT o.trade_id, o.coin_id
+                FROM offers o
+                LEFT JOIN coins c ON o.coin_id = c.coin_id
+                WHERE o.status = 'open'
+                  AND o.coin_id IS NOT NULL
+                  AND o.coin_id != ''
+                  AND (c.status IS NULL OR c.status != 'locked')
+                LIMIT 50
+                """
+            ).fetchall()
+        except Exception as e:
+            log_event("debug", "offer_coin_repair_query_failed",
+                      f"Repair query failed: {e}")
+            return
+
+        if not rows:
+            return
+
+        # F62 (2026-04-09): before re-locking, check whether the wallet still
+        # knows about this offer. The old repair loop re-locked blindly, which
+        # created an infinite self-healing cycle whenever the wallet had
+        # dropped an offer but the DB still had it open: Pass 2 of the Sage
+        # reconciler would free the orphan lock on every cycle, then this
+        # repair would re-lock it, then Pass 2 would free it again. The two
+        # sniper offers at startup were stuck in this loop for ~45 minutes.
+        #
+        # Fix: snapshot the wallet's open trade_ids once up front. If an
+        # offer is in our DB but the wallet doesn't know about it, the offer
+        # is dead (cancelled/filled/expired and the wallet is the source of
+        # truth), so mark it cancelled in the DB instead of re-locking its
+        # coin. Otherwise, re-lock as before.
+        wallet_open_ids = None
+        try:
+            from wallet import get_all_offers
+            _open = get_all_offers(include_completed=False, start=0, end=500) or []
+            wallet_open_ids = {
+                (o.get("trade_id") or "").lower()
+                for o in _open
+                if o.get("trade_id")
+                and str(o.get("status", "")).lower() not in
+                   ("cancelled", "canceled", "completed", "expired", "failed")
+            }
+        except Exception:
+            wallet_open_ids = None  # Unknown — fall back to old behaviour
+
+        repaired = 0
+        orphan_closed = 0
+        for row in rows:
+            tid = row["trade_id"]
+            cid = row["coin_id"]
+            if not tid or not cid:
+                continue
+            # If we have a reliable wallet snapshot and the offer isn't there,
+            # it's a dead offer — close it instead of relocking.
+            if wallet_open_ids is not None and tid.lower() not in wallet_open_ids:
+                try:
+                    update_offer_status(tid, "cancelled")
+                    orphan_closed += 1
+                except Exception:
+                    pass
+                continue
+            try:
+                if lock_coin(cid, tid):
+                    repaired += 1
+            except Exception:
+                pass
+
+        if repaired > 0:
+            log_event("warning", "offer_coin_link_repaired",
+                      f"Repaired {repaired} offer-coin link(s) where the offer "
+                      f"existed but the coin row wasn't marked locked. Indicates "
+                      f"a previous lock_coin call failed silently.")
+        if orphan_closed > 0:
+            log_event("info", "offer_coin_orphan_closed",
+                      f"Closed {orphan_closed} DB offer(s) that no longer exist "
+                      f"in the wallet — breaks the re-lock/free loop on dead "
+                      f"sniper/ladder offers.")
+
+    def _maybe_run_daily_reconcile(self) -> None:
+        """Run a deep DB↔wallet reconciliation once per 24 hours.
+
+        Backfills missing fills via the existing `backfill_verified_fills_from_offers`
+        helper, then logs a delta summary. Does NOT auto-correct anything
+        beyond what the existing backfill function already does (idempotent
+        record_fill calls for offers marked filled).
+        """
+        now = time.time()
+        last = float(getattr(self, "_last_daily_reconcile_at", 0) or 0)
+        if last and (now - last) < 86400:  # 24 hours
+            return
+
+        log_event("info", "daily_reconcile_start",
+                  "Daily DB↔wallet reconciliation starting")
+        self._last_daily_reconcile_at = now
+
+        try:
+            backfilled = backfill_verified_fills_from_offers(limit=200)
+            backfilled = backfilled or []
+            # F48 (2026-04-09): distinguish between newly-inserted rows and
+            # existing rows whose verification_status was upgraded from
+            # 'legacy' to 'verified'. The old code lumped them together and
+            # logged "backfilled N missing fill rows" even when nothing new
+            # was inserted — misleading for the operator reviewing logs.
+            created_count = sum(1 for r in backfilled if r.get("created"))
+            upgraded_count = sum(1 for r in backfilled if r.get("upgraded"))
+            if created_count > 0:
+                log_event(
+                    "warning",
+                    "daily_reconcile_backfilled",
+                    f"Daily reconcile INSERTED {created_count} new fill rows "
+                    f"for offers marked 'filled' in the offers table but "
+                    f"missing from the fills table — PnL was understated. "
+                    f"Now corrected.",
+                )
+            if upgraded_count > 0:
+                log_event(
+                    "info",
+                    "daily_reconcile_upgraded",
+                    f"Daily reconcile upgraded verification_status on "
+                    f"{upgraded_count} legacy fill row(s) to 'verified'. "
+                    f"No new rows inserted.",
+                )
+            if created_count == 0 and upgraded_count == 0:
+                log_event("info", "daily_reconcile_clean",
+                          "Daily reconcile: no missing fills found (PnL is in sync)")
+
+            # F62 (2026-04-09): if the backfill changed the all-time net
+            # position, the position-sanity baseline snapshot is now stale.
+            # The baseline was taken at session start when the fills table
+            # was still missing these rows, so it captured `baseline_net=0`.
+            # Leaving it stale makes `_check_position_sanity` fire every
+            # cycle with a phantom "wallet delta" equal to whatever the
+            # reconcile added. Reset it so the next housekeeping tick
+            # re-snaps against the fresh (correct) all-time position.
+            if created_count > 0 or upgraded_count > 0:
+                try:
+                    self.risk_manager.update_inventory()  # refresh net_position_cat
+                except Exception:
+                    pass
+                self._position_baseline_cat = None
+                self._position_baseline_net_cat = None
+                self._position_baseline_at = None
+                log_event(
+                    "info",
+                    "position_baseline_invalidated",
+                    "Position sanity baseline cleared after reconcile "
+                    "updated the fills table — will re-snap next tick.",
+                )
+        except Exception as _bf_err:
+            log_event("warning", "daily_reconcile_backfill_failed",
+                      f"Daily reconcile backfill step failed: {_bf_err}")
+
+        # Sanity check: number of open offers in DB vs in wallet
+        try:
+            from database import get_open_offers as _ro_get_open_offers
+            db_open = _ro_get_open_offers(cat_asset_id=cfg.CAT_ASSET_ID)
+            db_count = len(db_open)
+            wallet_offers = get_all_offers(include_completed=False, start=0, end=500)
+            if wallet_offers:
+                wallet_open = sum(
+                    1 for o in wallet_offers
+                    if str(o.get("status", "")).lower() not in
+                       ("cancelled", "canceled", "completed", "expired", "failed")
+                )
+                if abs(db_count - wallet_open) > 2:
+                    log_event(
+                        "warning",
+                        "daily_reconcile_count_mismatch",
+                        f"Daily reconcile: DB has {db_count} open offers, wallet has "
+                        f"{wallet_open}. Drift suggests DB is out of sync. "
+                        f"Recommend investigating offers table.",
+                    )
+                else:
+                    log_event("info", "daily_reconcile_count_ok",
+                              f"Daily reconcile count check OK: DB={db_count}, "
+                              f"wallet={wallet_open}")
+        except Exception as _cnt_err:
+            log_event("debug", "daily_reconcile_count_skipped",
+                      f"Daily reconcile count check skipped: {_cnt_err}")
+
+        # F24 (2026-04-08): daily Spacescan fill spot-check.
+        # Pick a random sample of recent fills from the DB and re-verify
+        # them against Spacescan. If any verification disagrees with the
+        # DB record, alert — that's evidence of a phantom fill that
+        # slipped past the verification gate.
+        if getattr(cfg, "SPACESCAN_ENABLED", False):
+            try:
+                self._spot_check_recent_fills()
+            except Exception as _sc_err:
+                log_event("debug", "daily_spot_check_failed",
+                          f"Daily Spacescan spot-check failed: {_sc_err}")
+
+    def _spot_check_recent_fills(self) -> None:
+        """F24 (2026-04-08): random Spacescan re-verification of recent fills.
+
+        Picks a random sample of 5 fills from the last 24h that were
+        recorded with verification_status='verified', then asks Spacescan
+        to confirm them again. If any disagree (Spacescan says the coin
+        wasn't actually spent, or was spent to ourselves), it's a phantom
+        fill that slipped past the original verification gate.
+        """
+        try:
+            from database import get_connection
+            from spacescan import verify_fill as _verify_fill
+            from wallet import get_first_address
+            import random as _random
+        except Exception:
+            return
+
+        try:
+            conn = get_connection()
+            rows = conn.execute(
+                """
+                SELECT f.fill_id, f.trade_id, f.side, f.price_xch
+                FROM fills f
+                LEFT JOIN offers o ON f.trade_id = o.trade_id
+                WHERE f.verification_status = 'verified'
+                  AND f.filled_at > datetime('now', '-1 day')
+                  AND o.coin_id IS NOT NULL
+                ORDER BY f.fill_id DESC
+                LIMIT 100
+                """
+            ).fetchall()
+        except Exception:
+            return
+
+        if not rows:
+            log_event("debug", "spot_check_skip_no_fills",
+                      "Spot-check skipped: no fills in last 24h")
+            return
+
+        sample_size = min(5, len(rows))
+        sample = _random.sample(list(rows), sample_size)
+
+        # Get our wallet address for self-spend detection
+        try:
+            our_address = get_first_address(cfg.WALLET_ID_XCH) or ""
+        except Exception:
+            our_address = ""
+
+        if not our_address:
+            log_event("debug", "spot_check_skip_no_address",
+                      "Spot-check skipped: could not determine wallet address")
+            return
+
+        verified = 0
+        phantom = 0
+        unknown = 0
+        for row in sample:
+            tid = row["trade_id"]
+            try:
+                # Look up coin_id for this trade
+                coin_row = conn.execute(
+                    "SELECT coin_id FROM offers WHERE trade_id=?", (tid,)
+                ).fetchone()
+                if not coin_row or not coin_row["coin_id"]:
+                    continue
+                result = _verify_fill(coin_row["coin_id"], our_address)
+                if result is True:
+                    verified += 1
+                elif result is False:
+                    phantom += 1
+                    log_event(
+                        "error",
+                        "spot_check_phantom_detected",
+                        f"PHANTOM FILL detected by spot-check: trade {tid[:16]}... "
+                        f"is recorded as a verified fill but Spacescan says the "
+                        f"coin was either unspent or spent back to us. Investigate "
+                        f"the original verification path — this fill should NOT "
+                        f"be in PnL.",
+                        data={"trade_id": tid, "fill_id": row["fill_id"],
+                              "side": row["side"]},
+                    )
+                else:
+                    unknown += 1
+            except Exception:
+                unknown += 1
+
+        log_event(
+            "info",
+            "daily_spot_check_done",
+            f"Daily Spacescan fill spot-check: {verified} verified, "
+            f"{phantom} phantoms, {unknown} unknown out of {sample_size} sampled "
+            f"(of {len(rows)} eligible fills in last 24h)",
+        )
+
+        if phantom > 0:
+            try:
+                self._emit_alert(
+                    "spot_check_phantom",
+                    "error",
+                    f"{phantom} phantom fill(s) detected",
+                    f"The daily fill audit found {phantom} fills marked verified "
+                    f"in the database that Spacescan disagrees with. PnL may be "
+                    f"inflated. Run a manual reconciliation.",
+                    action="run_doctor",
+                    action_label="Run Doctor",
+                )
+            except Exception:
+                pass
+
+    def _start_health_monitor(self) -> None:
+        """(Re)start the Sage health monitor thread. Idempotent."""
+        if self._health_thread and self._health_thread.is_alive():
+            return
+        self._health_thread = threading.Thread(
+            target=self._health_monitor_thread,
+            daemon=True,
+            name="bot-health-watch",
+        )
+        self._health_thread.start()
+
+    def _start_price_watcher(self) -> None:
+        """(Re)start the price watcher thread. Idempotent."""
+        if self._watcher_thread and self._watcher_thread.is_alive():
+            return
+        self._watcher_thread = threading.Thread(
+            target=self._price_watcher_thread,
+            daemon=True,
+            name="price-watcher",
+        )
+        self._watcher_thread.start()
+
+    def _start_coin_watcher(self) -> None:
+        """(Re)start the coin watcher thread. Idempotent."""
+        if self._coin_watcher_thread and self._coin_watcher_thread.is_alive():
+            return
+        self._coin_watcher_thread = threading.Thread(
+            target=self._coin_watcher_thread_run,
+            daemon=True,
+            name="coin-watcher",
+        )
+        self._coin_watcher_thread.start()
 
     # -------------------------------------------------------------------
     # Dexie Repost (V1 parity)
@@ -5578,13 +7177,16 @@ class BotLoop:
             if resp.status_code == 200:
                 pairs = resp.json()
                 normalized = cfg.CAT_ASSET_ID.lower().strip()
+                cat_decimals = int(getattr(cfg, "CAT_DECIMALS", 3) or 3)
+                cat_scale = 10 ** cat_decimals
                 for pair in pairs:
                     pair_asset = str(pair.get("short_name", "")).lower().strip()
                     pair_asset_id = str(pair.get("asset_id", "")).lower().strip()
-                    if normalized in (pair_asset, pair_asset_id, pair_asset_id + "00"):
-                        # API returns mojos — divide by 1e12 to match price_engine units
+                    # Exact match only — avoid zero-appending false matches.
+                    if normalized in (pair_asset, pair_asset_id):
+                        # API returns mojos — divide to match price_engine units
                         xch_res = float(pair.get("xch_reserve", 0)) / 1e12
-                        token_res = float(pair.get("token_reserve", 0))
+                        token_res = float(pair.get("token_reserve", 0)) / cat_scale
                         if xch_res > 0 and token_res > 0:
                             return xch_res, token_res
         except Exception:
@@ -5703,11 +7305,6 @@ class BotLoop:
                 changes = self._detect_coin_changes(
                     self._coin_snapshot, current_snapshot, db_state
                 )
-
-                with self._coin_watcher_lock:
-                    self._coin_watcher_polls += 1
-                    if changes:
-                        self._coin_watcher_changes += len(changes)
 
                 # Log each change with structured data
                 for change in changes:
@@ -5919,7 +7516,7 @@ class BotLoop:
     # Graceful Config Migration (V2 — config-first, batched cancels)
     # -------------------------------------------------------------------
 
-    def graceful_config_change(self, new_config: Dict = None) -> Dict:
+    def graceful_config_change(self, _new_config: Dict = None) -> Dict:
         """Handle config changes while maintaining market presence.
 
         V2 approach (improved from V1):

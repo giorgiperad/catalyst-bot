@@ -16,6 +16,8 @@ The developer (Tim) is not a coder — all development is done through prompting
 
 ## Working Style (PERMANENT — apply across all sessions)
 
+**Research the codebase before editing. Never change code you haven't read.**
+
 **Default to honest pushback, not agreement.**
 - Read the actual code before making claims about behaviour. Never describe what code "probably does" — check.
 - If Tim's stated goal conflicts with what the bot actually does, flag it clearly before implementing anything.
@@ -33,11 +35,17 @@ The developer (Tim) is not a coder — all development is done through prompting
 | Date | Decision | Rationale |
 |------|----------|-----------|
 | 2026-04-01 | Bot is a **symmetric market maker**, not a price support tool | Price support and arb are separate future projects. Market maker profits from spread capture, not direction. Optimise for that. |
-| 2026-04-01 | Probe-on-fill = positive signal, not failure | When a sniper probe fills immediately, treat it as price confirmation and build ladder at that level. Do not retry the probe — that wastes coins and time. |
-| 2026-04-01 | Topup threshold = `MAX_BUY_OFFERS + MAX_SELL_OFFERS` spare coins | 30% of max offers is too low. Create-first requote requires enough spare coins to replace the whole side without falling back to cancel-first. |
+| 2026-04-01 | ~~Probe-on-fill = positive signal~~ **REVERSED 2026-04-05** | ~~Treat fill as confirmation~~ → A filled probe means the safe edge hasn't been found yet. Always widen and retry. Ladder only deploys after probes **survive** on the book. Fill = overshot, not confirmation. |
+| 2026-04-01 | ~~Topup threshold = `MAX_BUY_OFFERS + MAX_SELL_OFFERS` spare coins~~ **SUPERSEDED 2026-04-08** | Actual rule in `coin_manager.needs_topup` is per-tier: `TIER_TRIGGER_PCT_*` percentages of `prep_target × pace_scale`, scaled by trading pace (busy=1.4×, slow=0.7×). Fires earlier than the simple sum, which is more defensive. Legacy non-tiered branch still uses the multiplier rule. Tune via `TIER_TRIGGER_PCT_INNER/MID/OUTER/EXTREME` in `.env`. |
 | 2026-04-01 | Topup backoff = exponential starting at 5 min, max 60 min | 2-hour fixed backoff is too long. Ladder degrades during the wait. Exponential gives fast retry on transient failures. |
 | 2026-04-01 | Circuit breaker must NOT halt the correcting side | If CB trips because position is over-long, sell offers must continue. Halting everything when you should be selling is wrong. |
-| 2026-04-01 | Smart Settings must clear legacy MAX_MID/MIN_MID keys | Legacy fallback chain in config silently overrides HARD_MAX/HARD_MIN. Fragile. Smart Settings writes both new and legacy keys. |
+| 2026-04-01 | ~~Smart Settings must write both new + legacy MAX_MID/MIN_MID keys~~ **REVERSED 2026-04-08** | Legacy keys are silent fallbacks for `HARD_MIN/MAX_PRICE_XCH`. Writing both creates two sources of truth and the legacy values can override the new ones unexpectedly. Smart Settings now **clears** the legacy keys (sets to "") so the new HARD rails are the only source. `MAX_MID_MOVE_BPS` was never consumed by trading code and was removed from config + GUI. |
+| 2026-04-08 | Price-rail breach (`HARD_MAX/MIN`, dynamic band, step) → trip price CB → cancel ALL offers → skip cycle | Previous behaviour silently returned from the cycle leaving stale offers exposed at the wrong mid. Now `_apply_safety_guards` records the breach direction and `bot_loop` routes the rail breach through `risk_manager.trip_price_rail_breach()` so the existing CB safeguard cancels the book. |
+| 2026-04-08 | `_handle_requoting` must check `risk_manager.should_enable_side` and stale-wallet streak | Was the second road to creating offers and bypassed the position-CB blocked-side check, defeating the partial-halt CB. Now mirrors the gates already used by `_create_offers_if_needed`. |
+| 2026-04-08 | `MAX_STEP_CHANGE_FRACTION` default = 0.10 (was 0); `REQUOTE_BPS` default = 30 (was 0); `DYNAMIC_SPREAD_ENABLED` default = True (was False) | The off-by-default settings made the safety/efficiency machinery inert in fresh installs. Step guard at 10% blocks corrupted Tibet responses inside the ±50% dynamic band; 30 bps requote hysteresis prevents every-cycle churn; dynamic spread enables the volatility/depth scaling the dashboard already advertises. |
+| 2026-04-08 | Silent fill-loss events get a per-hour rate alert | `mass_disappearance_guard`, `offer_closed_unverified`, and `fill_unverified` each log a single warning per occurrence — easy to miss when the bot is dropping real fills from PnL. `FillTracker._record_silent_loss_event` now keeps a per-event 1-hour bucket and emits an `error`-severity `silent_loss_rate_exceeded` event (with 10-min anti-spam cooldown) when the per-hour count exceeds 5. |
+| 2026-04-08 | Mass-disappearance guard boundary = `>= 0.5` (was `> 0.5`) | Exactly 50% of the visible book vanishing in one cycle is symmetric with 51% — both deserve the 3-strike guard. Previously a 4-of-8 cycle slipped through unprotected. Still gated on `disappeared > 1` so single fills in tiny books are unaffected. |
+| 2026-04-08 | `fills.trade_id` has a UNIQUE index (`uniq_fills_trade_id`) | Defense-in-depth backstop against double-counting if `record_fill` ever races between SELECT pre-check and INSERT. Migration is idempotent and skips gracefully if pre-existing duplicates would block the index. `record_fill` now catches `IntegrityError` specifically and returns the existing `fill_id` so a race becomes an idempotent no-op. |
 
 ## How to Run
 
@@ -195,7 +203,7 @@ v4/
 5. **Wallet operations must be serialised.** One split at a time.
 6. **trade_id is the universal key.**
 7. **Amounts:** XCH uses 1e12 mojos. CAT uses 10^decimals.
-8. **Batch cancels must be sequential** with 0.5-1s delays.
+8. **Batch cancels must be sequential** with ~0.3s delays (was 0.5-1s in v1; tightened in v2 for cancel-storm responsiveness — see `wallet_sage.cancel_offers_batch`).
 9. **Mass disappearance guard:** 3 confirmations before treating as fills.
 
 ## Code Conventions
