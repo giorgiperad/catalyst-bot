@@ -1035,3 +1035,4 @@ def has_per_side_tier_sizes() -> bool:
         if Decimal(str(getattr(cfg, f"SELL_{t.upper()}_SIZE_XCH", 0) or 0)) > 0:
             return True
     return False
+
