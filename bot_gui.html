@@ -24969,20 +24969,67 @@
                 // Step 2: Cancel offers (if requested)
                 if (cancelOffers) {
                     setShutdownStep('Offers', 'active', 'Cancelling active offers before exit.');
-                    updateShutdownProgress('Cancelling offers...', 'Waiting for open offers to be cancelled.');
+                    updateShutdownProgress('Cancelling offers...', 'Sending cancel request to Sage...');
                     addLogEntry('info', '   Step 2: Cancelling all offers...');
                     try {
                         startShutdownCancelAllPoll();
                         const cancelResp = await apiFetch(`${API_URL}/offers/cancel_all`, { method: 'POST' });
                         const cancelResult = await cancelResp.json();
-                        await pollShutdownCancelAllStatusOnce();
                         stopShutdownCancelAllPoll();
+
                         if (cancelResult.success) {
                             const count = cancelResult.cancelled || 0;
-                            setShutdownStep('Offers', 'done', count > 0
-                                ? `Cancelled ${count} offers before shutdown.`
-                                : 'No open offers needed cancelling.');
-                            addLogEntry('success', '   Cancelled ' + count + ' offers');
+                            if (count > 0) {
+                                addLogEntry('info', `   Cancel submitted for ${count} offers — waiting for on-chain confirmation...`);
+                                // Poll until Sage reports 0 active offers or timeout
+                                const _cancelPollStart = Date.now();
+                                const _cancelTimeout = 180000; // 3 minutes max
+                                let _remainingActive = count;
+                                while (Date.now() - _cancelPollStart < _cancelTimeout) {
+                                    await new Promise(r => setTimeout(r, 5000));
+                                    try {
+                                        const statusResp = await apiFetch(`${API_URL}/offers/cancel_all/status`);
+                                        const statusData = await statusResp.json();
+                                        // cancel_all/status tracks batch progress; check if
+                                        // it's finished AND get live wallet offer count
+                                        if (statusData.complete || !statusData.running) {
+                                            // Cancel RPC finished — now check actual wallet state
+                                            try {
+                                                const walletResp = await apiFetch(`${API_URL}/offers/open_count`);
+                                                const walletData = await walletResp.json();
+                                                _remainingActive = walletData.open_count || 0;
+                                            } catch(_wc) {
+                                                _remainingActive = 0; // assume done if can't check
+                                            }
+                                        } else {
+                                            // Still running — show batch progress
+                                            _remainingActive = Math.max(0,
+                                                (statusData.total || 0) - (statusData.batch_cancelled || 0));
+                                        }
+                                        const elapsed = Math.round((Date.now() - _cancelPollStart) / 1000);
+                                        updateShutdownProgress(
+                                            `Confirming cancellations... (${elapsed}s)`,
+                                            _remainingActive > 0
+                                                ? `${_remainingActive} offers still active on-chain`
+                                                : 'All offers cancelled'
+                                        );
+                                        setShutdownStep('Offers', 'active',
+                                            `Confirming: ${_remainingActive} still active (${elapsed}s)`);
+                                        if (_remainingActive === 0) break;
+                                    } catch(_pe) { /* keep polling */ }
+                                }
+                                if (_remainingActive === 0) {
+                                    setShutdownStep('Offers', 'done', `All ${count} offers cancelled and confirmed.`);
+                                    addLogEntry('success', `   All ${count} offers confirmed cancelled`);
+                                } else {
+                                    setShutdownStep('Offers', 'error',
+                                        `${_remainingActive} offers still active after 3 min — proceeding with shutdown.`);
+                                    addLogEntry('warning', `   ${_remainingActive} offers may still be active on-chain`);
+                                }
+                            } else {
+                                setShutdownStep('Offers', 'done', 'No open offers needed cancelling.');
+                                addLogEntry('success', '   No offers to cancel');
+                            }
                         } else {
                             setShutdownStep('Offers', 'error', cancelResult.error || 'Cancel all returned an unexpected response.');
                             addLogEntry('warning', '   Cancel returned: ' + (cancelResult.error || 'no offers'));

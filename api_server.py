@@ -3372,6 +3372,20 @@ def api_cancel_all_status():
     return jsonify({"success": True, **_get_cancel_all_state()})
 
 
+@app.route("/api/offers/open_count")
+def api_open_offer_count():
+    """Return the number of still-active offers in the wallet.
+
+    Used by the shutdown flow to verify cancels actually confirmed
+    on-chain before proceeding with app exit.
+    """
+    try:
+        open_offers = get_open_offers()
+        return jsonify({"success": True, "open_count": len(open_offers)})
+    except Exception as e:
+        return jsonify({"success": False, "open_count": -1, "error": str(e)})
+
+
 @app.route("/api/offers/cancel_all", methods=["POST"])
 def api_cancel_all():
     """Cancel all open offers when the bot is not actively managing the book."""
