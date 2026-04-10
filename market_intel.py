@@ -589,3 +589,4 @@ class MarketIntel:
             self._dbx["eligible_offers"] = 0
             self._dbx["estimated_dbx_rate"] = Decimal("0")
             self._dbx["last_check"] = 0
+
