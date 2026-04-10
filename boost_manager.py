@@ -1112,3 +1112,4 @@ class BoostManager:
                 "cascade_count": self._cascade_count,
                 "cascade_ready": self.should_cascade(),
             }
+
