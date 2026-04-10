@@ -1336,3 +1336,4 @@ class FillTracker:
                   f"{len(sell_ids)} sells — offline fills will be detected on first loop")
 
     # prune_known_ids REMOVED — _known_ids was dead state (write-only, never read)
+
