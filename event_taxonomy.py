@@ -567,3 +567,4 @@ def categorize_event(event_type: str) -> EventCategory:
 def get_category_map() -> dict:
     """Return the full event-to-category mapping (for diagnostics/API)."""
     return dict(_EVENT_CATEGORY_MAP)
+
