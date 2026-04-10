@@ -364,3 +364,4 @@ class SplashManager:
     def _fingerprint(offer_bech32: str) -> str:
         """SHA256 fingerprint of offer bech32 string."""
         return hashlib.sha256(offer_bech32.strip().encode("utf-8")).hexdigest()
+
