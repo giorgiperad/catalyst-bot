@@ -1078,6 +1078,7 @@ def serve_brand_asset(filename: str):
     assets_dir = os.path.join(gui_dir, "assets")
     allowed = {
         "bot_icon_new.png",
+        "favicon.ico",
         "sage_logo_official.png",
         "dexie_logo_official.png",
         "dexie_logo_official.ico",
