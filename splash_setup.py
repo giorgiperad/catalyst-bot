@@ -352,3 +352,4 @@ def get_download_status() -> Dict:
     """Get current download progress."""
     with _download_lock:
         return dict(_download_status)
+
