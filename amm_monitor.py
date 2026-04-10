@@ -480,3 +480,4 @@ class AMMMonitor:
         except Exception as e:
             log_event("debug", "amm_cache_inject_error",
                       f"AMM cache injection failed (non-critical): {e}")
+
