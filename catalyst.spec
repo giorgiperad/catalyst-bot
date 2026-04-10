@@ -1,0 +1,258 @@
+# build_windows.spec
+#
+# PyInstaller spec file for Chia Market Maker — Windows (onedir bundle)
+#
+# Usage:
+#   pyinstaller build_windows.spec
+#
+# Or via the helper script:
+#   python build.py
+#
+# Output: dist/ChiaMarketMaker/ChiaMarketMaker.exe  (plus all supporting files)
+#
+# Design notes:
+#   - onedir mode: all files sit in dist/ChiaMarketMaker/.  Simpler to debug
+#     than onefile, no extraction delay on launch, and easier for users to
+#     place their .env file alongside the exe.
+#   - splash.exe is bundled as a data file so the Splash P2P node works
+#     out of the box.  SplashNode.find_binary() searches sys._MEIPASS (the
+#     bundle root) automatically because it looks in the same dir as the
+#     running script.
+#   - .env is never bundled — it lives alongside the exe and holds secrets.
+#   - PyWebView on Windows requires edgechromium (WebView2) which ships with
+#     Windows 11 and is auto-installed on Windows 10 via Windows Update.
+#     The winforms backend is included as a fallback.
+
+import os
+import sys
+
+block_cipher = None
+
+# ---------------------------------------------------------------------------
+# Resolve the project root (where this spec file lives)
+# ---------------------------------------------------------------------------
+_HERE = os.path.dirname(os.path.abspath(SPEC))  # noqa: F821  (SPEC is injected by PyInstaller)
+
+# ---------------------------------------------------------------------------
+# Data files — everything the running app reads from the filesystem
+# ---------------------------------------------------------------------------
+
+# All HTML files served by Flask
+_html_files = [
+    (os.path.join(_HERE, 'bot_gui.html'), '.'),
+]
+
+# Brand / UI assets (now in assets/ subfolder)
+_assets_dir = os.path.join(_HERE, 'assets')
+_image_files = [
+    (os.path.join(_assets_dir, f), 'assets')
+    for f in ('bot_icon_new.png', 'bot_icon_new.ico', 'favicon.ico',
+              'dexie_logo_official.png', 'dexie_logo_official.ico',
+              'sage_logo_official.png', 'tibetswap_logo_official.png')
+    if os.path.isfile(os.path.join(_assets_dir, f))
+]
+# Also check root for backward compat
+_image_files += [
+    (os.path.join(_HERE, f), '.')
+    for f in ('bot_icon_new.png', 'bot_icon_new.ico')
+    if os.path.isfile(os.path.join(_HERE, f))
+    and not any(os.path.basename(s) == f for s, _ in _image_files)
+]
+
+# Splash P2P binary (optional — bundled when present, platform-specific)
+_splash_name = 'splash.exe' if sys.platform == 'win32' else 'splash'
+_splash_path = os.path.join(_HERE, _splash_name)
+_splash_files = [(_splash_path, '.')] if os.path.isfile(_splash_path) else []
+
+_datas = _html_files + _image_files + _splash_files
+
+# ---------------------------------------------------------------------------
+# Hidden imports
+#
+# PyInstaller's static analysis misses dynamic imports and modules that are
+# only referenced as strings (e.g. pywebview platform backends).
+# ---------------------------------------------------------------------------
+_hiddenimports = [
+    # Flask and its ecosystem
+    'flask',
+    'flask.templating',
+    'jinja2',
+    'jinja2.ext',
+    'werkzeug',
+    'werkzeug.serving',
+    'werkzeug.middleware.proxy_fix',
+
+    # PyWebView — platform backends (runtime picks best available)
+    'webview',
+    'webview.guilib',
+    *(['webview.platforms.winforms', 'webview.platforms.mshtml',
+       'webview.platforms.edgechromium'] if sys.platform == 'win32' else []),
+    *(['webview.platforms.cocoa'] if sys.platform == 'darwin' else []),
+    *(['webview.platforms.gtk'] if sys.platform == 'linux' else []),
+
+    # System tray
+    'pystray',
+    *(['pystray._win32'] if sys.platform == 'win32' else []),
+    *(['pystray._darwin'] if sys.platform == 'darwin' else []),
+    *(['pystray._xorg'] if sys.platform == 'linux' else []),
+
+    # Notifications
+    'plyer',
+    'plyer.utils',
+    *(['plyer.platforms.win.notification'] if sys.platform == 'win32' else []),
+    *(['plyer.platforms.macosx.notification'] if sys.platform == 'darwin' else []),
+    *(['plyer.platforms.linux.notification'] if sys.platform == 'linux' else []),
+
+    # Pillow (required by pystray for icon generation)
+    'PIL',
+    'PIL.Image',
+    'PIL.ImageDraw',
+    'PIL.ImageFont',
+    'PIL._imaging',
+
+    # HTTP / networking
+    'requests',
+    'requests.adapters',
+    'requests.auth',
+    'urllib3',
+    'urllib3.util',
+    'urllib3.util.retry',
+    'certifi',
+
+    # Config / env
+    'dotenv',
+    'dotenv.main',
+
+    # Data / serialisation
+    'decimal',
+    'json',
+    'sqlite3',
+
+    # Bot modules (all referenced by string or lazy import)
+    'api_server',
+    'app_bridge',
+    'tray_manager',
+    'notification_manager',
+    'bot_loop',
+    'database',
+    'config',
+    'price_engine',
+    'offer_manager',
+    'fill_tracker',
+    'risk_manager',
+    'coin_manager',
+    'market_intel',
+    'sniper',
+    'boost_manager',
+    'coinset_client',
+    'splash_manager',
+    'splash_node',
+    'splash_receive',
+    'splash_setup',
+    'dexie_manager',
+    'wallet',
+    'wallet_chia',
+    'wallet_sage',
+    'mock_wallet',
+    'coin_prep_worker',
+    'super_log',
+    'super_log_hooks',
+    'startup_test',
+    'chia_node',
+    'sage_node',
+    'runtime_monitor',
+    'spacescan',
+    'tx_fees',
+    'reservation_manager',
+    'market_data_collector',
+    'mempool_watcher',
+    'win_subprocess',
+    'event_taxonomy',
+    'offer_lifecycle',
+    'user_secrets',
+]
+
+# ---------------------------------------------------------------------------
+# Binaries — compiled extensions that Analysis may not find automatically
+# ---------------------------------------------------------------------------
+_binaries = []
+
+# ---------------------------------------------------------------------------
+# Analysis
+# ---------------------------------------------------------------------------
+a = Analysis(
+    ['desktop_app.py'],
+    pathex=[_HERE],
+    binaries=_binaries,
+    datas=_datas,
+    hiddenimports=_hiddenimports,
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[
+        # Test files — no need in the bundle
+        'pytest',
+        'playwright',
+        'unittest',
+        # Heavy scientific stack (not used)
+        'numpy',
+        'pandas',
+        'matplotlib',
+        'scipy',
+        'IPython',
+        'notebook',
+        # Dev tools
+        'black',
+        'mypy',
+        'pylint',
+        'flake8',
+    ],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=block_cipher,
+    noarchive=False,
+)
+
+# ---------------------------------------------------------------------------
+# PYZ archive (compiled .pyc files)
+# ---------------------------------------------------------------------------
+pyz = PYZ(  # noqa: F821  (injected by PyInstaller)
+    a.pure,
+    a.zipped_data,
+    cipher=block_cipher,
+)
+
+# ---------------------------------------------------------------------------
+# EXE
+# ---------------------------------------------------------------------------
+exe = EXE(  # noqa: F821
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,   # onedir: binaries go into COLLECT, not the exe
+    name='ChiaMarketMaker',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,                # Compress where possible (reduces size)
+    console=False,           # No console window — desktop_app.py manages this
+    disable_windowed_traceback=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    icon=os.path.join(_HERE, 'bot_icon_new.ico') if os.path.isfile(os.path.join(_HERE, 'bot_icon_new.ico')) else None,
+)
+
+# ---------------------------------------------------------------------------
+# COLLECT — assemble the final onedir bundle
+# ---------------------------------------------------------------------------
+coll = COLLECT(  # noqa: F821
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='ChiaMarketMaker',
+)

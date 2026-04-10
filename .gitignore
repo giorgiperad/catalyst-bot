@@ -109,3 +109,4 @@ splash.html
 tools/
 website
 simulation/
+!catalyst.spec
