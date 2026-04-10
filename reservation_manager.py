@@ -304,3 +304,4 @@ class ReservationManager:
                 conn.commit()
             except Exception as e:
                 print(f"  [ReservationManager] prune_old error: {e}", flush=True)
+
