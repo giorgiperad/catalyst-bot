@@ -185,3 +185,4 @@ def get_buffer(base_bps) -> Decimal:
 def get_state() -> dict:
     """Return diagnostic state dict for the dynamic buffer."""
     return _get_buffer_instance().get_state()
+
