@@ -1,1 +1,0 @@
-{"default":{"identifier":"default","description":"Default capability for the main Tauri windows.","local":true,"windows":["main","splash"],"permissions":["core:default"]}}
