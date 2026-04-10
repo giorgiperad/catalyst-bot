@@ -1,6 +1,6 @@
-# Chia Market Maker
+# CATalyst
 
-An automated market maker for Chia blockchain CAT tokens on the [Dexie](https://dexie.space) exchange. The bot maintains a symmetric bid/ask ladder, profits from the spread, and uses TibetSwap v2 pricing as the primary oracle.
+Automated market maker for CAT tokens on the [Dexie](https://dexie.space) exchange, powered by [Sage wallet](https://sage.rigidnetwork.io). Maintains a tiered bid/ask ladder, auto-requotes on price moves, and handles coin management — all from a native desktop window.
 
 **Status:** Beta — actively used in production. No warranty. Use at your own risk.
 
@@ -8,109 +8,93 @@ An automated market maker for Chia blockchain CAT tokens on the [Dexie](https://
 
 ## Features
 
-- Symmetric market-making on Dexie with configurable spread (basis points)
-- Tiered order sizing (inner/mid/outer/extreme tiers)
-- Dynamic spread adjustment based on volatility and inventory skew
-- Sniper mode for closing arbitrage gaps
-- Native desktop application (PyWebView + system tray) or browser-based Flask mode
-- Supports Sage light wallet (recommended) or official Chia wallet
-- Coin preparation and health management
-- Splash P2P offer broadcasting
-- Spacescan on-chain verification
-- Full audit log to SQLite
+- **Tiered ladder** — inner/mid/outer/extreme offer sizing, configurable per side
+- **Dynamic spreads** — adjusts based on volatility, inventory skew, and competitor depth
+- **Smart Settings** — one-click capital planning from wallet balance and market data
+- **Sniper probes** — detects arb gaps and probes new price edges
+- **Mempool detection** — spots TibetSwap swaps before they confirm on chain
+- **Multi-source fill verification** — Spacescan + Sage + Dexie fallback chain
+- **Splash P2P** — broadcasts offers directly to other Splash nodes
+- **Native desktop app** — system tray, notifications, runs in background
+- **Coin prep** — automatic UTXO splitting and replenishment
 
 ---
 
 ## Requirements
 
-- Python 3.10 or newer
-- [Sage wallet](https://github.com/rigidnetwork/sage) (recommended) or Chia wallet with full node
-- A funded wallet with XCH and the CAT you want to market-make
+- Windows 10 or 11 (64-bit)
+- Python 3.10+
+- [Sage wallet](https://sage.rigidnetwork.io) with RPC enabled
+- XCH + the CAT token you want to trade
 
 ---
 
-## Installation
+## Quick start
 
 ```bash
-# Clone the repository
-git clone https://github.com/your-username/chia-market-maker.git
-cd chia-market-maker
+# Install dependencies
+pip install flask requests python-dotenv pywebview pystray plyer Pillow --break-system-packages
 
-# Install core dependencies
-pip install flask requests python-dotenv --break-system-packages
-
-# Install desktop dependencies (optional — required for desktop mode)
-pip install pywebview pystray plyer Pillow --break-system-packages
-
-# Copy the config template and fill in your values
+# Copy config template
 cp .env.example .env
+# Edit .env with your Sage wallet paths
+
+# Run
+python desktop_app.py
 ```
+
+Or download the Windows installer from [Releases](https://github.com/Lowestofttim/catalyst-bot/releases).
 
 ---
 
 ## Configuration
 
-All settings live in `.env`. Copy `.env.example` to `.env` and configure:
+All settings live in `.env`. The key ones:
 
-| Key | Description |
-|-----|-------------|
-| `WALLET_TYPE` | `sage` (recommended) or `chia` |
-| `SAGE_CERT_PATH` / `SAGE_KEY_PATH` | Path to your Sage mTLS client cert/key |
-| `CAT_ASSET_ID` | The CAT token you want to trade |
-| `SPREAD_BPS` | Bid/ask spread in basis points (e.g. `800` = 8%) |
-| `MAX_ACTIVE_BUY` / `MAX_ACTIVE_SELL` | Max simultaneous offers per side |
-| `DEFAULT_TRADE_XCH` | XCH size per offer |
+| Setting | What it does |
+|---------|-------------|
+| `SAGE_RPC_URL` | Sage wallet RPC endpoint (default `https://127.0.0.1:9257`) |
+| `SAGE_CERT_PATH` / `SAGE_KEY_PATH` | Path to Sage mTLS client cert and key |
+| `CAT_ASSET_ID` | The CAT you want to trade (64-char hex) |
 
-See `.env.example` for the full list with comments.
+Everything else (spread, offer count, tier sizes, reserves) is configured via **Smart Settings** in the GUI — no need to edit `.env` manually for trading parameters.
 
-> **Security note:** Keep your `.env` file private. It contains wallet certificate paths. Never commit it to git.
-
----
-
-## Running
-
-### Desktop mode (recommended)
-
-Opens a native desktop window with system tray icon:
-
-```bash
-python desktop_app.py
-```
-
-### Browser mode (fallback / headless servers)
-
-Opens the GUI in your browser at `http://localhost:5000/`:
-
-```bash
-python desktop_app.py --flask
-```
-
-### Dev mode (desktop window + browser access)
-
-```bash
-python desktop_app.py --dev
-```
+> **Security:** `.env` contains wallet cert paths. Never commit it. The `.gitignore` already excludes it.
 
 ---
 
 ## Architecture
 
 ```
-desktop_app.py          Main entry point — starts Flask, creates PyWebView window, manages tray
-api_server.py           Flask HTTP API + Server-Sent Events for the GUI
-bot_loop.py             Main trading loop orchestrator
-bot_gui.html            Single-file dashboard UI (HTML/CSS/JS)
-config.py               Typed configuration loader from .env
-database.py             SQLite state store (offers, fills, events)
-offer_manager.py        Offer creation, cancellation, lifecycle
-fill_tracker.py         Fill detection and verification
-price_engine.py         Price oracle (Dexie + TibetSwap weighted average)
-risk_manager.py         Circuit breakers, position limits
-coin_manager.py         UTXO management and coin preparation
-sniper.py               Arbitrage gap-closing offers
+desktop_app.py          Entry point — Flask + PyWebView + system tray
+api_server.py           HTTP API + Server-Sent Events for the GUI
+bot_loop.py             Main trading loop (price → requote → fills → repeat)
+bot_gui.html            Dashboard UI (single-file HTML/CSS/JS)
+
+offer_manager.py        Offer creation, cancellation, rolling wave requote
+fill_tracker.py         Fill detection + multi-source verification
+price_engine.py         Price oracle (TibetSwap + Dexie weighted average)
+risk_manager.py         Circuit breakers, position limits, spread calculation
+coin_manager.py         UTXO tracking, tier classification, topup worker
+
 wallet_sage.py          Sage wallet RPC adapter
-wallet_chia.py          Chia wallet RPC adapter
+dexie_manager.py        Dexie API integration (posting, fingerprinting)
+spacescan.py            On-chain verification via Spacescan API
+sniper.py               Arb gap probing
+
+config.py               Typed config loader from .env
+database.py             SQLite state (offers, fills, events, coins)
 ```
+
+---
+
+## Running modes
+
+| Mode | Command | Description |
+|------|---------|-------------|
+| Desktop (default) | `python desktop_app.py` | Native window + system tray |
+| Browser | `python desktop_app.py --flask` | Opens in browser at localhost:5000 |
+| Dev | `python desktop_app.py --dev` | Desktop window + browser access |
 
 ---
 
@@ -118,17 +102,17 @@ wallet_chia.py          Chia wallet RPC adapter
 
 ```bash
 pip install pytest --break-system-packages
-pytest
+cd tests && pytest
 ```
 
 ---
 
 ## Disclaimer
 
-This is beta software. It controls a live trading wallet and submits real blockchain transactions. **There is no warranty.** You can lose funds if the bot misbehaves or if you misconfigure it. Always test with `DRY_RUN=true` first. The authors accept no liability for financial losses.
+This is beta software that controls a live trading wallet. **There is no warranty.** You can lose funds if the bot misbehaves or if you misconfigure it. The authors accept no liability for financial losses.
 
 ---
 
 ## License
 
-[MIT License](LICENSE) — Copyright (c) 2026 Tim
+[MIT License](LICENSE) — Copyright (c) 2026
