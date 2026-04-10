@@ -314,3 +314,4 @@ def classify_and_store_fill(
         return result
     except Exception:
         return FillClassification(trade_id=trade_id)
+
