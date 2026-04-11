@@ -14081,7 +14081,8 @@
                 // and saying "competitors are tighter at 0.0%" is internally
                 // contradictory. Gate the entire branch on competitorBps > 0.
                 const spreadGapBps = baseBps - competitorBps;
-                if (fillsHr === 0 && competitorCount > 0 && competitorBps > 0 && arbGapBps < 60 && !bothSidesAtEdge) {
+                const _spreadCooldownActive = Date.now() < _saSpreadActionCooldownUntil;
+                if (fillsHr === 0 && competitorCount > 0 && competitorBps > 0 && arbGapBps < 60 && !bothSidesAtEdge && !_spreadCooldownActive) {
                     if (tokenQuiet || tokenThin) {
                         const parts = [];
                         if (tokenThin) parts.push('holder depth is still thin');
@@ -14123,7 +14124,7 @@
                     }
                 }
 
-                if (competitorCount === 0 && arbGapBps < 40 && baseBps < 500) {
+                if (competitorCount === 0 && arbGapBps < 40 && baseBps < 500 && !_spreadCooldownActive) {
                     if (tokenQuiet || tokenThin) {
                         pushSuggestion({
                             type: 'info',
@@ -14298,17 +14299,30 @@
         }
 
         // Advisor quick actions
+        let _saSpreadActionCooldownUntil = 0;  // Suppress re-suggest for 60s after acting
+
         function saApplySpread(bps) {
             document.getElementById('lcSpreadSlider').value = bps;
             lcSpreadInput(document.getElementById('lcSpreadSlider'));
             // Actually apply the spread change via API, not just move the slider
             lcApplySpread();
+            // Suppress spread recommendations for 60s so the same suggestion
+            // doesn't immediately re-appear before the change propagates.
+            _saSpreadActionCooldownUntil = Date.now() + 60000;
+            // Immediately refresh advisor so the recommendation disappears
+            if (typeof saUpdateAdvisor === 'function' && window._lastDashboard) {
+                saUpdateAdvisor(window._lastDashboard);
+            }
         }
 
         function saEnableInventory() {
             const el = document.getElementById('lcToggleInventory');
             if (el && !el.classList.contains('on')) {
                 lcToggle('INVENTORY_ENABLED', el);
+            }
+            // Immediately refresh advisor so the recommendation disappears
+            if (typeof saUpdateAdvisor === 'function' && window._lastDashboard) {
+                saUpdateAdvisor(window._lastDashboard);
             }
         }
 
