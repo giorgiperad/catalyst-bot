@@ -13764,7 +13764,11 @@
                 return;
             }
 
-            const baseBps = parseFloat(spreads.base_spread_bps) || 800;
+            const configBaseBps = parseFloat(spreads.base_spread_bps) || 800;
+            // Use the LIVE spread (actual bid-ask gap) for display and comparisons.
+            // Fall back to config base if live data isn't available yet.
+            const liveSpreadBps = parseFloat(mhMetrics.your_spread_bps || 0) || 0;
+            const baseBps = liveSpreadBps > 0 ? liveSpreadBps : configBaseBps;
             const basePct = baseBps / 100;
             const competitorBps = parseFloat(
                 mhMetrics.market_spread_bps ?? mh.competitor_spread_bps ?? 0
