@@ -1846,6 +1846,9 @@ class OfferManager:
 
         Requoting happens when the mid price has moved more than
         REQUOTE_BPS from where we last placed offers.
+
+        Returns True/False for backward compatibility.
+        Use should_requote_graduated() for the severity level.
         """
         if not cfg.AUTO_REQUOTE:
             return False
@@ -1864,12 +1867,48 @@ class OfferManager:
 
         return move_fraction > requote_fraction
 
+    def should_requote_graduated(self, side: str, current_price: Decimal,
+                                 last_quoted_price: Decimal):
+        """Like should_requote but returns a RequoteSeverity level.
+
+        Determines HOW MUCH of the book needs adjusting based on
+        the magnitude of price drift:
+          NONE      — no action (drift < inner threshold)
+          INNER     — adjust inner tier only
+          INNER_MID — adjust inner + mid tiers
+          FULL      — adjust all tiers (still budget-capped)
+          EMERGENCY — offers may be arbable, cancel immediately
+        """
+        from reaction_strategy import RequoteSeverity, classify_drift
+
+        if not cfg.AUTO_REQUOTE:
+            return RequoteSeverity.NONE
+
+        # Cooldown check
+        elapsed = time.time() - self._last_requote_time.get(side, 0)
+        if elapsed < cfg.REQUOTE_COOLDOWN_SECS:
+            return RequoteSeverity.NONE
+
+        if last_quoted_price <= 0:
+            return RequoteSeverity.NONE
+
+        move_fraction = abs(current_price - last_quoted_price) / last_quoted_price
+        return classify_drift(
+            move_fraction,
+            inner_threshold=getattr(cfg, "REQUOTE_DRIFT_INNER", Decimal("0.003")),
+            mid_threshold=getattr(cfg, "REQUOTE_DRIFT_MID", Decimal("0.008")),
+            full_threshold=getattr(cfg, "REQUOTE_DRIFT_FULL", Decimal("0.02")),
+            emergency_threshold=getattr(cfg, "REQUOTE_DRIFT_EMERGENCY", Decimal("0.05")),
+        )
+
     def requote_side(self, side: str, current_price: Decimal,
                      dexie_manager=None, risk_manager=None,
                      spread_fraction: Decimal = None,
                      price_cap: Decimal = None,
                      price_floor: Decimal = None,
-                     live_offer_ids: set = None) -> List[Dict]:
+                     live_offer_ids: set = None,
+                     max_offers: int = 0,
+                     allowed_tiers: set = None) -> List[Dict]:
         """Create-first requote — new offers go up BEFORE old ones come down.
 
         Strategy: use available spare coins to create new offers at the updated
@@ -1891,6 +1930,13 @@ class OfferManager:
         locked coins and creates NEW coins with different IDs. The recycled
         coins need time to confirm on-chain before they become spendable.
 
+        Args:
+            max_offers: If > 0, stop after replacing this many offers.
+                        Remaining offers carry over to the next cycle.
+                        0 means no limit (legacy behaviour).
+            allowed_tiers: If provided, only requote offers in these tiers.
+                           E.g. {"inner", "mid"} for graduated response.
+
         Returns the full list of newly created offers.
         """
         with self._lock:
@@ -1908,6 +1954,23 @@ class OfferManager:
                            if o.get("trade_id") in live_offer_ids]
         open_offers = self._sort_open_offers_for_requote(open_offers, side,
                                                           mid_price=current_price)
+
+        # ── Incremental reaction: filter by tier and cap count ──
+        if allowed_tiers:
+            _before = len(open_offers)
+            open_offers = [o for o in open_offers
+                           if str(o.get("tier") or "mid").lower() in allowed_tiers]
+            if len(open_offers) < _before:
+                log_event("info", "requote_tier_filter",
+                          f"Tier filter ({', '.join(sorted(allowed_tiers))}): "
+                          f"{_before} → {len(open_offers)} offers to process")
+        if max_offers > 0 and len(open_offers) > max_offers:
+            _full = len(open_offers)
+            open_offers = open_offers[:max_offers]
+            log_event("info", "requote_budget_cap",
+                      f"Budget cap: processing {max_offers} of {_full} offers "
+                      f"this cycle (rest deferred)")
+
         total_to_replace = len(open_offers)
 
         log_event("info", "requote_start",

@@ -7699,6 +7699,7 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
             )
 
         _capital_plan = {
+            "total_xch":             round(xch_spendable, 4),
             "xch_reserve":           _xch_reserve,
             "cat_reserve":           _cat_reserve,
             "available_xch":         round(_avail_xch, 4),
@@ -7742,6 +7743,7 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
             )
     else:
         _capital_plan = {
+            "total_xch":     round(xch_spendable, 4),
             "xch_reserve":   _xch_reserve,
             "cat_reserve":   _cat_reserve,
             "available_xch": round(_avail_xch, 4),
@@ -9528,9 +9530,11 @@ def api_coin_prep_status():
                 current_run_id = _coin_prep_state.get("run_id")
                 file_run_id = worker_status.get("run_id")
                 is_current_run = (
-                    not current_run_id  # No run_id tracking yet — trust file
-                    or not file_run_id  # Old-format file — trust if running
-                    or file_run_id == current_run_id  # Same run
+                    current_run_id  # There IS an active run
+                    and (
+                        not file_run_id  # Old-format file — trust if running
+                        or file_run_id == current_run_id  # Same run
+                    )
                 )
 
                 # Only overlay the worker status when it belongs to the
@@ -9559,12 +9563,151 @@ def api_coin_prep_status():
                         _coin_prep_state["running"] = False
                         _coin_prep_state["error"] = w_error
                 else:
-                    # Stale status file from previous run — show as still starting
+                    # Stale status file from previous run.
                     if _coin_prep_state["running"]:
+                        # New run just started — ignore stale file
                         result["phase"] = "idle"
                         result["progress"] = 0
                         result["message"] = "Starting coin preparation..."
                         result["complete"] = False
+                    elif worker_status.get("phase") == "complete":
+                        # Previous run completed — verify the wallet still
+                        # has coins of the RIGHT SIZES before claiming
+                        # "already done".  Uses coin_prep_last.json (which
+                        # stores the tier sizes/counts from the last
+                        # successful prep) + wallet RPC to do disjoint
+                        # size-matching with 5 % tolerance — same logic
+                        # the /api/coin-prep/verify endpoint uses.
+                        _prev_ok = False
+                        _matched_xch = 0
+                        _matched_cat = 0
+                        _target_xch = 0
+                        _target_cat = 0
+                        try:
+                            _prep_path = os.path.join(
+                                os.path.dirname(os.path.abspath(__file__)),
+                                "coin_prep_last.json",
+                            )
+                            if os.path.exists(_prep_path):
+                                with open(_prep_path, "r") as _pf:
+                                    _last = json.load(_pf)
+
+                                from wallet import get_spendable_coins_rpc, WALLET_ID_XCH
+                                from config import cfg as _cfg
+
+                                _cat_wid = int(
+                                    _active_cat.get("wallet_id")
+                                    or getattr(_cfg, "CAT_WALLET_ID", 2)
+                                    or 2
+                                )
+                                _cat_dec = int(
+                                    _active_cat.get("decimals")
+                                    or getattr(_cfg, "CAT_DECIMALS", 3)
+                                )
+                                _tol = 0.05
+
+                                # Fetch spendable coins from wallet
+                                _xr = get_spendable_coins_rpc(WALLET_ID_XCH)
+                                _cr = get_spendable_coins_rpc(_cat_wid)
+                                _xch_coins = [
+                                    r.get("coin", {}).get("amount", 0)
+                                    for r in (_xr or {}).get("records", [])
+                                    if r.get("coin", {}).get("amount", 0) > 0
+                                ] if _xr and _xr.get("success") else []
+                                _cat_coins = [
+                                    r.get("coin", {}).get("amount", 0)
+                                    for r in (_cr or {}).get("records", [])
+                                    if r.get("coin", {}).get("amount", 0) > 0
+                                ] if _cr and _cr.get("success") else []
+
+                                def _alloc_match(coins_list, requests, tol):
+                                    """Allocate coins disjointly to tiers."""
+                                    remaining = list(coins_list)
+                                    allocated = {}
+                                    reqs = list(enumerate(requests))
+                                    reqs.sort(key=lambda x: (-x[1][1], x[0]))
+                                    for _, (tier, target_m, needed) in reqs:
+                                        if target_m <= 0 or needed <= 0:
+                                            allocated[tier] = 0
+                                            continue
+                                        lo = int(target_m * (1 - tol))
+                                        hi = int(target_m * (1 + tol))
+                                        hits = [i for i, a in enumerate(remaining) if lo <= a <= hi]
+                                        take = min(needed, len(hits))
+                                        allocated[tier] = take
+                                        for i in reversed(hits[:take]):
+                                            remaining.pop(i)
+                                    return allocated
+
+                                _all_ok = True
+                                if _last.get("tier_enabled"):
+                                    _tsxch = _last.get("tier_sizes_xch", {})
+                                    _tscat = _last.get("tier_sizes_cat", {})
+                                    _tc = _last.get("tier_counts", {})
+                                    _xreqs = []
+                                    _creqs = []
+                                    for _t, _cnt in _tc.items():
+                                        _cnt = int(_cnt or 0)
+                                        _xsz = float(_tsxch.get(_t, 0))
+                                        _csz = float(_tscat.get(_t, 0))
+                                        _target_xch += _cnt
+                                        if _csz > 0:
+                                            _target_cat += _cnt
+                                        if _xsz > 0 and _cnt > 0:
+                                            _xreqs.append((_t, int(_xsz * 1e12), _cnt))
+                                        if _csz > 0 and _cnt > 0:
+                                            _creqs.append((_t, int(_csz * (10 ** _cat_dec)), _cnt))
+                                    _xa = _alloc_match(_xch_coins, _xreqs, _tol)
+                                    _ca = _alloc_match(_cat_coins, _creqs, _tol)
+                                    for _t, _cnt in _tc.items():
+                                        _cnt = int(_cnt or 0)
+                                        if _cnt <= 0:
+                                            continue
+                                        _xsz = float(_tsxch.get(_t, 0))
+                                        _csz = float(_tscat.get(_t, 0))
+                                        if _xsz > 0 and _xa.get(_t, 0) < _cnt:
+                                            _all_ok = False
+                                        if _csz > 0 and _ca.get(_t, 0) < _cnt:
+                                            _all_ok = False
+                                    _matched_xch = sum(_xa.values())
+                                    _matched_cat = sum(_ca.values())
+                                else:
+                                    # Flat mode
+                                    _xsz = float(_last.get("xch_coin_size") or _last.get("prepared_trade_size_xch") or 0)
+                                    _csz = float(_last.get("cat_coin_size") or 0)
+                                    _xt = int(_last.get("xch_target") or 0)
+                                    _ct = int(_last.get("cat_target") or 0)
+                                    _target_xch = _xt
+                                    _target_cat = _ct
+                                    if _xsz > 0 and _xt > 0:
+                                        _xm = int(_xsz * 1e12)
+                                        _lo = int(_xm * (1 - _tol))
+                                        _hi = int(_xm * (1 + _tol))
+                                        _matched_xch = sum(1 for c in _xch_coins if _lo <= c <= _hi)
+                                        if _matched_xch < _xt:
+                                            _all_ok = False
+                                    if _csz > 0 and _ct > 0:
+                                        _cm = int(_csz * (10 ** _cat_dec))
+                                        _lo = int(_cm * (1 - _tol))
+                                        _hi = int(_cm * (1 + _tol))
+                                        _matched_cat = sum(1 for c in _cat_coins if _lo <= c <= _hi)
+                                        if _matched_cat < _ct:
+                                            _all_ok = False
+
+                                _prev_ok = _all_ok and (_target_xch > 0 or _target_cat > 0)
+                        except Exception:
+                            _prev_ok = False
+
+                        if _prev_ok:
+                            result["phase"] = "complete"
+                            result["complete"] = True
+                            result["xch_coins"] = _matched_xch
+                            result["cat_coins"] = _matched_cat
+                            result["xch_target"] = _target_xch
+                            result["cat_target"] = _target_cat
+                            result["previously_complete"] = True
+                        # else: stale file + wallet doesn't have right
+                        # coin sizes → ignore, result stays idle
             except (json.JSONDecodeError, IOError):
                 pass  # File being written — skip this poll
 

@@ -62,6 +62,13 @@ build/
 # --- Rust / Tauri build artefacts ---
 src-tauri/target/
 
+# --- Alternate build output directories ---
+build2/
+dist2/
+
+# --- Runtime test/state files ---
+smoke_test_state.json
+
 # --- Backup and archive directories (large, no public value) ---
 _backups/
 _archive/

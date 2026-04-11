@@ -63,7 +63,12 @@ MinVersion=10.0.17763
 ; LicenseFile=LICENSE.txt
 
 ; Icons for Add/Remove Programs and shortcuts
-SetupIconFile=bot_icon_new.ico
+SetupIconFile=assets\bot_icon_new.ico
+
+; Wizard branding — MonkeyZoo logo on left panel, app icon top-right.
+; Inno Setup 6+ accepts PNG directly and auto-scales.
+WizardImageFile=assets\MonkeyZoo_Logo.png
+WizardSmallImageFile=assets\bot_icon_new.png
 
 ; Run the app after install (optional checkbox on the final page)
 ; See [Run] section below
@@ -87,12 +92,12 @@ Source: "{#MySourceDir}\.env.example"; DestDir: "{app}"; Flags: ignoreversion on
 
 [Icons]
 ; Start Menu group entry
-Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: startmenuicon; IconFilename: "{app}\bot_icon_new.ico"
+Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: startmenuicon; IconFilename: "{app}\assets\bot_icon_new.ico"
 Name: "{autoprograms}\{#MyAppName} (Help)"; Filename: "{#MyAppURL}"; Tasks: startmenuicon
 Name: "{autoprograms}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"; Tasks: startmenuicon
 
 ; Desktop shortcut (opt-in via task checkbox)
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon; IconFilename: "{app}\bot_icon_new.ico"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon; IconFilename: "{app}\assets\bot_icon_new.ico"
 
 [Run]
 ; Offer to launch the app after install finishes.

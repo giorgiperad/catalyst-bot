@@ -285,14 +285,10 @@ def start_flask_server():
     # Create bot instance
     api_server.create_bot()
 
-    # Start wallet startup manager (sage_node handles wallet startup orchestration).
-    # For Sage: manages the connecting â†’ launching â†’ fingerprint â†’ ready flow.
-    # The GUI's startup screen polls /api/sage/startup-status which depends on this.
-    try:
-        import sage_node
-        sage_node.start_preload()
-    except Exception as e:
-        print(f"  Warning: Wallet startup manager failed: {e}")
+    # Wallet startup is triggered later by the GUI via POST /api/wallet/begin-startup
+    # after the user accepts the disclaimer and chooses how to connect to Sage.
+    # Do NOT call sage_node.start_preload() here — it would auto-launch Sage
+    # before the user reaches the "Connect to Sage" screen.
 
     # Restore log clear-point from database
     try:

@@ -6315,7 +6315,7 @@
         .coin-prep-log-box {
             display: none;
             width: 100%;
-            max-height: 320px;
+            max-height: 180px;
             overflow-y: auto;
             background: linear-gradient(180deg, rgba(13, 17, 23, 0.98), rgba(8, 12, 18, 0.98));
             border: 1px solid rgba(100,116,139,0.28);
@@ -9181,7 +9181,7 @@
                     </div>
 
                     <!-- Live Controls shortcut in Settings -->
-                    <div class="v4-settings-section" style="border-color: rgba(96, 165, 250, 0.3); background: rgba(96, 165, 250, 0.03);" id="settingsLiveSection">
+                    <div class="v4-settings-section v4-settings-blue" style="background: rgba(96, 165, 250, 0.03);" id="settingsLiveSection">
                         <div class="v4-settings-section-title" style="color: var(--info-300);">
                             Live Controls
                             <span style="font-size: 10px; font-weight: 400; color: var(--text-tertiary); margin-left: 8px;">adjustable while running</span>
@@ -9261,7 +9261,7 @@
                     </div>
 
                     <!-- ══ Smart Defaults ══ -->
-                    <div class="v4-settings-section" style="background: rgba(139,92,246,0.08); border-color: rgba(139,92,246,0.25); text-align: center;">
+                    <div class="v4-settings-section v4-settings-purple" style="background: rgba(139,92,246,0.08); text-align: center;">
                         <div style="font-size: 1.05em; font-weight: bold; color: var(--violet-300); margin-bottom: 8px;">Auto-Fill Settings</div>
                         <div class="v4-settings-hint" style="margin-bottom: 10px;">Set your <strong>Reserves</strong> above first, then choose a risk profile, then click — everything is sized from what's left: fee pool → sniper pool → trading capital → tier sizes &amp; offer counts.</div>
 
@@ -9302,11 +9302,13 @@
                         </div>
 
                         <!-- Quick-rerun strip — shown after first successful run -->
-                        <div id="riskProfileRerunStrip" style="display:none; margin-top:10px; align-items:center; justify-content:center; gap:6px; flex-wrap:wrap;">
-                            <span style="font-size:0.78em; color:var(--slate-500);">Switch profile &amp; rerun:</span>
-                            <button type="button" onclick="rerunWithProfile('conservative')" style="cursor:pointer; padding:3px 10px; border-radius:4px; border:1px solid var(--info-300)44; background:rgba(96,165,250,0.08); color:var(--info-300); font-size:0.8em; font-weight:600;" id="rerunBtn_conservative">Conservative</button>
-                            <button type="button" onclick="rerunWithProfile('balanced')"    style="cursor:pointer; padding:3px 10px; border-radius:4px; border:1px solid var(--violet-300)44; background:rgba(139,92,246,0.08); color:var(--violet-300); font-size:0.8em; font-weight:600;" id="rerunBtn_balanced">Balanced</button>
-                            <button type="button" onclick="rerunWithProfile('aggressive')"  style="cursor:pointer; padding:3px 10px; border-radius:4px; border:1px solid var(--orange-400)44; background:rgba(251,146,60,0.08); color:var(--orange-400); font-size:0.8em; font-weight:600;" id="rerunBtn_aggressive">Aggressive</button>
+                        <div id="riskProfileRerunStrip" style="display:none; margin-top:10px; flex-direction:column; align-items:center; gap:6px;">
+                            <span style="font-size:0.78em; color:var(--slate-500);">Switch profile &amp; rerun</span>
+                            <div style="display:flex; align-items:center; justify-content:center; gap:6px;">
+                                <button type="button" onclick="rerunWithProfile('conservative')" style="cursor:pointer; padding:3px 10px; border-radius:4px; border:1px solid var(--info-300)44; background:rgba(96,165,250,0.08); color:var(--info-300); font-size:0.8em; font-weight:600;" id="rerunBtn_conservative">Conservative</button>
+                                <button type="button" onclick="rerunWithProfile('balanced')"    style="cursor:pointer; padding:3px 10px; border-radius:4px; border:1px solid var(--violet-300)44; background:rgba(139,92,246,0.08); color:var(--violet-300); font-size:0.8em; font-weight:600;" id="rerunBtn_balanced">Balanced</button>
+                                <button type="button" onclick="rerunWithProfile('aggressive')"  style="cursor:pointer; padding:3px 10px; border-radius:4px; border:1px solid var(--orange-400)44; background:rgba(251,146,60,0.08); color:var(--orange-400); font-size:0.8em; font-weight:600;" id="rerunBtn_aggressive">Aggressive</button>
+                            </div>
                         </div>
                         <div id="smartDefaultsProgress" class="smart-defaults-progress"><div class="smart-defaults-progress-bar"></div></div>
                         <div id="smartDefaultsStatus" class="smart-defaults-status"></div>
@@ -9328,7 +9330,7 @@
                          separate from the user's hard reserve (set in step 1
                          above) and represents the working budget Smart
                          Settings allocates for coin splits. -->
-                    <div class="v4-settings-section" style="background: rgba(16,185,129,0.05); border: 1px dashed rgba(16,185,129,0.30);">
+                    <div class="v4-settings-section v4-settings-green" style="background: rgba(16,185,129,0.05);">
                         <div class="v4-settings-section-title" style="display: flex; align-items: center; gap: 6px; color: var(--status-success);">
                             Topup Pool
                             <span class="cc-help">?<span class="cc-tooltip" style="text-align: left; min-width: 280px;">
@@ -9749,7 +9751,7 @@
                     </div>
 
                     <!-- ══ SECTION: Bot Operations ══ -->
-                    <div class="v4-settings-section" style="border-color: rgba(139, 92, 246, 0.3);">
+                    <div class="v4-settings-section v4-settings-purple">
                         <div class="v4-settings-section-title" style="color: var(--accent-secondary);">Bot Operations <span class="cc-help">?<span class="cc-tooltip">Core bot features that control how the bot operates. Some of these are critical for normal operation — disabling them may reduce performance or break trading flows.</span></span></div>
 
                         <div class="form-group" style="margin-bottom: 8px;">
@@ -9980,7 +9982,7 @@
 
                 <div class="coin-prep-confirm-aside">
                 <div class="coin-prep-message">
-                    This may take 1-5 minutes depending on wallet size. You can monitor progress below.
+                    This will take around five minutes to complete. You can monitor progress below.
                 </div>
 
                 <div class="coin-prep-guidance">
@@ -10029,7 +10031,7 @@
                 </div>
                 
                 <div style="margin-top: 20px; padding: 10px 14px; background: rgba(59,130,246,0.08); border: 1px solid rgba(59,130,246,0.2); border-radius: 8px; font-size: 0.85em; color: rgba(255,255,255,0.6); line-height: 1.5; text-align: center;">
-                    ℹ️ This process can take several minutes depending on how many coins need to be split. Each split requires a blockchain transaction to confirm.
+                    ℹ️ This will take around five minutes to complete. Each split requires a blockchain transaction to confirm.
                 </div>
                 
                 <div style="margin-top: 12px; display: flex; flex-direction: column; align-items: center; gap: 8px;">
@@ -10040,8 +10042,14 @@
                         Waiting for coin prep logs...
                     </div>
                 </div>
+
+                <!-- Fallback Done button — shown when progress reaches 100% but the
+                     complete view didn't switch automatically (e.g. race condition) -->
+                <div id="cpProgressDoneFallback" style="display:none; margin-top: 20px; text-align: center;">
+                    <button class="btn btn-start btn-primary" onclick="setCoinPrepStatus('done'); showCoinPrepView('complete');" style="padding: 12px 40px; font-size: 1.1em;">Done</button>
+                </div>
             </div>
-            
+
             <!-- COMPLETE VIEW -->
             <div id="coinPrepCompleteView" style="display: none;">
                 <div class="coin-prep-title" style="background: linear-gradient(to right, var(--status-success), var(--success-400)); -webkit-background-clip: text; background-clip: text;">Coins Ready!</div>
@@ -10387,7 +10395,7 @@
                 </ul>
             </div>
             <p style="opacity: 0.7; margin-bottom: 20px; font-size: 0.88em; color: var(--text-secondary);">
-                Coin prep only needs to run once and takes 1-5 minutes.
+                Coin prep only needs to run once and takes around five minutes.
             </p>
             <div class="v4-modal-actions v4-modal-actions--center">
                 <button class="btn btn-start btn-primary" onclick="closeSkipWarningAndGoBack()" style="flex: 1; max-width: 190px;">🪙 Run Coin Prep</button>
@@ -10619,7 +10627,7 @@
                         <li><strong>Wait for the green light</strong> — Watch the sync indicator in the top-left corner. Once it shows green "Ready", your wallet is reachable and ready.</li>
                         <li><strong>Pick your trading pair</strong> — Use the Quick Start panel at the top of the dashboard to choose which CAT token you want to trade.</li>
                         <li><strong>Review your settings</strong> — Click the Quick Start panel's <strong>Review Settings</strong> button to check your spread, trade sizes, and number of offers. The defaults work well for beginners.</li>
-                        <li><strong>Prepare your coins</strong> — Click "Prepare Coins" to split your wallet balance into the right sizes for trading. This usually takes a few minutes depending on confirmations and wallet responsiveness.</li>
+                        <li><strong>Prepare your coins</strong> — Click "Prepare Coins" to split your wallet balance into the right sizes for trading. This will take around five minutes to complete.</li>
                         <li><strong>Hit Start Bot</strong> — Click the green "Start Bot" button and you're live! The bot will create offers and manage them automatically.</li>
                     </ol>
                     <h3 style="color: var(--accent-primary-hover);">Tips for beginners</h3>
@@ -12676,10 +12684,11 @@
                     (data && data.combined_price) ||
                     (bot_state && bot_state.pricing && bot_state.pricing.mid) ||
                     0;
-                if (midPrice) {
-                    priceEl.textContent = parseFloat(midPrice).toFixed(6) + ' XCH';
-                } else if (!tickerName) {
+                if (!tickerName) {
+                    // No token selected yet — hide stale prices from previous session
                     priceEl.textContent = '—';
+                } else if (midPrice) {
+                    priceEl.textContent = parseFloat(midPrice).toFixed(6) + ' XCH';
                 }
                 // If we have a pair but no price yet, leave whatever's there
                 // (either the previous live value or the "Loading..." set by
@@ -16248,34 +16257,45 @@
                         </div>
                     </div>`;
 
-                    // Capital breakdown
+                    // Capital breakdown — all components as % of total wallet, summing to 100%
                     let capitalRow = '';
                     if (cp.available_xch > 0) {
-                        const avail = (cp.available_xch || 0).toFixed(3);
-                        const feePct = cp.fee_pct || 3;
-                        const sniperPct = cp.sniper_pct || 4;
-                        const tradePct = cp.trading_pct || 0;
-                        const feeXch = (cp.fee_pool_xch || 0).toFixed(3);
-                        const sniperXch = (cp.sniper_pool_xch || 0).toFixed(3);
-                        const tradeXch = (cp.trading_xch || 0).toFixed(3);
+                        const totalXch = cp.total_xch || (cp.available_xch + (cp.xch_reserve || 0));
+                        const reserveXch = (cp.xch_reserve || 0);
+                        const feeXch = (cp.fee_pool_xch || 0);
+                        const sniperXch = (cp.sniper_pool_xch || 0);
+                        const topupXch = (cp.topup_buffer_xch || 0);
+                        const tradeXch = (cp.trading_xch || 0);
+                        const pct = (v) => totalXch > 0 ? (v / totalXch * 100).toFixed(1) : '0';
                         const catLimited = cp.n_sell_limited_by_cat ? ' <span style="color:var(--orange-400);">⚠ CAT limited</span>' : '';
-                        capitalRow = `<div style="margin-bottom:6px;">
-                            <span style="color:var(--slate-400);font-size:0.8em;text-transform:uppercase;letter-spacing:0.05em;">Capital  <span style="font-weight:normal;color:var(--slate-500);text-transform:none;letter-spacing:0;">${avail} XCH available after reserve</span></span>
-                            <div style="margin-top:4px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;">
+                        _lastSmartCapitalPlan = Object.assign({}, cp);
+                        capitalRow = `<div data-smart-capital style="margin-bottom:6px;">
+                            <span style="color:var(--slate-400);font-size:0.8em;text-transform:uppercase;letter-spacing:0.05em;">Capital  <span style="font-weight:normal;color:var(--slate-500);text-transform:none;letter-spacing:0;">${totalXch.toFixed(3)} XCH total</span></span>
+                            <div style="margin-top:4px;display:grid;grid-template-columns:repeat(5,1fr);gap:4px;">
+                                <div style="background:rgba(255,255,255,0.04);border-radius:4px;padding:4px 7px;">
+                                    <div style="color:var(--slate-500);font-size:0.78em;">Reserve</div>
+                                    <div style="font-weight:600;">${reserveXch.toFixed(3)} XCH</div>
+                                    <div style="color:var(--slate-500);font-size:0.78em;">${pct(reserveXch)}%</div>
+                                </div>
                                 <div style="background:rgba(255,255,255,0.04);border-radius:4px;padding:4px 7px;">
                                     <div style="color:var(--slate-500);font-size:0.78em;">Fee pool</div>
-                                    <div style="font-weight:600;">${feeXch} XCH</div>
-                                    <div style="color:var(--slate-500);font-size:0.78em;">${feePct}%</div>
+                                    <div style="font-weight:600;">${feeXch.toFixed(3)} XCH</div>
+                                    <div style="color:var(--slate-500);font-size:0.78em;">${pct(feeXch)}%</div>
                                 </div>
                                 <div style="background:rgba(255,255,255,0.04);border-radius:4px;padding:4px 7px;">
                                     <div style="color:var(--slate-500);font-size:0.78em;">Sniper pool</div>
-                                    <div style="font-weight:600;">${sniperXch} XCH</div>
-                                    <div style="color:var(--slate-500);font-size:0.78em;">${sniperPct}%</div>
+                                    <div style="font-weight:600;">${sniperXch.toFixed(3)} XCH</div>
+                                    <div style="color:var(--slate-500);font-size:0.78em;">${pct(sniperXch)}%</div>
+                                </div>
+                                <div style="background:rgba(255,255,255,0.04);border-radius:4px;padding:4px 7px;">
+                                    <div style="color:var(--slate-500);font-size:0.78em;">Top-up pool</div>
+                                    <div style="font-weight:600;">${topupXch.toFixed(3)} XCH</div>
+                                    <div style="color:var(--slate-500);font-size:0.78em;">${pct(topupXch)}%</div>
                                 </div>
                                 <div style="background:rgba(34,197,94,0.08);border:1px solid rgba(34,197,94,0.2);border-radius:4px;padding:4px 7px;">
                                     <div style="color:var(--slate-500);font-size:0.78em;">Trading</div>
-                                    <div style="font-weight:600;color:var(--success-200);">${tradeXch} XCH</div>
-                                    <div style="color:var(--slate-500);font-size:0.78em;">${tradePct}%</div>
+                                    <div style="font-weight:600;color:var(--success-200);">${tradeXch.toFixed(3)} XCH</div>
+                                    <div style="color:var(--slate-500);font-size:0.78em;">${pct(tradeXch)}%</div>
                                 </div>
                             </div>${catLimited}
                         </div>`;
@@ -16383,8 +16403,8 @@
         // Edits silently invalidate the recommended sizes/counts/spares — Tim
         // explicitly asked for either dynamic recompute OR a re-run prompt.
         const SMART_SETTINGS_WATCHED_INPUTS = [
-            'configXchReserveAmount', 'configCatReserveAmount',
-            'configXchReservePercent', 'configCatReservePercent',
+            'configXchReserve', 'configCatReserve',
+            'configTopupPoolPct',
             'configTradeXch', 'configMaxBuy', 'configMaxSell',
             'configTierEnabled', 'configBuyLadderReversed',
             'configInnerSizeXch', 'configMidSizeXch',
@@ -16404,6 +16424,81 @@
         ];
         let _smartSettingsAppliedSnapshot = null;
         let _smartSettingsBannerListenersBound = false;
+
+        // Stashed capital plan from last Smart Settings run — used for live
+        // recalculation when the user tweaks topup pool % or reserve.
+        let _lastSmartCapitalPlan = null;
+
+        /**
+         * Recalculate and re-render the capital breakdown in the Smart Settings
+         * result card when the user changes topup pool % after Smart Settings ran.
+         */
+        function recalcCapitalBreakdown() {
+            const cp = _lastSmartCapitalPlan;
+            if (!cp || !cp.total_xch) return;
+
+            const totalXch = cp.total_xch;
+            const reserveXch = cp.xch_reserve || 0;
+            const feeXch = cp.fee_pool_xch || 0;
+            const sniperXch = cp.sniper_pool_xch || 0;
+            const postPools = Math.max(0, totalXch - reserveXch - feeXch - sniperXch);
+
+            // Read current topup % from the input
+            const topupPctRaw = parseFloat(document.getElementById('configTopupPoolPct')?.value) || 15;
+            const topupPct = Math.max(5, Math.min(35, topupPctRaw)) / 100;
+            const topupXch = +(postPools * topupPct).toFixed(4);
+            const tradeXch = +(postPools - topupXch).toFixed(4);
+
+            const pct = (v) => totalXch > 0 ? (v / totalXch * 100).toFixed(1) : '0';
+            const catLimited = cp.n_sell_limited_by_cat ? ' <span style="color:var(--orange-400);">⚠ CAT limited</span>' : '';
+
+            // Find and update the CAPITAL section inside the result body
+            const resultBody = document.getElementById('smartDefaultsResultBody');
+            if (!resultBody) return;
+
+            // The capital row is identified by looking for the grid inside the result
+            const capitalDiv = resultBody.querySelector('[data-smart-capital]');
+            if (!capitalDiv) return;
+
+            capitalDiv.innerHTML = `
+                <span style="color:var(--slate-400);font-size:0.8em;text-transform:uppercase;letter-spacing:0.05em;">Capital  <span style="font-weight:normal;color:var(--slate-500);text-transform:none;letter-spacing:0;">${totalXch.toFixed(3)} XCH total</span></span>
+                <div style="margin-top:4px;display:grid;grid-template-columns:repeat(5,1fr);gap:4px;">
+                    <div style="background:rgba(255,255,255,0.04);border-radius:4px;padding:4px 7px;">
+                        <div style="color:var(--slate-500);font-size:0.78em;">Reserve</div>
+                        <div style="font-weight:600;">${reserveXch.toFixed(3)} XCH</div>
+                        <div style="color:var(--slate-500);font-size:0.78em;">${pct(reserveXch)}%</div>
+                    </div>
+                    <div style="background:rgba(255,255,255,0.04);border-radius:4px;padding:4px 7px;">
+                        <div style="color:var(--slate-500);font-size:0.78em;">Fee pool</div>
+                        <div style="font-weight:600;">${feeXch.toFixed(3)} XCH</div>
+                        <div style="color:var(--slate-500);font-size:0.78em;">${pct(feeXch)}%</div>
+                    </div>
+                    <div style="background:rgba(255,255,255,0.04);border-radius:4px;padding:4px 7px;">
+                        <div style="color:var(--slate-500);font-size:0.78em;">Sniper pool</div>
+                        <div style="font-weight:600;">${sniperXch.toFixed(3)} XCH</div>
+                        <div style="color:var(--slate-500);font-size:0.78em;">${pct(sniperXch)}%</div>
+                    </div>
+                    <div style="background:rgba(255,255,255,0.04);border-radius:4px;padding:4px 7px;">
+                        <div style="color:var(--slate-500);font-size:0.78em;">Top-up pool</div>
+                        <div style="font-weight:600;">${topupXch.toFixed(3)} XCH</div>
+                        <div style="color:var(--slate-500);font-size:0.78em;">${pct(topupXch)}%</div>
+                    </div>
+                    <div style="background:rgba(34,197,94,0.08);border:1px solid rgba(34,197,94,0.2);border-radius:4px;padding:4px 7px;">
+                        <div style="color:var(--slate-500);font-size:0.78em;">Trading</div>
+                        <div style="font-weight:600;color:var(--success-200);">${tradeXch.toFixed(3)} XCH</div>
+                        <div style="color:var(--slate-500);font-size:0.78em;">${pct(tradeXch)}%</div>
+                    </div>
+                </div>${catLimited}`;
+
+            // Also update the topup XCH/CAT budget fields to stay in sync
+            const topupXchEl = document.getElementById('configTopupPoolXch');
+            if (topupXchEl) topupXchEl.value = topupXch.toFixed(4);
+            const mid = Number(bot_state?.pricing?.mid || 0);
+            if (mid > 0) {
+                const topupCatEl = document.getElementById('configTopupPoolCat');
+                if (topupCatEl) topupCatEl.value = Math.round(topupXch / mid).toLocaleString();
+            }
+        }
 
         function _readSmartWatchedValue(id) {
             const el = document.getElementById(id);
@@ -16455,6 +16550,11 @@
                 el.addEventListener('input', handler);
                 el.addEventListener('change', handler);
             }
+            // Live-recalculate capital breakdown when topup pool % changes
+            const topupPctEl = document.getElementById('configTopupPoolPct');
+            if (topupPctEl) {
+                topupPctEl.addEventListener('input', () => recalcCapitalBreakdown());
+            }
             _smartSettingsBannerListenersBound = true;
         }
 
@@ -16469,6 +16569,7 @@
 
         function clearSmartSettingsAppliedState() {
             _smartSettingsAppliedSnapshot = null;
+            _lastSmartCapitalPlan = null;
             setSmartSettingsBannerVisible(false);
         }
 
@@ -18185,8 +18286,9 @@
             updateReserveDisplay(type);
             updateCoinPrepPreview();
             validateSettingsForm();
+            checkSmartSettingsDirty();
         }
-        
+
         function updateReserveFromInput(type) {
             const input = document.getElementById(type === 'xch' ? 'configXchReserve' : 'configCatReserve');
             const slider = document.getElementById(type === 'xch' ? 'configXchReserveSlider' : 'configCatReserveSlider');
@@ -18203,8 +18305,9 @@
             if (pctLabel) pctLabel.textContent = Math.min(75, pct) + '%';
             
             updateReserveDisplay(type);
+            checkSmartSettingsDirty();
         }
-        
+
         function updateReserveDisplay(type) {
             const balance = getWalletBalance(type);
             const input = document.getElementById(type === 'xch' ? 'configXchReserve' : 'configCatReserve');
@@ -18840,7 +18943,7 @@
                 console.error('[CAT SWITCH] Error:', error);
                 showToast('Error selecting CAT: ' + formatError(error), 'error');
             } finally {
-                const minOverlayMs = 350;
+                const minOverlayMs = 2000;
                 const remaining = minOverlayMs - (Date.now() - switchStartedAt);
                 if (remaining > 0) {
                     await new Promise(resolve => setTimeout(resolve, remaining));
@@ -22313,7 +22416,7 @@
                         ${ts.available ? `
                           <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 16px;font-size:0.92em;">
                             <div style="color:var(--text-secondary);">AMM price</div><div>${ts.amm_price ? Number(ts.amm_price).toFixed(8) : '—'}</div>
-                            <div style="color:var(--text-secondary);">Drift from quoted</div><div>${ts.drift_bps ? ts.drift_bps + ' bps' : '—'}</div>
+                            <div style="color:var(--text-secondary);">Drift from quoted</div><div>${ts.drift_bps != null ? (ts.drift_bps / 100).toFixed(2) + '%' : '—'}</div>
                             <div style="color:var(--text-secondary);">Arb pressure</div><div>${escapeHtml(ts.arb_pressure_label || '—')}</div>
                             <div style="color:var(--text-secondary);">Total polls</div><div>${fmtN(ts.total_polls)}</div>
                             <div style="color:var(--text-secondary);">Failed polls</div><div>${fmtN(ts.failed_polls)}</div>
@@ -22922,18 +23025,32 @@
                         ? `${data.cat_coins}/${data.cat_target || '?'}` : '';
 
                     // Only append when message changes (avoids flooding)
-                    const statusLine = msg || phase;
-                    if (statusLine && statusLine !== _coinPrepLastMsg) {
-                        _coinPrepLastMsg = statusLine;
-                        const coins = [xch && `XCH ${xch}`, cat && `CAT ${cat}`]
-                            .filter(Boolean).join(' · ');
-                        const detail = coins ? ` (${coins})` : '';
-                        _coinPrepMsgHistory.push(
-                            `${now} [${pct}%] ${statusLine}${detail}`
-                        );
-                        // Cap at 200 lines
-                        if (_coinPrepMsgHistory.length > 200) {
-                            _coinPrepMsgHistory = _coinPrepMsgHistory.slice(-150);
+                    const rawLine = msg || phase;
+                    if (rawLine && rawLine !== _coinPrepLastMsg) {
+                        _coinPrepLastMsg = rawLine;
+                        // Apply the same simplification used for log_lines
+                        const simplified = _cpSimplify(rawLine);
+                        if (!simplified || !_cpFilterLine(simplified)) {
+                            // skip filtered/empty lines
+                        } else {
+                            const coins = [xch && `XCH ${xch}`, cat && `CAT ${cat}`]
+                                .filter(Boolean).join(' · ');
+                            const detail = coins ? ` (${coins})` : '';
+                            const formatted = `${now} [${pct}%] ${simplified}${detail}`;
+                            // Collapse repeated verifying/waiting lines —
+                            // replace the last one instead of appending
+                            const isRepeat = /Verifying|Waiting.*\d+s/.test(simplified);
+                            const lastIsRepeat = _coinPrepMsgHistory.length > 0
+                                && /Verifying|Waiting.*\d+s/.test(_coinPrepMsgHistory[_coinPrepMsgHistory.length - 1]);
+                            if (isRepeat && lastIsRepeat) {
+                                _coinPrepMsgHistory[_coinPrepMsgHistory.length - 1] = formatted;
+                            } else {
+                                _coinPrepMsgHistory.push(formatted);
+                            }
+                            // Cap at 200 lines
+                            if (_coinPrepMsgHistory.length > 200) {
+                                _coinPrepMsgHistory = _coinPrepMsgHistory.slice(-150);
+                            }
                         }
                     }
                     lines = _coinPrepMsgHistory.length
@@ -24035,6 +24152,9 @@
             _botStartingAt = Date.now();  // Safety timeout tracking
             startBtn.disabled = true;
             startBtn.innerHTML = '⏳ Starting...';
+            // Also give feedback on the CTA start button (startup guide)
+            const ctaBtn = document.getElementById('startupReadyCtaBtn');
+            if (ctaBtn) { ctaBtn.disabled = true; ctaBtn.textContent = '⏳ Starting...'; }
             updateStartupChecklist(bot_state);
             updateDashboardStartupLayout(bot_state);
             showToast('Starting bot — running pre-flight checks...', 'info');
@@ -26866,9 +26986,15 @@ function closeCtgErrorModal() {
                 if (bar) bar.style.width = Math.min(progress, 100) + '%';
                 const pctEl = document.getElementById('cpProgressPct');
                 if (pctEl) pctEl.textContent = Math.round(progress) + '%';
-                
+
+                // Show fallback Done button when progress hits 100% — safety net
+                // in case the complete view switch fails for any reason
+                const fallbackBtn = document.getElementById('cpProgressDoneFallback');
+                if (fallbackBtn) fallbackBtn.style.display = progress >= 100 ? 'block' : 'none';
+
                 // Update phase with animated dots
                 const phaseEl = document.getElementById('cpProgressPhase');
+                const msgHasStep = !!(status.message && status.message.includes('Step '));
                 if (phaseEl) {
                     const phaseLabels = {
                         'idle': 'Getting ready',
@@ -26886,7 +27012,6 @@ function closeCtgErrorModal() {
                     // which is shown separately in cpProgressMessage below).
                     // Extract just the step number and a short label from the message.
                     let label;
-                    const msgHasStep = status.message && status.message.includes('Step ');
                     if (msgHasStep) {
                         const stepMatch = status.message.match(/Step (\d+\/\d+)/);
                         const stepNum = stepMatch ? stepMatch[1] : '';
@@ -26910,7 +27035,7 @@ function closeCtgErrorModal() {
                         phaseEl.classList.remove('active-phase');
                     }
                 }
-                
+
                 // Update message — hide when phase label already shows the step info
                 // to avoid showing the same text twice
                 const msgEl = document.getElementById('cpProgressMessage');
@@ -26924,30 +27049,38 @@ function closeCtgErrorModal() {
                     }
                 }
                 
-                // Update coin counts (show current / target if target available)
+                // Update coin counts — show current / target, handling 0 as valid
                 const xchEl = document.getElementById('cpProgressXchCoins');
-                if (xchEl && status.xch_coins !== undefined) {
-                    xchEl.textContent = status.xch_target
-                        ? `${status.xch_coins} / ${status.xch_target}`
-                        : status.xch_coins;
+                if (xchEl) {
+                    const xc = status.xch_coins;
+                    const xt = status.xch_target;
+                    if (xc != null || xt != null) {
+                        xchEl.textContent = xt ? `${xc || 0} / ${xt}` : `${xc || 0}`;
+                    }
                 }
 
                 const catEl = document.getElementById('cpProgressCatCoins');
-                if (catEl && status.cat_coins !== undefined) {
-                    catEl.textContent = status.cat_target
-                        ? `${status.cat_coins} / ${status.cat_target}`
-                        : status.cat_coins;
+                if (catEl) {
+                    const cc = status.cat_coins;
+                    const ct = status.cat_target;
+                    if (cc != null || ct != null) {
+                        catEl.textContent = ct ? `${cc || 0} / ${ct}` : `${cc || 0}`;
+                    }
                 }
                 
                 // Check if complete — multiple detection paths to avoid stuck modal:
                 // 1. phase === 'complete' (explicit completion signal)
-                // 2. success === true (worker reported success)
+                // 2. complete flag set (backend sets this from worker status file)
                 // 3. subprocess exited + progress >= 100 + not idle
+                // 4. progress >= 100 and message contains 'Complete' (fallback)
+                // NOTE: Do NOT check status.success here — that's the API call
+                // success flag, not the coin prep completion flag.
                 const isComplete = status.phase === 'complete'
-                    || status.success === true
-                    || (!status.running && progress >= 100 && status.phase !== 'idle');
+                    || status.complete === true
+                    || (!status.running && progress >= 100 && status.phase !== 'idle')
+                    || (progress >= 100 && typeof status.message === 'string' && /complete/i.test(status.message));
                 if (isComplete) {
-                    console.log('[CoinPrep] Completion detected:', status.phase, status.success, status.running, progress);
+                    console.log('[CoinPrep] Completion detected:', status.phase, status.success, status.running, progress, status.complete);
                 }
                 if (isComplete) {
                     // Stop polling
@@ -26956,22 +27089,18 @@ function closeCtgErrorModal() {
                         coinPrepPollInterval = null;
                     }
                     
-                    // Carry final counts to complete view (show current / target if available)
+                    // Carry final counts to complete view
                     const completeXch = document.getElementById('cpCompleteXchCoins');
                     const completeCat = document.getElementById('cpCompleteCatCoins');
                     if (completeXch) {
                         const xc = status.xch_coins;
                         const xt = status.xch_target;
-                        completeXch.textContent = (xc != null && xc !== undefined)
-                            ? (xt ? `${xc} / ${xt}` : xc)
-                            : '--';
+                        completeXch.textContent = xt ? `${xc || xt} / ${xt}` : `${xc || 0}`;
                     }
                     if (completeCat) {
                         const cc = status.cat_coins;
                         const ct = status.cat_target;
-                        completeCat.textContent = (cc != null && cc !== undefined)
-                            ? (ct ? `${cc} / ${ct}` : cc)
-                            : '--';
+                        completeCat.textContent = ct ? `${cc || ct} / ${ct}` : `${cc || 0}`;
                     }
                     
                     // Show complete view
@@ -27385,7 +27514,7 @@ function updateAmmStatusBar(data) {
     if (driftEl) {
         if (data.drift_bps !== null && data.drift_bps !== undefined) {
             const drift = parseFloat(data.drift_bps);
-            driftEl.textContent = drift.toFixed(1) + ' bps';
+            driftEl.textContent = (drift / 100).toFixed(2) + '%';
             if (drift >= driftThreshold) {
                 driftEl.style.color = 'var(--status-danger)';
                 if (driftBadge) driftBadge.style.display = 'inline';
@@ -27423,7 +27552,7 @@ function updateAmmStatusBar(data) {
         if (data.buffer_enabled) {
             bufferBadge.style.display = 'inline';
             bufferBadge.textContent = isWidened
-                ? `BUFFER ${effBps.toFixed(0)}bps (×${parseFloat(dynBuf.multiplier||1).toFixed(1)})`
+                ? `BUFFER ${(effBps/100).toFixed(1)}% (×${parseFloat(dynBuf.multiplier||1).toFixed(1)})`
                 : 'BUFFER ON';
             bufferBadge.style.background = isWidened
                 ? 'rgba(239,68,68,0.15)' : 'rgba(251,191,36,0.15)';

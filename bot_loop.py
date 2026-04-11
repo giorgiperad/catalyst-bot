@@ -3492,6 +3492,13 @@ class BotLoop:
             all_open = open_buys + open_sells
             expiring_tids = self.offer_manager.detect_expiring_offers(
                 all_open, refresh_before_secs=cfg.OFFER_REFRESH_BEFORE)
+            # ── Incremental reaction: cap expiry refreshes per cycle ──
+            _max_refresh = int(getattr(cfg, "CYCLE_MAX_EXPIRY_REFRESH", 4) or 4)
+            if len(expiring_tids) > _max_refresh:
+                log_event("info", "step7_refresh_capped",
+                          f"Expiry refresh: {len(expiring_tids)} expiring but "
+                          f"capping at {_max_refresh} per cycle (rest deferred)")
+                expiring_tids = expiring_tids[:_max_refresh]
             if expiring_tids:
                 log_event("info", "step7_refresh",
                           f"Pre-emptive refresh: cancelling {len(expiring_tids)} "
@@ -4869,14 +4876,41 @@ class BotLoop:
                           f"Fill protection active for {side} side — skipping requote")
                 continue
 
-            # Check if requote needed — either forced (convergence) or price moved
-            should_requote = forced or self.offer_manager.should_requote(side, mid_price, last_price)
+            # Check if requote needed — graduated severity check
+            from reaction_strategy import (
+                RequoteSeverity, tiers_for_severity, CycleBudget as _CB,
+            )
+            severity = RequoteSeverity.NONE
+            if forced:
+                # Forced convergence — use graduated severity based on drift magnitude
+                if last_price > 0:
+                    _move_frac = abs(mid_price - last_price) / last_price
+                    from reaction_strategy import classify_drift
+                    severity = classify_drift(
+                        _move_frac,
+                        inner_threshold=getattr(cfg, "REQUOTE_DRIFT_INNER", Decimal("0.003")),
+                        mid_threshold=getattr(cfg, "REQUOTE_DRIFT_MID", Decimal("0.008")),
+                        full_threshold=getattr(cfg, "REQUOTE_DRIFT_FULL", Decimal("0.02")),
+                        emergency_threshold=getattr(cfg, "REQUOTE_DRIFT_EMERGENCY", Decimal("0.05")),
+                    )
+                    # Forced convergence should always do at least INNER
+                    if severity == RequoteSeverity.NONE:
+                        severity = RequoteSeverity.INNER
+                else:
+                    severity = RequoteSeverity.FULL
+            else:
+                severity = self.offer_manager.should_requote_graduated(side, mid_price, last_price)
+
+            should_requote = severity != RequoteSeverity.NONE
 
             if should_requote:
-                reason = "convergence tightening" if forced else f"price moved {last_price:.8f} -> {mid_price:.8f}"
+                reason = (f"convergence tightening [{severity.value}]"
+                          if forced
+                          else f"price moved {last_price:.8f} -> {mid_price:.8f} [{severity.value}]")
                 print(f"\n   [REQUOTE] {side} side ({reason})", flush=True)
                 log_event("info", "requoting",
-                          f"Requoting {side} side ({reason})")
+                          f"Requoting {side} side ({reason})",
+                          data={"severity": severity.value})
 
                 # Clear force flag BEFORE requoting (so it doesn't re-trigger)
                 if forced:
@@ -4893,6 +4927,14 @@ class BotLoop:
                         f"Anchoring {side} requote to probe edge: mid {mid_price:.8f} "
                         f"-> {requote_mid:.8f}",
                     )
+
+                # ── Incremental reaction: tier filter + budget cap ──
+                _allowed_tiers = tiers_for_severity(severity)
+                _max_offers = getattr(cfg, "CYCLE_MAX_CANCELS", 6)
+                # For EMERGENCY, no budget cap — cancel everything arbable
+                if severity == RequoteSeverity.EMERGENCY:
+                    _max_offers = 0  # 0 = no limit
+
                 _live_ids_req = current_buy_ids if side == "buy" else current_sell_ids
                 requote_result = self.offer_manager.requote_side(
                     side, requote_mid, dexie_manager=self.dexie_manager,
@@ -4901,6 +4943,9 @@ class BotLoop:
                     price_cap=price_cap,
                     price_floor=price_floor,
                     live_offer_ids=_live_ids_req,
+                    max_offers=_max_offers,
+                    allowed_tiers=_allowed_tiers if severity not in (
+                        RequoteSeverity.FULL, RequoteSeverity.EMERGENCY) else None,
                 )
                 if isinstance(requote_result, dict):
                     new_offers = requote_result.get("offers", [])

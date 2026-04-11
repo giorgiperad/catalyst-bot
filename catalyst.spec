@@ -48,7 +48,9 @@ _image_files = [
     (os.path.join(_assets_dir, f), 'assets')
     for f in ('bot_icon_new.png', 'bot_icon_new.ico', 'favicon.ico',
               'dexie_logo_official.png', 'dexie_logo_official.ico',
-              'sage_logo_official.png', 'tibetswap_logo_official.png')
+              'sage_logo_official.png', 'tibetswap_logo_official.png',
+              'MonkeyZoo_Logo.png', 'monkeyzoo-logo-1.gif',
+              'spacescan-logo-192.webp')
     if os.path.isfile(os.path.join(_assets_dir, f))
 ]
 # Also check root for backward compat
@@ -174,6 +176,7 @@ _hiddenimports = [
     'event_taxonomy',
     'offer_lifecycle',
     'user_secrets',
+    'reaction_strategy',
 ]
 
 # ---------------------------------------------------------------------------
@@ -244,7 +247,7 @@ exe = EXE(  # noqa: F821
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=os.path.join(_HERE, 'bot_icon_new.ico') if os.path.isfile(os.path.join(_HERE, 'bot_icon_new.ico')) else None,
+    icon=os.path.join(_assets_dir, 'bot_icon_new.ico') if os.path.isfile(os.path.join(_assets_dir, 'bot_icon_new.ico')) else None,
 )
 
 # ---------------------------------------------------------------------------

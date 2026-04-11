@@ -255,6 +255,25 @@ class Config:
         self.REQUOTE_BATCH_SIZE = _int("REQUOTE_BATCH_SIZE", 5)
         self.REQUOTE_COIN_FREE_WAIT = _int("REQUOTE_COIN_FREE_WAIT", 5)
 
+        # ----- Incremental Reaction Strategy (cycle budget) -----
+        # Max on-chain actions per cycle. The bot processes the most
+        # urgent offers first (inner tier, highest staleness) and defers
+        # the rest to subsequent cycles. This prevents costly full-ladder
+        # rebuilds from a single price move.
+        self.CYCLE_MAX_CANCELS = _int("CYCLE_MAX_CANCELS", 6)
+        self.CYCLE_MAX_CREATES = _int("CYCLE_MAX_CREATES", 6)
+        # Max expiry refreshes per cycle (prevents mass-refresh when many
+        # offers approach expiry at the same time).
+        self.CYCLE_MAX_EXPIRY_REFRESH = _int("CYCLE_MAX_EXPIRY_REFRESH", 4)
+        # Per-tier drift thresholds (fraction, not bps) for graduated
+        # requoting.  Only tiers whose drift exceeds their threshold are
+        # requoted.  Uses REQUOTE_BPS and AMM_DRIFT_REQUOTE_BPS as the
+        # first two defaults to stay consistent with existing behaviour.
+        self.REQUOTE_DRIFT_INNER = _decimal("REQUOTE_DRIFT_INNER", "0.003")   # 30 bps
+        self.REQUOTE_DRIFT_MID   = _decimal("REQUOTE_DRIFT_MID",   "0.008")   # 80 bps
+        self.REQUOTE_DRIFT_FULL  = _decimal("REQUOTE_DRIFT_FULL",  "0.02")    # 200 bps
+        self.REQUOTE_DRIFT_EMERGENCY = _decimal("REQUOTE_DRIFT_EMERGENCY", "0.05")  # 500 bps
+
         # ----- Reserves -----
         #
         # Two-tier reserve system (F49, 2026-04-09):
