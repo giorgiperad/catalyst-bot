@@ -24894,6 +24894,12 @@
                     _gapCloserFloorBps = result.arb_floor_bps || 0;
                     _gapCloserSteps = 0;
                     updateGapCloserButton();
+                    // Immediately refresh Recommendations so the "Close the Gap"
+                    // suggestion disappears the instant the user activates it,
+                    // rather than waiting for the next dashboard poll.
+                    if (typeof saUpdateAdvisor === 'function' && window._lastDashboard) {
+                        saUpdateAdvisor(window._lastDashboard);
+                    }
                     addLogEntry('success',
                         `📈 Close the Gap ON — started at ${bps2pct(result.spread_bps)} ` +
                         `(floor: ${bps2pct(result.arb_floor_bps)}), ${sizeXch} XCH each`);
