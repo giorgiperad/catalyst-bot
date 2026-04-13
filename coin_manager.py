@@ -1605,8 +1605,8 @@ class CoinManager:
                 return
 
             # No coins to promote — reserve is empty (will be created from
-            # freed coins when offers fill/cancel)
-            log_event("info", "no_reserve_available",
+            # freed coins when offers fill/cancel, or consolidated by Strategy 3)
+            log_event("debug", "no_reserve_available",
                       f"No {wallet_type.upper()} reserve coin — will create from freed coins")
 
         except Exception as e:

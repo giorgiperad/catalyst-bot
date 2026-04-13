@@ -1419,8 +1419,8 @@
             word-break: break-all;
             white-space: normal;
         }
-        .v4-hero-value.positive { color: var(--status-success); }
-        .v4-hero-value.negative { color: var(--status-danger); }
+        .v4-hero-value.positive { color: var(--status-warning); }
+        .v4-hero-value.negative { color: var(--info-300); }
         .v4-hero-value.neutral  { color: var(--text-secondary); }
         .data-pending { opacity: 0.35; }
         .data-freshness-warn { color: var(--status-warning); font-size: 0.8em; padding: 4px 10px; background: rgba(245,158,11,0.1); border-radius: 4px; border: 1px solid rgba(245,158,11,0.25); }
@@ -1466,7 +1466,7 @@
             margin-top: 2px;
         }
         .v4-market-value.bid { color: var(--status-success); }
-        .v4-market-value.ask { color: var(--status-danger); }
+        .v4-market-value.ask { color: var(--text-primary); }
 
         .dashboard-startup-guide {
             position: relative;
@@ -8922,9 +8922,9 @@
                         <div style="color: rgba(255,255,255,0.5); font-size: 11px; margin-bottom: 4px;">Best Live Bid <span class="cc-help">?<span class="cc-tooltip">Highest live buy price we can currently see across the Dexie book plus this bot's active offers.</span></span></div>
                         <div id="intelBestBid" style="color: var(--status-success); font-size: 18px; font-weight: 700;">—</div>
                     </div>
-                    <div style="background: rgba(239,68,68,0.1); border: 1px solid rgba(239,68,68,0.3); border-radius: 8px; padding: 12px; text-align: center;">
+                    <div style="background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.15); border-radius: 8px; padding: 12px; text-align: center;">
                         <div style="color: rgba(255,255,255,0.5); font-size: 11px; margin-bottom: 4px;">Best Live Ask <span class="cc-help">?<span class="cc-tooltip">Lowest live sell price we can currently see across the Dexie book plus this bot's active offers.</span></span></div>
-                        <div id="intelBestAsk" style="color: var(--status-danger); font-size: 18px; font-weight: 700;">—</div>
+                        <div id="intelBestAsk" style="color: var(--text-primary); font-size: 18px; font-weight: 700;">—</div>
                     </div>
                     <div style="background: rgba(59,130,246,0.1); border: 1px solid rgba(59,130,246,0.3); border-radius: 8px; padding: 12px; text-align: center;">
                         <div style="color: rgba(255,255,255,0.5); font-size: 11px; margin-bottom: 4px;">Thin Side <span class="cc-help">?<span class="cc-tooltip">Which side of the orderbook has less liquidity. The bot can tighten on the thin side to attract fills when liquidity is scarce.</span></span></div>
@@ -22143,6 +22143,25 @@
                 return { icon: '📊', msg: 'Round-trip PnL matched', cls: 'la-success' };
 
             // --- Offers ---
+            // Single offer creation (e.g. replacement after a fill)
+            // Message format: "Offer #1/1 sell @ 0.00013106 | size=3.4401 XCH | ..."
+            if (eventType === 'offer_created') {
+                const seqMatch = m.match(/#(\d+)\/(\d+)/);
+                // Only surface single-offer events (#X/1) to avoid spamming the
+                // activity feed when all 24 offers are created at startup (#1/24 … #24/24)
+                if (!seqMatch || seqMatch[2] !== '1') return null;
+                const sideMatch = m.match(/\b(buy|sell)\b/i);
+                const side = sideMatch ? sideMatch[1].toUpperCase() : '';
+                const priceMatch = m.match(/@ ([0-9.]+)/);
+                const price = priceMatch ? parseFloat(priceMatch[1]) : null;
+                let msg = side ? 'New ' + side + ' offer' : 'New offer';
+                if (price) msg += ' @ ' + price.toFixed(8);
+                return {
+                    icon: '📋',
+                    msg: msg,
+                    cls: side === 'BUY' ? 'la-buy' : (side === 'SELL' ? 'la-sell' : 'la-info'),
+                };
+            }
             if (eventType === 'offers_created') {
                 const countMatch = m.match(/(\d+)/);
                 const n = countMatch ? countMatch[1] : '';
