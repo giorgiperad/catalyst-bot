@@ -80,6 +80,10 @@ _bytes_written = 0
 # Ring buffer for verbose context (collections.deque is thread-safe for append/iter)
 _ring_buffer = collections.deque(maxlen=RING_BUFFER_SIZE)
 _error_dump_count = 0
+# Category/event types already dumped this session — each distinct error type
+# only gets one context dump so repeated known failures (e.g. no_unique_coin_preselected
+# during coin-prep shortage) don't burn through the entire MAX_ERROR_DUMPS budget.
+_error_dump_seen_categories: set = set()
 
 # Track DB connections per thread
 _connection_count = 0
@@ -515,7 +519,14 @@ def slog(category: str, message: str, data: dict = None, level: str = "info"):
                 pass
 
     # ---- ERROR: dump ring buffer context to file ----
-    if lvl >= LEVELS["error"] and _initialized and _error_dump_count < MAX_ERROR_DUMPS:
+    # Each distinct error category gets at most one context dump per session.
+    # This prevents a single repeated failure (e.g. no_unique_coin_preselected
+    # during a coin-prep shortage) from burning through all MAX_ERROR_DUMPS slots
+    # and leaving no budget for genuinely unexpected errors later in the session.
+    if (lvl >= LEVELS["error"] and _initialized
+            and _error_dump_count < MAX_ERROR_DUMPS
+            and category not in _error_dump_seen_categories):
+        _error_dump_seen_categories.add(category)
         _error_dump_count += 1
         _dump_error_context(category, message)
 
