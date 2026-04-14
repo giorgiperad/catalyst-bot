@@ -1230,6 +1230,10 @@ class OfferManager:
         else:
             num = num_offers or cfg.MAX_ACTIVE_SELL_OFFERS
 
+        # Compute default_size early — it's needed by both the position guard
+        # below AND the main offer-creation loop, so define it once here.
+        default_size = trade_size_xch or cfg.DEFAULT_TRADE_XCH
+
         # F25 (2026-04-08): position rebalance hard guard.
         # Risk_manager already enforces MAX_POSITION_XCH as a soft limit
         # via spread skew. This is a HARD backstop: if creating these
@@ -1290,7 +1294,6 @@ class OfferManager:
         if total_slots is None:
             total_slots = num
 
-        default_size = trade_size_xch or cfg.DEFAULT_TRADE_XCH
         half_spread = spread_fraction or cfg.get_spread_fraction() / Decimal("2")
         asset_id = cat_asset_id or cfg.CAT_ASSET_ID
         decimals = cat_decimals or cfg.CAT_DECIMALS

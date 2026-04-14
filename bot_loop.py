@@ -644,9 +644,11 @@ class BotLoop:
             if state.get("cycle_create_stalled") else 0
         )
 
-        # Escalate if create-stall streak is very long — bot may be stuck
+        # Escalate if create-stall streak is very long — bot may be stuck.
+        # Use exponential back-off (fire at cycles 10, 20, 40, 80, 160, 320)
+        # to avoid spamming CRITICAL entries every 7.5 min during multi-hour stalls.
         _stall_streak = int(state.get("create_stall_streak", 0))
-        if _stall_streak > 0 and _stall_streak % 10 == 0:
+        if _stall_streak in (10, 20, 40, 80, 160, 320):
             log_event("critical", "recovery_create_stall_escalation",
                       f"Offer creation has been stalled for {_stall_streak} consecutive "
                       f"recovery cycles — bot may be unable to rebuild the book. "
