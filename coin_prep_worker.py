@@ -4047,8 +4047,9 @@ class CoinPrepWorker:
         # This handles cases where the pool coin map was built from stale wallet data
         # (e.g. after a previous run was aborted mid-flight).
         if target_amount > 0:
-            self.log(f"      ⚠️ {side_label} {tier_name} preselected coin ID not found after {id_timeout_s}s — "
-                     f"falling back to amount match ({target_amount:,} mojos)")
+            self.log(f"      {side_label} {tier_name} preselected coin ID not found after {id_timeout_s}s — "
+                     f"falling back to amount match ({target_amount:,} mojos)",
+                     severity="info")
             fallback_polls = max(1, int((timeout_s - id_timeout_s) / max(1, poll_interval_s)))
             log_every = max(1, int(30 / max(1, poll_interval_s)))
             for fb_attempt in range(fallback_polls):
