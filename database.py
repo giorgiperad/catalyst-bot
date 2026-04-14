@@ -62,6 +62,14 @@ except Exception as _e:
 # ---------------------------------------------------------------------------
 _local = threading.local()
 
+# Guard that prevents init_database() from running migrations more than once
+# per process for the same database file.  Werkzeug's reloader and
+# multi-threaded Flask startup can import modules multiple times, causing the
+# full migration sequence to spam the log.  Tests that swap DB_PATH for a temp
+# file bypass the guard automatically because the path differs.
+_db_initialized_path: str = ""
+_db_init_lock = threading.Lock()
+
 
 def get_connection() -> sqlite3.Connection:
     """Get a thread-local database connection.
@@ -278,8 +286,15 @@ def init_database():
     """Create all tables and indexes if they don't exist.
 
     Safe to call multiple times — uses CREATE IF NOT EXISTS.
-    Called once on bot startup.
+    After the first call in a process the function returns immediately so
+    repeated imports (Werkzeug reloader, multi-threaded Flask startup, etc.)
+    don't replay the full migration sequence and spam the log.
     """
+    global _db_initialized_path
+    with _db_init_lock:
+        if _db_initialized_path == DB_PATH:
+            return
+        _db_initialized_path = DB_PATH
     conn = get_connection()
     conn.executescript(SCHEMA_SQL)
 

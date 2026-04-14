@@ -5863,7 +5863,13 @@ class BotLoop:
 
                     to_delete = []
                     anomalies = 0
+                    new_anomalies = 0   # only first-time occurrences
                     now_ts = int(time.time())
+                    # Per-session set — each unique trade_id is only
+                    # warned about once.  Stored on self so it survives
+                    # across cycles for the lifetime of the bot session.
+                    if not hasattr(self, "_sage_anomaly_seen"):
+                        self._sage_anomaly_seen: set = set()
 
                     for offer in all_sage_offers:
                         status_val = offer.get("status")
@@ -5933,28 +5939,34 @@ class BotLoop:
 
                         # ---- Gate C: does our local DB agree? ----
                         if local_offer is None:
-                            log_event(
-                                "warning",
-                                "sage_cleanup_anomaly",
-                                f"Sage reports offer {trade_id[:16]}... as "
-                                f"{reason} but no local DB record exists. "
-                                f"Refusing to delete — check Recommendations.",
-                            )
                             anomalies += 1
+                            if trade_id not in self._sage_anomaly_seen:
+                                self._sage_anomaly_seen.add(trade_id)
+                                new_anomalies += 1
+                                log_event(
+                                    "warning",
+                                    "sage_cleanup_anomaly",
+                                    f"Sage reports offer {trade_id[:16]}... as "
+                                    f"{reason} but no local DB record exists. "
+                                    f"Refusing to delete — check Recommendations.",
+                                )
                             continue
 
                         local_status = str(local_offer.get("status") or "").lower()
                         if local_status not in LOCAL_SAFE_STATUSES:
                             # Local says something else — open, filled,
                             # pending, etc. Don't touch it.
-                            log_event(
-                                "warning",
-                                "sage_cleanup_anomaly",
-                                f"Sage says {reason} for {trade_id[:16]}... "
-                                f"but local DB shows '{local_status}'. "
-                                f"Refusing to delete — manual review needed.",
-                            )
                             anomalies += 1
+                            if trade_id not in self._sage_anomaly_seen:
+                                self._sage_anomaly_seen.add(trade_id)
+                                new_anomalies += 1
+                                log_event(
+                                    "warning",
+                                    "sage_cleanup_anomaly",
+                                    f"Sage says {reason} for {trade_id[:16]}... "
+                                    f"but local DB shows '{local_status}'. "
+                                    f"Refusing to delete — manual review needed.",
+                                )
                             continue
 
                         # All three gates passed.
@@ -5991,13 +6003,21 @@ class BotLoop:
                                           f"Updated {status_updates} local offer "
                                           f"statuses during Sage cleanup")
                     if anomalies > 0:
-                        log_event(
-                            "warning",
-                            "sage_cleanup_anomalies_summary",
-                            f"Skipped {anomalies} Sage cleanup candidates due to "
-                            f"DB mismatch or missing records — review "
-                            f"sage_cleanup_anomaly events above.",
-                        )
+                        # Only emit the summary when there are NEW (first-seen)
+                        # anomalies this cycle.  Known anomalies are silently
+                        # counted so the summary still shows the total, but
+                        # repeated cycles won't flood the log.
+                        repeated = anomalies - new_anomalies
+                        if new_anomalies > 0:
+                            log_event(
+                                "warning",
+                                "sage_cleanup_anomalies_summary",
+                                f"Skipped {anomalies} Sage cleanup candidates "
+                                f"({new_anomalies} new, {repeated} already seen) "
+                                f"due to DB mismatch or missing records — "
+                                f"review sage_cleanup_anomaly events above.",
+                            )
+                        # else: all anomalies already seen — no summary spam
 
                     repaired_fills = backfill_verified_fills_from_offers(
                         limit=50,

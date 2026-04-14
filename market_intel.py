@@ -393,6 +393,16 @@ class MarketIntel:
         with self._lock:
             return dict(self._competitors)
 
+    def get_cached_data(self) -> Dict:
+        """Return the cached competitor-analysis snapshot.
+
+        Provides access to the same data as get_competitor_spread() under
+        the name that bot_loop uses when feeding the Smart Advisor and the
+        live dashboard.  Keys include: competitor_spread_bps, best_bid,
+        best_ask, thin_side, buy_depth_xch, sell_depth_xch, etc.
+        """
+        return self.get_competitor_spread()
+
     def get_spread_recommendation(self, side: str, our_spread_bps: Decimal,
                                    mid_price: Decimal) -> Decimal:
         """Get a spread recommendation based on competitor analysis.
