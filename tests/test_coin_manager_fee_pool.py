@@ -11,6 +11,13 @@ class CoinManagerFeePoolTests(unittest.TestCase):
         self._saved_wallet_type = os.environ.get("WALLET_TYPE")
         os.environ["WALLET_TYPE"] = "chia"
 
+        _TIER_SIZES = {
+            "inner":   Decimal("1.0"),
+            "mid":     Decimal("0.5"),
+            "outer":   Decimal("0.25"),
+            "extreme": Decimal("0.1"),
+        }
+
         fake_config = types.ModuleType("config")
         fake_config.cfg = types.SimpleNamespace(
             COINSET_ENABLED=False,
@@ -23,6 +30,16 @@ class CoinManagerFeePoolTests(unittest.TestCase):
             MID_SIZE_XCH=Decimal("0.5"),
             OUTER_SIZE_XCH=Decimal("0.25"),
             EXTREME_SIZE_XCH=Decimal("0.1"),
+            # Per-side sizes (required by coin_manager._configured_tier_sizes_xch)
+            BUY_INNER_SIZE_XCH=Decimal("1.0"),
+            BUY_MID_SIZE_XCH=Decimal("0.5"),
+            BUY_OUTER_SIZE_XCH=Decimal("0.25"),
+            BUY_EXTREME_SIZE_XCH=Decimal("0.1"),
+            SELL_INNER_SIZE_XCH=Decimal("1.0"),
+            SELL_MID_SIZE_XCH=Decimal("0.5"),
+            SELL_OUTER_SIZE_XCH=Decimal("0.25"),
+            SELL_EXTREME_SIZE_XCH=Decimal("0.1"),
+            BUY_LADDER_REVERSED=False,
             SNIPER_ENABLED=False,
             SNIPER_SIZE_XCH=Decimal("0"),
             SNIPER_PREP_COUNT=0,
@@ -34,6 +51,13 @@ class CoinManagerFeePoolTests(unittest.TestCase):
             TRANSACTION_FEE_ESTIMATE_COST=20_000_000,
             FEE_PREP_COUNT=20,
             FEE_COIN_SIZE_XCH=Decimal("0.0001"),
+        )
+        # Module-level helpers imported directly by coin_manager (not via cfg)
+        fake_config.get_buy_tier_size_xch = lambda tier: _TIER_SIZES.get(
+            (tier or "").strip().lower(), Decimal("0")
+        )
+        fake_config.get_sell_tier_size_xch = lambda tier: _TIER_SIZES.get(
+            (tier or "").strip().lower(), Decimal("0")
         )
         sys.modules["config"] = fake_config
 

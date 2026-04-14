@@ -7,9 +7,6 @@ import unittest
 
 class CoinPrepConfirmedViewTests(unittest.TestCase):
     def setUp(self):
-        if hasattr(sys.stdout, "reconfigure"):
-            sys.stdout.reconfigure(encoding="utf-8")
-
         self._saved_env = {
             "WALLET_TYPE": os.environ.get("WALLET_TYPE"),
             "DEFAULT_TRADE_XCH": os.environ.get("DEFAULT_TRADE_XCH"),

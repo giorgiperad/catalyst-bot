@@ -6,7 +6,23 @@ from unittest.mock import patch
 
 if "requests" not in sys.modules:
     requests_stub = types.ModuleType("requests")
-    requests_stub.Session = object
+
+    class _StubSession:
+        """Minimal Session stub with headers so amm_monitor.__init__ doesn't crash."""
+        def __init__(self):
+            self.headers = {}
+
+        def get(self, *args, **kwargs):
+            class _R:
+                status_code = 200
+                def json(self): return {}
+                def raise_for_status(self): pass
+            return _R()
+
+        def mount(self, *args, **kwargs):
+            pass
+
+    requests_stub.Session = _StubSession
     requests_stub.exceptions = types.SimpleNamespace(RequestException=Exception)
     requests_adapters_stub = types.ModuleType("requests.adapters")
     requests_adapters_stub.HTTPAdapter = object

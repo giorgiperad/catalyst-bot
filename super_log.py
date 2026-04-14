@@ -175,7 +175,8 @@ def _cleanup_old_logs(log_dir: str):
             for f in to_delete:
                 try:
                     os.remove(f)
-                    sys.__stdout__.write(f"[SUPER_LOG] Cleaned up old log: {os.path.basename(f)}\n")
+                    if sys.__stdout__ is not None:
+                        sys.__stdout__.write(f"[SUPER_LOG] Cleaned up old log: {os.path.basename(f)}\n")
                 except OSError:
                     pass
     except Exception:
@@ -211,7 +212,8 @@ def _rotate_if_needed():
         slog("SUPER_LOG", f"Rotated log: {os.path.basename(old_path)} -> {os.path.basename(_log_path)}")
         _cleanup_old_logs(_log_dir)
     except Exception as e:
-        sys.__stderr__.write(f"[SUPER_LOG] Rotation error: {e}\n")
+        if sys.__stderr__ is not None:
+            sys.__stderr__.write(f"[SUPER_LOG] Rotation error: {e}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +311,8 @@ def _archive_log_digest(log_path: str):
         _prune_archive(archive_path)
 
     except Exception as e:
-        sys.__stderr__.write(f"[SUPER_LOG] Archive digest error: {e}\n")
+        if sys.__stderr__ is not None:
+            sys.__stderr__.write(f"[SUPER_LOG] Archive digest error: {e}\n")
 
 
 def _prune_archive(archive_path: str):
@@ -347,7 +350,8 @@ def _prune_archive(archive_path: str):
             f.writelines(keep)
 
     except Exception as e:
-        sys.__stderr__.write(f"[SUPER_LOG] Archive prune error: {e}\n")
+        if sys.__stderr__ is not None:
+            sys.__stderr__.write(f"[SUPER_LOG] Archive prune error: {e}\n")
 
 
 def get_archive_summary(last_n: int = 10) -> list:
@@ -491,9 +495,14 @@ def slog(category: str, message: str, data: dict = None, level: str = "info"):
     _ring_buffer.append(line)
 
     # ---- Terminal output: filtered by _terminal_level ----
-    if lvl >= _terminal_level:
-        sys.__stdout__.write(line + "\n")
-        sys.__stdout__.flush()
+    # sys.__stdout__ can be None when running without a console (e.g. pythonw,
+    # detached subprocess, or certain frozen-app launchers on Windows).
+    if lvl >= _terminal_level and sys.__stdout__ is not None:
+        try:
+            sys.__stdout__.write(line + "\n")
+            sys.__stdout__.flush()
+        except Exception:
+            pass
 
     # ---- File output: filtered by _file_level ----
     if lvl >= _file_level and _initialized:
@@ -546,7 +555,8 @@ def _dump_error_context(error_category: str, error_message: str):
             _bytes_written += len(footer)
             _log_file.flush()
         except Exception as e:
-            sys.__stderr__.write(f"[SUPER_LOG] Error dumping context: {e}\n")
+            if sys.__stderr__ is not None:
+                sys.__stderr__.write(f"[SUPER_LOG] Error dumping context: {e}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -896,12 +906,15 @@ def close_super_log():
     if _log_file:
         slog("SUPER_LOG", "Closing super log")
         try:
-            sys.stdout = sys.__stdout__
-            sys.stderr = sys.__stderr__
+            if sys.__stdout__ is not None:
+                sys.stdout = sys.__stdout__
+            if sys.__stderr__ is not None:
+                sys.stderr = sys.__stderr__
             _log_file.flush()
             _log_file.close()
         except Exception as e:
-            sys.__stderr__.write(f"[SUPER_LOG] Error closing log: {e}\n")
+            if sys.__stderr__ is not None:
+                sys.__stderr__.write(f"[SUPER_LOG] Error closing log: {e}\n")
     _initialized = False
 
 

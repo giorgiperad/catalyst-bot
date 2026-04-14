@@ -57,6 +57,10 @@ def _make_cfg(**overrides):
         "ENABLE_COIN_PREP": False,
         "XCH_TARGET_COINS": 50,
         "CAT_TARGET_COINS": 50,
+        # Fee coin settings — must be explicit Decimal so validator comparisons
+        # (fee_coin_size > Decimal("0")) don't receive a MagicMock attribute.
+        "FEE_COIN_SIZE_XCH": Decimal("0"),
+        "FEE_PREP_COUNT": 0,
     }
     defaults.update(overrides)
     cfg = MagicMock()

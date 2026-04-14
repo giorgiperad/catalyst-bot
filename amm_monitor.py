@@ -229,11 +229,11 @@ class AMMMonitor:
             state = self._state
 
         if not state or not state.get("available"):
-            return None  # No data — fail closed
+            return True  # No data — fail open (AMM guard inactive without data)
 
         amm_price = state.get("amm_price")
         if not amm_price or amm_price <= 0:
-            return None
+            return True  # No price — fail open
 
         try:
             base_bps = Decimal(str(getattr(cfg, "AMM_BUFFER_BPS", "30")))
@@ -267,7 +267,7 @@ class AMMMonitor:
             return True
 
         except (InvalidOperation, ZeroDivisionError):
-            return None  # Calculation error — fail closed
+            return True  # Calculation error — fail open
 
     def get_stats(self) -> Dict:
         """Return health/stats dict for monitoring."""

@@ -187,8 +187,17 @@ class SweepCoordinator:
         self, block_idx: int, entries: List[SweepEntry]
     ) -> None:
         """Convert a list of entries into a SweepEvent (or discard if single)."""
-        if len(entries) < 2:
-            # Single fill — no sweep evidence.  Leave classification as-is.
+        # Read min-fills threshold from config (default 2 — any 2 fills in the
+        # same block is treated as a sweep).  Set SWEEP_MIN_FILLS=3 to only
+        # trigger protection when 3+ of your offers are swept in one block.
+        try:
+            from config import cfg as _cfg
+            _min_fills = max(2, int(getattr(_cfg, "SWEEP_MIN_FILLS", 2) or 2))
+        except Exception:
+            _min_fills = 2
+
+        if len(entries) < _min_fills:
+            # Not enough fills to be a sweep — leave classification as-is.
             return
 
         group_id = f"sweep_{block_idx}"

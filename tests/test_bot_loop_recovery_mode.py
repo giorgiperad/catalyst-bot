@@ -131,6 +131,13 @@ class _DummyOfferManager:
         del trade_id
         return False
 
+    def get_suspended_slot_count(self, side):
+        del side
+        return 0
+
+    def unsuspend_slots_if_coins_available(self, side):
+        del side
+
 
 class _DummyFillTracker:
     def __init__(self, offer_manager=None):
@@ -183,6 +190,7 @@ class _DummyCoinManager:
         self._reserve_ids_cat = set()
         self._tier_spares = {}
         self._xch_inventory = {"reserve": []}
+        self.fee_pool = None  # Required by bot_loop.py BotLoop.__init__
 
     def is_busy(self):
         return False

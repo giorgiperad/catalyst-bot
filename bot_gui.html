@@ -13933,26 +13933,28 @@
             }
 
             // ── Reserve floor hit — one side going quiet ──
-            if (isRunning && xchTotal > 0 && xchSpendable > 0) {
-                const xchReserveAmt = xchTotal * (xchReservePct / 100);
+            // XCH_RESERVE and CAT_RESERVE are absolute amounts (XCH / display-unit),
+            // NOT percentages. Compare spendable directly against the floor value.
+            if (isRunning && xchSpendable > 0 && xchReservePct > 0) {
+                const xchReserveAmt = xchReservePct; // absolute XCH floor
                 if (xchSpendable <= xchReserveAmt * 1.05) {
                     pushSuggestion({
                         type: 'warning',
                         icon: '+/-',
-                        msg: `Your XCH spendable balance (${xchSpendable.toFixed(3)} XCH) is at or below your ${xchReservePct}% reserve floor. The bot will stop placing buy offers to protect your reserve. To resume: either lower the reserve % in Settings, add more XCH to the wallet, or wait for some sell offers to fill and return XCH.`,
+                        msg: `Your XCH spendable balance (${xchSpendable.toFixed(3)} XCH) is at or below your reserve floor (${xchReserveAmt.toFixed(3)} XCH). The bot will stop placing buy offers to protect your reserve. To resume: either lower the XCH Reserve in Settings, add more XCH to the wallet, or wait for some sell offers to fill and return XCH.`,
                         action: 'Open Settings',
                         actionType: 'openSettings',
                         actionValue: 'safety'
                     });
                 }
             }
-            if (isRunning && catTotal > 0 && catSpendable > 0) {
-                const catReserveAmt = catTotal * (catReservePct / 100);
+            if (isRunning && catSpendable > 0 && catReservePct > 0) {
+                const catReserveAmt = catReservePct; // absolute CAT display-unit floor
                 if (catSpendable <= catReserveAmt * 1.05) {
                     pushSuggestion({
                         type: 'warning',
                         icon: '+/-',
-                        msg: `Your CAT spendable balance is at or below your ${catReservePct}% reserve floor. The bot will stop placing sell offers to protect your reserve. To resume: either lower the CAT reserve % in Settings, add more CAT to the wallet, or wait for buy offers to fill.`,
+                        msg: `Your CAT spendable balance (${catSpendable.toFixed(3)}) is at or below your reserve floor (${catReserveAmt.toFixed(3)}). The bot will stop placing sell offers to protect your reserve. To resume: either lower the CAT Reserve in Settings, add more CAT to the wallet, or wait for buy offers to fill.`,
                         action: 'Open Settings',
                         actionType: 'openSettings',
                         actionValue: 'safety'

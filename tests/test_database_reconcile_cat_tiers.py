@@ -8,12 +8,6 @@ from decimal import Decimal
 from pathlib import Path
 
 
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8")
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8")
-
-
 if "dotenv" not in sys.modules:
     dotenv_stub = types.ModuleType("dotenv")
     dotenv_stub.load_dotenv = lambda *args, **kwargs: False
@@ -26,6 +20,19 @@ os.environ["INNER_SIZE_XCH"] = "2.4"
 os.environ["MID_SIZE_XCH"] = "1.2"
 os.environ["OUTER_SIZE_XCH"] = "0.6"
 os.environ["EXTREME_SIZE_XCH"] = "0.24"
+# Explicitly zero out per-side sell sizes so get_sell_tier_size_xch() falls
+# back to the legacy INNER_SIZE_XCH etc. values set above.  A prior test that
+# imports api_server may have called load_dotenv(override=True), writing real
+# SELL_*_SIZE_XCH values into os.environ; without these zeros cfg.reload()
+# would pick those up and change the tier thresholds, breaking the test.
+os.environ["SELL_INNER_SIZE_XCH"] = "0"
+os.environ["SELL_MID_SIZE_XCH"] = "0"
+os.environ["SELL_OUTER_SIZE_XCH"] = "0"
+os.environ["SELL_EXTREME_SIZE_XCH"] = "0"
+os.environ["BUY_INNER_SIZE_XCH"] = "0"
+os.environ["BUY_MID_SIZE_XCH"] = "0"
+os.environ["BUY_OUTER_SIZE_XCH"] = "0"
+os.environ["BUY_EXTREME_SIZE_XCH"] = "0"
 os.environ["SNIPER_ENABLED"] = "false"
 os.environ["CAT_DECIMALS"] = "3"
 os.environ["CAT_COIN_SIZE"] = "4000"
@@ -56,6 +63,14 @@ class DatabaseReconcileCatTierTests(unittest.TestCase):
         os.environ["MID_SIZE_XCH"] = "1.2"
         os.environ["OUTER_SIZE_XCH"] = "0.6"
         os.environ["EXTREME_SIZE_XCH"] = "0.24"
+        os.environ["SELL_INNER_SIZE_XCH"] = "0"
+        os.environ["SELL_MID_SIZE_XCH"] = "0"
+        os.environ["SELL_OUTER_SIZE_XCH"] = "0"
+        os.environ["SELL_EXTREME_SIZE_XCH"] = "0"
+        os.environ["BUY_INNER_SIZE_XCH"] = "0"
+        os.environ["BUY_MID_SIZE_XCH"] = "0"
+        os.environ["BUY_OUTER_SIZE_XCH"] = "0"
+        os.environ["BUY_EXTREME_SIZE_XCH"] = "0"
         os.environ["SNIPER_ENABLED"] = "false"
         os.environ["CAT_DECIMALS"] = "3"
         os.environ["CAT_COIN_SIZE"] = "4000"

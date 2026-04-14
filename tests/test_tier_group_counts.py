@@ -10,6 +10,7 @@ class TierGroupCountTests(unittest.TestCase):
         fake_config = types.ModuleType("config")
         fake_config.cfg = types.SimpleNamespace(
             TIER_ENABLED=True,
+            # Legacy keys (kept for backward compat — new code reads BUY_/SELL_ variants)
             INNER_TIER_COUNT=1,
             MID_TIER_COUNT=2,
             OUTER_TIER_COUNT=1,
@@ -18,10 +19,38 @@ class TierGroupCountTests(unittest.TestCase):
             MID_TIER_SPARE_COUNT=0,
             OUTER_TIER_SPARE_COUNT=0,
             EXTREME_TIER_SPARE_COUNT=0,
+            # Per-side tier counts (current config style — required by get_tier_distribution)
+            BUY_INNER_TIER_COUNT=1,
+            BUY_MID_TIER_COUNT=2,
+            BUY_OUTER_TIER_COUNT=1,
+            BUY_EXTREME_TIER_COUNT=0,
+            SELL_INNER_TIER_COUNT=1,
+            SELL_MID_TIER_COUNT=2,
+            SELL_OUTER_TIER_COUNT=1,
+            SELL_EXTREME_TIER_COUNT=0,
+            # Per-side spare counts
+            BUY_INNER_TIER_SPARE_COUNT=0,
+            BUY_MID_TIER_SPARE_COUNT=0,
+            BUY_OUTER_TIER_SPARE_COUNT=0,
+            BUY_EXTREME_TIER_SPARE_COUNT=0,
+            SELL_INNER_TIER_SPARE_COUNT=0,
+            SELL_MID_TIER_SPARE_COUNT=0,
+            SELL_OUTER_TIER_SPARE_COUNT=0,
+            SELL_EXTREME_TIER_SPARE_COUNT=0,
+            # Offer sizes
             INNER_SIZE_XCH=Decimal("1.0"),
             MID_SIZE_XCH=Decimal("0.5"),
             OUTER_SIZE_XCH=Decimal("0.25"),
             EXTREME_SIZE_XCH=Decimal("0.1"),
+            BUY_INNER_SIZE_XCH=Decimal("1.0"),
+            BUY_MID_SIZE_XCH=Decimal("0.5"),
+            BUY_OUTER_SIZE_XCH=Decimal("0.25"),
+            BUY_EXTREME_SIZE_XCH=Decimal("0.1"),
+            SELL_INNER_SIZE_XCH=Decimal("1.0"),
+            SELL_MID_SIZE_XCH=Decimal("0.5"),
+            SELL_OUTER_SIZE_XCH=Decimal("0.25"),
+            SELL_EXTREME_SIZE_XCH=Decimal("0.1"),
+            BUY_LADDER_REVERSED=False,
             WALLET_ID_XCH=1,
         )
         sys.modules["config"] = fake_config

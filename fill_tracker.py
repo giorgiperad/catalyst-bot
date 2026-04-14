@@ -1189,11 +1189,30 @@ class FillTracker:
         # Pass 1: Match same-tier + same-size fills (highest confidence)
         # Pass 2: Match same-size fills regardless of tier (within 1%)
         # Pass 3: Match remaining fills within 20% size tolerance (FIFO)
-        for pass_num, (check_tier, size_tolerance) in enumerate([
+        # Pass 4: FIFO fallback for asymmetric buy/sell tier sizing.
+        #   When BUY_*_SIZE_XCH ≠ SELL_*_SIZE_XCH (e.g. BUY_INNER=0.67 XCH,
+        #   SELL_INNER=3.26 XCH), size-based matching never succeeds because
+        #   the ratio (4.8x) exceeds the 20% tolerance. Pass 4 matches any
+        #   unmatched buy with any unmatched sell purely by chronological
+        #   order. The _create_round_trip PnL formula is still mathematically
+        #   correct for asymmetric pairs: net_xch = sell_xch - buy_xch, and
+        #   the unbalanced CAT position is valued at the current mid price,
+        #   giving an accurate mark-to-market realized PnL.
+        pass4_eligible = (
+            len([f for f in valid_buys
+                 if f["fill_id"] not in {m["buy_fill_id"] for m in matched}]) > 0
+            and len([f for f in valid_sells
+                     if f["fill_id"] not in used_sell_ids]) > 0
+        )
+        pass_specs = [
             (True, Decimal("0.01")),    # Pass 1: same tier, exact size
             (False, Decimal("0.01")),   # Pass 2: any tier, exact size
             (False, Decimal("0.20")),   # Pass 3: any tier, 20% tolerance
-        ], start=1):
+        ]
+        if pass4_eligible:
+            pass_specs.append((False, None))  # Pass 4: FIFO, no size limit
+
+        for pass_num, (check_tier, size_tolerance) in enumerate(pass_specs, start=1):
             for buy_fill in valid_buys:
                 if buy_fill["fill_id"] in {m["buy_fill_id"] for m in matched}:
                     continue  # Already matched
@@ -1216,13 +1235,19 @@ class FillTracker:
                     if check_tier and buy_tier != sell_tier:
                         continue
 
-                    # Size tolerance check
-                    if buy_xch > 0:
-                        size_diff = abs(sell_xch - buy_xch) / buy_xch
+                    # Size tolerance check (Pass 4 skips this — FIFO by time)
+                    if size_tolerance is not None:
+                        if buy_xch > 0:
+                            size_diff = abs(sell_xch - buy_xch) / buy_xch
+                        else:
+                            continue
+                        if size_diff > size_tolerance:
+                            continue
                     else:
-                        continue
+                        # Pass 4: accept any size; use absolute diff as tiebreak
+                        size_diff = abs(sell_xch - buy_xch)
 
-                    if size_diff <= size_tolerance and size_diff < best_size_diff:
+                    if size_diff < best_size_diff:
                         best_sell = sell_fill
                         best_size_diff = size_diff
 
@@ -1239,7 +1264,7 @@ class FillTracker:
         if unmatched_buy_count or unmatched_sell_count:
             log_event("info", "pnl_unmatched_fills",
                       f"{unmatched_buy_count} buy + {unmatched_sell_count} sell fills "
-                      f"unmatched (no same-size counterpart — one-directional)")
+                      f"unmatched (one-directional inventory build)")
 
         return matched
 

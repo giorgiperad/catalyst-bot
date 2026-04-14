@@ -191,9 +191,18 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             cancel_batches.append(list(trade_ids))
             return {tid: {"success": True} for tid in trade_ids}
 
+        # Two spare trading coins (DB-first path in requote_side).
+        # Must have designation in {"tier_spare","tier_active"} and assigned_tier
+        # NOT in {"none","sniper","reserve","fee"} to be counted as spares.
+        _two_spare_coins = [
+            {"designation": "tier_spare", "assigned_tier": "inner"},
+            {"designation": "tier_spare", "assigned_tier": "mid"},
+        ]
+
         with patch.object(offer_manager, "get_open_offers", return_value=open_offers), \
                 patch.object(offer_manager, "get_exact_spendable_coins_rpc",
                              return_value={"coin_records": [{}, {}]}), \
+                patch("database.get_free_coins", return_value=_two_spare_coins), \
                 patch.object(manager, "create_ladder", side_effect=fake_create_ladder), \
                 patch.object(manager, "cancel_offers", side_effect=fake_cancel_offers), \
                 patch.object(offer_manager, "log_event"):
@@ -366,7 +375,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
 
         def fake_select(wallet_id, amount_mojos, used_coins=None,
                          preferred_tier=None, strict_preferred_tier=False,
-                         spendable_records=None):
+                         spendable_records=None, max_amount_mojos=None):
             captured.append({
                 "wallet_id": wallet_id,
                 "amount_mojos": amount_mojos,
@@ -437,7 +446,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
 
         def fake_select(wallet_id, amount_mojos, used_coins=None,
                         preferred_tier=None, strict_preferred_tier=False,
-                        spendable_records=None):
+                        spendable_records=None, max_amount_mojos=None):
             return f"0xcoin{next(counter)}"
 
         def fake_create_offer_with_retry(self, offer_dict, max_retries=2,
@@ -693,7 +702,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
 
         def fake_select(wallet_id, amount_mojos, used_coins=None,
                          preferred_tier=None, strict_preferred_tier=False,
-                         spendable_records=None):
+                         spendable_records=None, max_amount_mojos=None):
             captured.append({
                 "wallet_id": wallet_id,
                 "amount_mojos": amount_mojos,
@@ -850,15 +859,25 @@ class OfferManagerCoinIdTests(unittest.TestCase):
         self.assertTrue(any(args[1] == "coin_ids_overlap_observed" for args, _ in mock_log_event.call_args_list))
 
     def test_get_replenishment_slots_heals_tier_shortage_instead_of_mini_ladder(self):
+        # Scenario: only the extreme tier has a shortage (3 slots short).
+        # With the current tier config (INNER=10, MID=7, OUTER=5, EXTREME=28
+        # for a 50-slot ladder), extreme spans slots 22–49.  The function
+        # fills from the INNERMOST end of the shortage, so the 3 missing
+        # extreme slots should be positions [22, 23, 24] — NOT a mini-ladder
+        # that would blindly add offers at positions 47–49.
         manager = offer_manager.OfferManager()
         existing = (
-            [{"tier": "inner"}] * 5
-            + [{"tier": "mid"}] * 15
-            + [{"tier": "outer"}] * 17
-            + [{"tier": "extreme"}] * 12
+            [{"tier": "inner"}] * 10    # exactly at target — no inner shortage
+            + [{"tier": "mid"}] * 7     # exactly at target — no mid shortage
+            + [{"tier": "outer"}] * 5   # exactly at target — no outer shortage
+            + [{"tier": "extreme"}] * 25  # 3 short of 28-slot extreme target
         )
 
         with patch.object(offer_manager.cfg, "TIER_ENABLED", True), \
+                patch.object(offer_manager.cfg, "BUY_INNER_TIER_COUNT", 10, create=True), \
+                patch.object(offer_manager.cfg, "BUY_MID_TIER_COUNT", 7, create=True), \
+                patch.object(offer_manager.cfg, "BUY_OUTER_TIER_COUNT", 5, create=True), \
+                patch.object(offer_manager.cfg, "BUY_EXTREME_TIER_COUNT", 0, create=True), \
                 patch.object(offer_manager, "get_open_offers", return_value=existing):
             slots = manager.get_replenishment_slots(
                 side="buy",
@@ -866,7 +885,9 @@ class OfferManagerCoinIdTests(unittest.TestCase):
                 cat_asset_id="test-cat",
             )
 
-        self.assertEqual(slots[:3], [47, 48, 49])
+        # Only extreme is short (22–49 with 25 existing → 3 slots needed);
+        # fill from innermost extreme positions [22, 23, 24].
+        self.assertEqual(slots, [22, 23, 24])
 
     def test_slot_size_variation_supports_thousands_of_unique_steps(self):
         self.assertEqual(

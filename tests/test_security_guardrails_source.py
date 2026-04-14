@@ -3,7 +3,7 @@ from pathlib import Path
 import unittest
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent  # project root, one level above tests/
 
 
 def _class_assign_literal(tree: ast.AST, class_name: str, attr_name: str):

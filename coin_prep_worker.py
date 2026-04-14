@@ -469,15 +469,18 @@ class CoinPrepWorker:
         self.xch_expected_total_coins = self.xch_target_coins + 1
         self.cat_expected_total_coins = self.cat_target_coins + 1
 
-        # Initial status
+        # Initial status — report prepared-coin targets, not expected_total.
+        # xch_expected_total_coins (+1 for reserve) is used internally for
+        # split confirmation polling and health checks, but the GUI target
+        # should reflect the trading-coin target the user configured.
         self.status = CoinPrepStatus(
             phase=PrepPhase.IDLE.value,
             progress=0.0,
             message="Initializing...",
             xch_coins_current=0,
-            xch_coins_target=self.xch_expected_total_coins,
+            xch_coins_target=self.xch_target_coins,
             cat_coins_current=0,
-            cat_coins_target=self.cat_expected_total_coins,
+            cat_coins_target=self.cat_target_coins,
             timestamp=time.time()
         )
         
@@ -517,8 +520,10 @@ class CoinPrepWorker:
         self.cat_expected_total_coins = self.cat_target_coins + 1
         if hasattr(self, "status"):
             with self.status_lock:
-                self.status.xch_coins_target = self.xch_expected_total_coins
-                self.status.cat_coins_target = self.cat_expected_total_coins
+                # GUI target = prepared-coin count only (xch_target_coins).
+                # xch_expected_total_coins (+1 reserve) is for internal use.
+                self.status.xch_coins_target = self.xch_target_coins
+                self.status.cat_coins_target = self.cat_target_coins
 
     @staticmethod
     def _prepared_coin_count_from_total(total_count: int) -> int:

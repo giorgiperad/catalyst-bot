@@ -5,6 +5,7 @@ import io
 import contextlib
 from decimal import Decimal
 from unittest.mock import patch
+from reaction_strategy import RequoteSeverity
 
 
 class _FakeCfg:
@@ -95,9 +96,18 @@ class _DummyOfferManager:
     def should_requote(self, side, current_price, last_quoted_price):
         return True
 
+    def should_requote_graduated(self, side, current_price, last_price):
+        return RequoteSeverity.FULL
+
     def requote_side(self, side, current_price, **kwargs):
         self.requote_calls.append((side, current_price, kwargs))
         return {"offers": [], "fully_replaced": True}
+
+    def get_suspended_slot_count(self, side):
+        return 0
+
+    def unsuspend_slots_if_coins_available(self, side):
+        pass
 
 
 class _DummyFillTracker:
@@ -151,6 +161,7 @@ class _DummyCoinsetClient:
 class _DummyCoinManager:
     def __init__(self):
         self._price_engine = None
+        self.fee_pool = None  # Required by bot_loop.py BotLoop.__init__
 
     def is_busy(self):
         return False
@@ -568,7 +579,7 @@ class ProbeAnchorTests(unittest.TestCase):
 
     def test_handle_requoting_updates_baseline_to_anchored_mid(self):
         loop = bot_loop.BotLoop()
-        loop._loop_count = 5
+        loop._loop_count = 6  # Must be > 5 to bypass the startup grace period
         loop._probe_state.update({
             "active": False,
             "confirmed_price": Decimal("1.10"),

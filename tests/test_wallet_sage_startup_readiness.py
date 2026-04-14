@@ -12,12 +12,16 @@ except ModuleNotFoundError as exc:
 @unittest.skipIf(wallet_sage is None, f"wallet_sage import unavailable: {_IMPORT_ERROR}")
 class TestWalletSageStartupReadiness(unittest.TestCase):
     def test_get_chia_health_reports_syncing_when_wallet_not_synced(self):
+        # Mock get_peer_connections to avoid real network calls that may fail
+        # when the Sage wallet is under load from earlier tests in the suite.
         with patch.object(wallet_sage, "get_wallet_sync_status", return_value={
             "reachable": True,
             "synced": False,
             "syncing": True,
             "sync_state": "not_synced",
-        }):
+        }), patch.object(wallet_sage, "get_peer_connections", return_value=[
+            {"peer_host": "127.0.0.1"},
+        ]):
             health = wallet_sage.get_chia_health()
 
         self.assertEqual(health["status"], "wallet_not_synced")
@@ -29,7 +33,9 @@ class TestWalletSageStartupReadiness(unittest.TestCase):
             "synced": False,
             "syncing": False,
             "sync_state": "unknown",
-        }):
+        }), patch.object(wallet_sage, "get_peer_connections", return_value=[
+            {"peer_host": "127.0.0.1"},
+        ]):
             health = wallet_sage.get_chia_health()
 
         self.assertEqual(health["status"], "wallet_sync_unknown")

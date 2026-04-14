@@ -34,18 +34,30 @@ from urllib.parse import urlparse, quote
 # ---------------------------------------------------------------------------
 # Fix Windows cp1252 terminal encoding so emoji in log messages don't crash.
 # ---------------------------------------------------------------------------
+# Use reconfigure() instead of detach+wrap: reconfigure changes encoding
+# in-place without detaching the underlying buffer.  This is critical when
+# running under pytest --capture=sys: sys.stdout is a CaptureIO wrapping a
+# BytesIO, and calling detach() on it would rip the BytesIO away, causing
+# pytest's getvalue() to fail with "assert isinstance(self.buffer, BytesIO)".
 if sys.platform == "win32":
-    for _pair in [("stdout", "__stdout__"), ("stderr", "__stderr__")]:
-        _st = getattr(sys, _pair[0], None)
-        if _st is not None and hasattr(_st, "buffer"):
+    for _attr in ("stdout", "__stdout__", "stderr", "__stderr__"):
+        _st = getattr(sys, _attr, None)
+        if _st is not None and hasattr(_st, "reconfigure"):
             try:
-                _buf = _st.detach()
-                _wrapped = io.TextIOWrapper(
-                    _buf, encoding="utf-8", errors="replace",
-                    line_buffering=True,
-                )
-                setattr(sys, _pair[0], _wrapped)
-                setattr(sys, _pair[1], _wrapped)
+                _st.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+        elif _st is not None and hasattr(_st, "buffer"):
+            # Fallback for streams that don't support reconfigure — only safe
+            # to detach when the buffer is a real file (not BytesIO capture).
+            try:
+                if not isinstance(_st.buffer, io.BytesIO):
+                    _buf = _st.detach()
+                    _wrapped = io.TextIOWrapper(
+                        _buf, encoding="utf-8", errors="replace",
+                        line_buffering=True,
+                    )
+                    setattr(sys, _attr, _wrapped)
             except Exception:
                 pass
 from flask import Flask, jsonify, request, send_from_directory, send_file, Response

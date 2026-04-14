@@ -50,7 +50,7 @@ except ModuleNotFoundError:
 
 
 def _load_real_module(name: str, filename: str):
-    spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name(filename))
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).parent.parent / filename)
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
     sys.modules[name] = module
@@ -136,20 +136,22 @@ class SpacescanCollectorTests(unittest.TestCase):
         self.assertTrue(result["has_data"])
         self.assertEqual(result["name"], "Monkeyzoo")
         self.assertEqual(result["holder_count"], 321)
-        # Activity fetching is inside the holders loop; when pro-holders succeeds
-        # the loop breaks before running activity code, so activity_count stays 0.
-        self.assertEqual(result["activity_count"], 0)
+        # F39 (2026-04-08): activity fetching runs AFTER the holders block,
+        # not inside it. Pro-legacy (/token/activity) times out, pro-plural
+        # (/token/activities/asset123) returns 3 items → activity_count=3.
+        self.assertEqual(result["activity_count"], 3)
         self.assertEqual(calls[0]["url"], f"{mdc.cfg.SPACESCAN_PRO_URL}/token/info/asset123")
         # Holders endpoint uses count=1 to minimise response size (only total_count needed)
         holders_calls = [c for c in calls if "/token/holders/" in c["url"]]
         self.assertTrue(len(holders_calls) > 0)
         self.assertEqual(holders_calls[0]["params"], {"count": 1})
-        # Activity endpoints not called when holders break early
+        # Activity is always fetched (F39 fix): pro-legacy times out twice (retries=1)
+        # then pro-plural succeeds — 3 activity HTTP calls total.
         activity_calls = [
             c for c in calls
             if "/token/activity" in c["url"] or "/token/activities/" in c["url"]
         ]
-        self.assertEqual(len(activity_calls), 0)
+        self.assertEqual(len(activity_calls), 3)
         self.assertEqual(calls[0]["headers"]["x-api-key"], "test-key")
         self.assertEqual(calls[0]["headers"]["version"], "v1")
         self.assertEqual(calls[0]["headers"]["network"], "xch")

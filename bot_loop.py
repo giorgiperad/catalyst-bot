@@ -217,6 +217,7 @@ class BotLoop:
         self._last_quoted_price: Dict[str, Decimal] = {"buy": Decimal("0"), "sell": Decimal("0")}
         self._force_requote: Dict[str, bool] = {"buy": False, "sell": False}
         self._current_mid_price: Decimal = Decimal("0")
+        self._requoted_this_cycle: set = set()   # sides requoted in current cycle
 
         # ---- Bot state (for GUI) ----
         self._bot_state: Dict = {
@@ -3250,6 +3251,29 @@ class BotLoop:
         current_buy_ids = {o.get("trade_id", "") for o in open_buys if o.get("trade_id")}
         current_sell_ids = {o.get("trade_id", "") for o in open_sells if o.get("trade_id")}
 
+        # Compute DB-open subsets for cap check (wallet set may include zombie
+        # offers: cancelled in DB but still active in Sage after a failed cancel
+        # attempt).  Fill detection and requote still use the full wallet sets.
+        try:
+            from database import get_open_offers as _db_get_open
+            _db_open_buy_ids = {
+                o["trade_id"] for o in _db_get_open(side="buy") if o.get("trade_id")
+            }
+            _db_open_sell_ids = {
+                o["trade_id"] for o in _db_get_open(side="sell") if o.get("trade_id")
+            }
+            _zombie_buys = len(current_buy_ids) - len(_db_open_buy_ids & current_buy_ids)
+            _zombie_sells = len(current_sell_ids) - len(_db_open_sell_ids & current_sell_ids)
+            if _zombie_buys > 0 or _zombie_sells > 0:
+                log_event("info", "zombie_wallet_offers",
+                          f"Wallet has {_zombie_buys} zombie buy / {_zombie_sells} zombie sell "
+                          f"offers (cancelled in DB, still active in Sage) — excluded from cap")
+        except Exception as _dbo_err:
+            _db_open_buy_ids = current_buy_ids
+            _db_open_sell_ids = current_sell_ids
+            log_event("debug", "db_open_ids_fallback",
+                      f"DB-open cap filter failed (non-critical): {_dbo_err}")
+
         # Remove recently-created offers now visible in wallet (prevents double-counting)
         self.offer_manager.clean_visible_recently_created(current_buy_ids | current_sell_ids)
 
@@ -4495,8 +4519,11 @@ class BotLoop:
 
         # ---- Step 10: Create new offers if needed ----
         self._set_cycle_step("step10_create_offers")
-        print(f"   [10] Offers: buys {len(current_buy_ids)}/{cfg.MAX_ACTIVE_BUY_OFFERS}, "
-              f"sells {len(current_sell_ids)}/{cfg.MAX_ACTIVE_SELL_OFFERS}", flush=True)
+        # Cap is based on DB-open count (_db_open_*_ids) so zombie wallet offers
+        # (cancelled in DB, still active in Sage) don't falsely fill the cap.
+        # Both branches of the try/except above guarantee these are defined.
+        print(f"   [10] Offers: buys {len(_db_open_buy_ids)}/{cfg.MAX_ACTIVE_BUY_OFFERS}, "
+              f"sells {len(_db_open_sell_ids)}/{cfg.MAX_ACTIVE_SELL_OFFERS}", flush=True)
         # step10 count log removed — console print covers this
         if _reserve_skip_create:
             log_event("info", "step10_skipped_reserve",
@@ -4520,10 +4547,10 @@ class BotLoop:
 
         self._create_offers_if_needed(
             mid_price,
-            len(current_buy_ids),
-            len(current_sell_ids),
-            current_buy_ids=current_buy_ids,
-            current_sell_ids=current_sell_ids,
+            len(_db_open_buy_ids),   # DB-open count (excludes zombie wallet offers)
+            len(_db_open_sell_ids),  # DB-open count (excludes zombie wallet offers)
+            current_buy_ids=_db_open_buy_ids,
+            current_sell_ids=_db_open_sell_ids,
             arb_gap=arb_gap,
             skip_buy=_skip_buy,
             skip_sell=_skip_sell,
@@ -4582,10 +4609,21 @@ class BotLoop:
         # place this should rarely fire — but when it does, it stops the
         # overshoot from accumulating across cycles.
         try:
+            # Filter out zombie wallet offers (cancelled in DB but still active in
+            # Sage) before passing to trim so the trim doesn't count those against
+            # the cap and cancel freshly-created real offers.
+            _db_filtered_buys = [
+                o for o in open_buys
+                if o.get("trade_id") in _db_open_buy_ids
+            ]
+            _db_filtered_sells = [
+                o for o in open_sells
+                if o.get("trade_id") in _db_open_sell_ids
+            ]
             trimmed = self.offer_manager.trim_excess_offers(
                 mid_price,
-                wallet_buys=open_buys,
-                wallet_sells=open_sells,
+                wallet_buys=_db_filtered_buys,
+                wallet_sells=_db_filtered_sells,
             )
             if trimmed > 0:
                 log_event("info", "trim_excess_done",
@@ -7246,7 +7284,29 @@ class BotLoop:
                         reasons.append("full node unreachable")
                     elif wallet_type != "sage" and not node_info.get("synced"):
                         reasons.append("full node not synced")
+                    if wallet_type == "sage" and wallet_sync_state == "no_peers":
+                        reasons.append("no network peers")
                     reason_str = " — " + ", ".join(reasons) if reasons else ""
+
+                    # Sage-specific: no_peers gets its own prominent alert immediately
+                    # (cycle 1) because it silently blocks fills and TX submissions.
+                    if wallet_type == "sage" and wallet_sync_state == "no_peers":
+                        if self._consecutive_unhealthy == 1:
+                            log_event("warning", "wallet_no_peers",
+                                      "Sage wallet has no network peers — fill detection "
+                                      "and offer submission are paused.")
+                        self._emit_alert(
+                            "wallet_no_peers",
+                            "warning",
+                            "Sage Wallet: No Network Peers",
+                            "Sage has lost all peer connections. Fills cannot be detected "
+                            "and new offers cannot be submitted. Check your internet "
+                            "connection or restart Sage.",
+                            action="restart_sage",
+                            action_label="Restart Sage",
+                        )
+                    else:
+                        self._clear_alert("wallet_no_peers")
 
                     if self._consecutive_unhealthy == 1:
                         health_label = "Sage wallet" if wallet_type == "sage" else "Chia health"

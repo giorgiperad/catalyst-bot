@@ -4670,7 +4670,7 @@ class CoinManager:
         _two_step_split step 2 — poll for num_to_create new owned coins that
         match trading_size_mojos.
         """
-        from wallet_sage import sage_topup_split, get_next_address as _sage_get_addr
+        from wallet_sage import sage_topup_split
 
         tag = f"topup_{name.lower()}"
 
@@ -4680,8 +4680,10 @@ class CoinManager:
             return False
 
         # --- Get own address for send-to-self outputs ---
+        # Use the module-level get_next_address (from wallet adapter) so tests
+        # can patch it and so the Chia backend also works if ever needed.
         try:
-            addr_result = _sage_get_addr(wallet_id=wallet_id, new_address=False)
+            addr_result = get_next_address(wallet_id=wallet_id, new_address=False)
             if not addr_result or not addr_result.get("success"):
                 self._abort_topup_for_wallet_degradation(
                     f"{name} topup paused: Sage could not provide a wallet address "

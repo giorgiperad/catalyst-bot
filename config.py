@@ -218,6 +218,15 @@ class Config:
         _legacy_max = _decimal("MAX_MID", "0") if _str("MAX_MID") else Decimal("0")
         self.HARD_MIN_PRICE_XCH = _hard_min if _hard_min > 0 else _legacy_min
         self.HARD_MAX_PRICE_XCH = _hard_max if _hard_max > 0 else _legacy_max
+
+        # ----- Sweep Protection -----
+        # Minimum fills in the same block to classify as a sweep (default 2).
+        # Raise to 3+ if you only want protection when larger sweeps occur.
+        self.SWEEP_MIN_FILLS = _int("SWEEP_MIN_FILLS", 2)
+        # Seconds to pause requoting the swept side (direction known), default 90.
+        self.SWEEP_PROTECTION_SECS = _int("SWEEP_PROTECTION_SECS", 90)
+        # Seconds to pause both sides when sweep direction is unknown, default 30.
+        self.SWEEP_PROTECTION_UNKNOWN_SECS = _int("SWEEP_PROTECTION_UNKNOWN_SECS", 30)
         # MAX_STEP_CHANGE_FRACTION: reject single-fetch jumps larger than
         # this fraction (e.g. 0.10 = 10%). Set to 0 to disable. Default
         # raised from 0 → 0.10 on 2026-04-08: with the dynamic band at ±50%
