@@ -5823,7 +5823,35 @@ class CoinManager:
                     xch_tier_counts[get_fee_tier_name()] = get_fee_pool_count()
                 total_coins = sum(xch_tier_counts.values())
 
-                buy_tier_sizes_str  = ",".join(f"{t}={s}" for t, s in buy_tier_sizes.items())
+                # When BUY_LADDER_REVERSED is active, xch_tier_counts has already
+                # been flipped (position-inner→coin-extreme etc.) by
+                # get_weighted_tier_prep_counts → flip_position_tiers_to_coin_size_tiers.
+                # We must apply the same flip to the coin SIZES so that each coin
+                # tier is sized at the OFFER it actually backs — not at the coin-tier
+                # name's literal size.  Without this, coin prep tries to build 20
+                # "extreme"-named coins at 5.33 XCH each (4.8448×1.1) even though
+                # those coins back position-INNER offers that only commit 0.67 XCH.
+                # The inverse mapping: coin tier → position tier whose size it uses.
+                _COIN_TO_POS: Dict[str, str] = {
+                    v: k for k, v in _BUY_REVERSED_POSITION_TO_COIN_SIZE.items()
+                }
+                if getattr(cfg, "BUY_LADDER_REVERSED", False):
+                    # Re-key: each coin tier uses the offer-size of the position
+                    # that maps TO it under the reversal.
+                    buy_tier_sizes_for_coins = {
+                        coin_t: buy_tier_sizes.get(pos_t, Decimal("0"))
+                        for coin_t, pos_t in _COIN_TO_POS.items()
+                    }
+                    # Preserve any non-positional tiers already in buy_tier_sizes
+                    for _t, _s in buy_tier_sizes.items():
+                        if _t not in buy_tier_sizes_for_coins:
+                            buy_tier_sizes_for_coins[_t] = _s
+                else:
+                    buy_tier_sizes_for_coins = buy_tier_sizes
+
+                buy_tier_sizes_str  = ",".join(
+                    f"{t}={s}" for t, s in buy_tier_sizes_for_coins.items()
+                )
                 sell_tier_sizes_str = ",".join(f"{t}={s}" for t, s in sell_tier_sizes.items())
                 # Fee/sniper tiers reuse their buy-side size (XCH-only)
                 if self._fee_pool_enabled():
@@ -5843,7 +5871,7 @@ class CoinManager:
                 cmd.extend(["--prep-headroom-pct", str(prep_headroom_pct)])
 
                 tier_detail = " + ".join(
-                    f"{c} {t} × {buy_tier_sizes.get(t, Decimal('0'))}"
+                    f"{c} {t} × {buy_tier_sizes_for_coins.get(t, Decimal('0'))}"
                     for t, c in xch_tier_counts.items() if c > 0
                 )
                 log_event("info", "coin_prep_config",
@@ -5873,6 +5901,30 @@ class CoinManager:
                 env=env,
                 **hidden_subprocess_kwargs(),
             )
+
+            # Drain the worker's stdout pipe continuously so the worker never
+            # blocks on a full pipe buffer.  The worker delivers real-time log
+            # events via HTTP (ApiMirrorStream), so we can safely discard what
+            # comes through the pipe.  Without this drainer the 64 KB pipe
+            # buffer fills up after ~300 log lines and the worker stalls
+            # indefinitely.
+            _proc_ref = self._prep_process
+
+            def _drain_stdout():
+                try:
+                    while True:
+                        chunk = _proc_ref.stdout.read(4096)
+                        if not chunk:
+                            break
+                except Exception:
+                    pass
+
+            _drain_thread = threading.Thread(
+                target=_drain_stdout,
+                daemon=True,
+                name="prep-stdout-drain",
+            )
+            _drain_thread.start()
 
             log_event("info", "coin_prep_started",
                       f"Coin prep worker started (PID: {self._prep_process.pid})")

@@ -367,12 +367,17 @@ class DexieManager:
         are visible on the orderbook.
 
         Args:
-            active_offers: List of offer dicts with 'trade_id' and 'offer_bech32'
+            active_offers: List of offer dicts. Accepts both our internal
+            format (keys: 'trade_id', 'offer_bech32') and raw Sage wallet
+            dicts (keys: 'offer_id', 'offer') so the /api/dexie/repost
+            endpoint works correctly regardless of where the offer list
+            came from.
         """
         count = 0
         for offer in active_offers:
-            bech32 = offer.get("offer_bech32", "")
-            trade_id = offer.get("trade_id", "")
+            # Support both our internal DB format and raw Sage wallet dicts
+            bech32 = offer.get("offer_bech32") or offer.get("offer") or ""
+            trade_id = offer.get("trade_id") or offer.get("offer_id") or ""
 
             if bech32 and trade_id:
                 self.queue_post(bech32, trade_id, force=True)
