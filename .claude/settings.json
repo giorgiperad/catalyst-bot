@@ -6,7 +6,24 @@
       "Edit(.claude/monitor/backups/**)",
       "Write(.claude/monitor/backups/**)",
       "Edit(.claude/monitor/dashboard/**)",
-      "Write(.claude/monitor/dashboard/**)"
+      "Write(.claude/monitor/dashboard/**)",
+      "Bash(rm .claude/monitor/monitor.lock*)",
+      "Bash(rm .claude/monitor/monitor.lock && echo *)",
+      "Bash(rm \"*monitor.lock\"*)",
+      "Bash(rm .claude/monitor/**/*)",
+      "Bash(mkdir .claude/monitor/*)",
+      "Bash(mkdir -p .claude/monitor/*)",
+      "Bash(touch .claude/monitor/*)",
+      "Bash(echo * >> .claude/monitor/*)",
+      "Bash(cat .claude/monitor/*)",
+      "Bash(tail .claude/monitor/*)",
+      "Bash(tail -n * .claude/monitor/*)",
+      "Bash(head .claude/monitor/*)",
+      "Bash(ls .claude/monitor/*)",
+      "Bash(ls -la .claude/monitor/*)",
+      "Bash(stat .claude/monitor/*)",
+      "Bash(cp .claude/monitor/* .claude/monitor/*)",
+      "Bash(cp .claude/monitor/MEMORY.md.template .claude/monitor/MEMORY.md*)"
     ]
   }
 }
