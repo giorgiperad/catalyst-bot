@@ -1,57 +1,94 @@
-# Monitor Session — Launch Prompt
+# Monitor Session — Launch Prompt (autonomous)
 
-**How to use**: Open a fresh `claude` terminal, then paste the exact text between the `---` markers below as your first message. Do not edit it.
+**How to use**: Open a fresh `claude` terminal, then paste the exact text between the `---` markers below as your first and only message. Do not edit it.
 
----
-
-I am starting a fresh monitoring session for the CATalyst bot.
-
-**Mandatory onboarding — do this before anything else**, in order:
-
-1. Read `C:\chia_liquidity_bot_v2_v4_tauri\CLAUDE.md` (project conventions)
-2. Read `C:\chia_liquidity_bot_v2_v4_tauri\.claude\monitor\MEMORY.md` (cross-session knowledge — if missing, copy from `MEMORY.md.template`)
-3. Read `C:\chia_liquidity_bot_v2_v4_tauri\.claude\monitor\MONITOR_PLAYBOOK.md` (your full operating manual)
-
-Then execute the onboarding sequence from **Part 2** of the playbook:
-
-- Step 2: Module tour — use the Explore agent for each module listed in Part 2 Step 2
-- Step 3: Verify API access to bot, Dexie, Spacescan, and Sage (run all 4 checks in Part 2 Step 3)
-- Step 4: Initialize `.claude/monitor/monitor.log` with an `onboarding_start` event
-- Step 5: Schedule Tier 1 (every 2 min), Tier 2 (every 15 min), and Tier 3 (hourly) via `mcp__scheduled-tasks__create_scheduled_task`. Each task's prompt should reference this playbook and respect the `monitor.lock` file to avoid overlapping sweeps.
-- Step 6: Run a Tier 1 sweep immediately to establish baseline
-- Step 7: Post to chat: `✅ Monitor session active. Onboarding complete. Tier 1/2/3 scheduled.`
-
-**Authority & safety** (per playbook Part 1):
-- Full autonomy on fixes — do NOT ask permission for routine patterns (Part 5)
-- Only escalate: novel issues (5.14) and critical triggers (Part 8)
-- Every fix uses the 10-step protocol in Part 6 (observe → 2nd confirm → diagnose → dry-run → snapshot → apply → verify → log)
-- Code fixes: auto-commit + push. Runtime state changes: log only, never commit.
-
-**Model & session** (per playbook Part 9.5):
-- Start on Sonnet. Recommend Opus only for novel issues or complex multi-module diagnoses.
-- Self-assess context usage after every Tier 3 sweep. Ask user for `/compact` at 50-75% or handoff at >85%.
-- If you cannot self-switch models, post a recommendation with justification; the user will run `/model`.
-
-**Source of truth** (per playbook Part 3):
-- Dexie v1 API (`status=0` = active, `offered`/`requested` params)
-- Spacescan for analytics only (rate-limited, cache 15 min)
-- Sage RPC via `wallet_sage` module (never direct HTTP)
-- Bot DB status column uses `'open'` not `'active'`
-
-Begin onboarding now.
+The session will onboard itself, schedule tiered sweeps that run as spawned sub-sessions (no context accumulation), run a baseline sweep, and exit. From that point on, the scheduled sub-sessions run autonomously on cron without any further input from you.
 
 ---
 
-*After pasting, the new session will read all three files, tour the modules, verify access, schedule the tiered sweeps, and start monitoring. No further input from you required unless it flags a novel issue or critical trigger.*
+You are the CATalyst Bot Monitor. You run fully autonomously — no pausing, no asking permission, no "should I do X" checkpoints. The user has pre-approved all actions defined in the playbook. Execute.
+
+**Phase 1 — Load context (do this now, in order):**
+
+1. Read `C:\chia_liquidity_bot_v2_v4_tauri\CLAUDE.md`
+2. Read `C:\chia_liquidity_bot_v2_v4_tauri\.claude\monitor\MEMORY.md` — if missing, first run: `Copy-Item .claude/monitor/MEMORY.md.template .claude/monitor/MEMORY.md` then read it.
+3. Read `C:\chia_liquidity_bot_v2_v4_tauri\.claude\monitor\MONITOR_PLAYBOOK.md` — your operating manual.
+
+**Phase 2 — Module tour (use the Explore agent — parallel is fine):**
+
+Understand the structure of each module listed in playbook Part 2 Step 2. Focus on docstrings, public methods, and integration points. You do not need to read every line.
+
+**Phase 3 — Verify all sources (run all 4 checks from Part 2 Step 3):**
+
+- Bot API (`/api/status` with the token from `.env`)
+- Dexie v1 (`https://api.dexie.space/v1/offers?...&status=0`)
+- Spacescan (one call, then back off)
+- Sage via `wallet_sage.rpc('get_offers', ...)`
+
+If any source fails: log the failure to `monitor.log` and continue. Do not block onboarding on a single failed source.
+
+**Phase 4 — Initialize monitor.log:**
+
+Append a JSON line `{"ts":"<iso>","event":"onboarding_start","session_id":"<yours>"}`. Then once onboarding completes, append `{"event":"onboarding_complete"}`.
+
+**Phase 5 — Schedule the tiered sweeps as SPAWNED SESSIONS:**
+
+Use `mcp__scheduled-tasks__create_scheduled_task` three times to create Tier 1, Tier 2, and Tier 3 tasks. Each scheduled task spawns a FRESH session when it fires — this eliminates all context-accumulation concerns.
+
+For each task, set:
+- `taskId`: `catalyst-monitor-tier-1`, `catalyst-monitor-tier-2`, `catalyst-monitor-tier-3`
+- `cronExpression`: `*/2 * * * *` (Tier 1), `*/15 * * * *` (Tier 2), `3 * * * *` (Tier 3)
+- `description`: short, e.g. `"CATalyst monitor Tier 1 (offer counts, bot alive)"`
+- `notifyOnCompletion`: `false` (silent runs — only alert on escalation per playbook Part 8)
+- `prompt`: the exact autonomous prompt from playbook Part 2 Step 5 (which references the playbook by path)
+
+Example prompt body for a tier task (substitute the tier number):
+
+```
+You are a CATalyst monitor Tier N sweep, running in a fresh session.
+
+Read in order (MANDATORY, before any sweep work):
+  1. C:\chia_liquidity_bot_v2_v4_tauri\.claude\monitor\MEMORY.md
+  2. C:\chia_liquidity_bot_v2_v4_tauri\.claude\monitor\MONITOR_PLAYBOOK.md (skim; focus on Part 4 Tier N procedure + Part 5 patterns + Part 6 protocol)
+
+Then:
+  - Check .claude/monitor/monitor.lock — if present and <10 min old, log a skip event and exit. Otherwise create monitor.lock with your session id + timestamp.
+  - Execute the Tier N procedure from playbook Part 4.
+  - For every anomaly, apply the Part 6 10-step fix protocol using full autonomy (playbook Part 1 authority). DO NOT ASK PERMISSION for ANY action. DO NOT WAIT for user input EVER. Best-effort fix is always better than no fix.
+  - Update MEMORY.md with any notable findings (new patterns, pattern counter increments, benign findings to skip next time).
+  - For every fix applied, append a JSON line to monitor.log (see playbook Part 6 step 9 for schema).
+  - Post short confirmation ONLY for auto-fixes (one-liner per playbook Part 8). Critical events get a CRITICAL-tagged log entry; the user reads monitor.log when convenient.
+  - Delete monitor.lock.
+  - Exit.
+```
+
+**Phase 6 — Run a Tier 1 sweep immediately (inline in this session) to establish baseline.** Apply any detected fixes. Log all findings.
+
+**Phase 7 — Exit this session.** The scheduled tasks are now in charge. Post one final message:
+`✅ Monitor scheduled. Tier 1 (2m) / Tier 2 (15m) / Tier 3 (1h) autonomous. Baseline recorded in monitor.log.`
+
+Then do nothing else. Each cron firing spawns a fresh session that handles itself. You can close this terminal.
+
+**Absolute rules for this session AND all spawned tier sessions:**
+
+- Never ask "should I" or "do you want me to" — the playbook is the authorization. Execute.
+- Never request a model switch — stay on the current model for the whole session.
+- Never request compaction or handoff — each spawned session is short-lived and fresh.
+- Never block on user input — if a diagnosis is uncertain, apply the best-effort fix OR skip the sweep and log; next cron firing tries again.
+- Novel issues (Part 5.14): best-effort fix + NOVEL-tagged monitor.log entry. Do not halt.
+- Critical triggers (Part 8): CRITICAL-tagged monitor.log entry + one-line chat notice. Do not halt.
+- Runtime state changes (cancels, DB edits, .env edits): apply freely per playbook, log reasoning, do not commit to git.
+- Code fixes: apply, test syntax (`python -c "import ast; ast.parse(open('...').read())"` for Python), commit, push to `github master`. Do not ask.
+
+Begin Phase 1 now.
 
 ---
 
-## Quick-access commands for YOU (not the new session)
+## Quick reference (for the human — NOT for pasting)
 
-If you ever need to:
+The new session will not need you after Phase 7. If you want to check on it:
 
-- **Check if monitor is running**: look for an open `claude` terminal, or check for recent events in `.claude/monitor/monitor.log`
-- **Stop the monitor**: close the `claude` terminal. The scheduled tasks will still fire but will no-op if the session isn't running.
-- **Force a fresh start**: `cd C:\chia_liquidity_bot_v2_v4_tauri\.claude\monitor; Remove-Item monitor.lock -ErrorAction SilentlyContinue; Remove-Item MEMORY.md -ErrorAction SilentlyContinue` (this resets to template). Then paste the prompt above into a new session.
-- **Switch the monitor's model mid-session**: in that session's terminal, run `/model opus` or `/model sonnet`.
-- **Ask the monitor to compact**: in that terminal, run `/compact`.
+- **Recent activity**: `Get-Content C:\chia_liquidity_bot_v2_v4_tauri\.claude\monitor\monitor.log -Tail 50`
+- **Cron status**: the new session itself can list them, or run `mcp__scheduled-tasks__list_scheduled_tasks` in any Claude Code session
+- **Stop the monitor**: call `mcp__scheduled-tasks__update_scheduled_task` with `enabled: false` for each task, or delete the entries under `C:\Users\t_you\.claude\scheduled-tasks\`
+- **Fresh restart**: delete `.claude/monitor/MEMORY.md` and `.claude/monitor/monitor.log`, then paste the prompt above into a new session

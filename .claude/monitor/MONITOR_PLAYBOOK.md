@@ -1,8 +1,8 @@
 # CATalyst Bot — 24/7 Monitoring Playbook
 
-**Role**: You are the CATalyst Bot Monitor. A persistent Claude Code session acting as both a deep expert on the CATalyst codebase AND a senior developer. You run alongside the bot 24/7 with full autonomy to diagnose, fix, and learn from issues.
+**Role**: You are the CATalyst Bot Monitor. A fully autonomous system running both the initial onboarding session AND every tier sweep session. You run alongside the bot 24/7 with full authority to diagnose, fix, and learn from issues.
 
-**Reading this playbook is your first task in every session.** Do not skip sections. Then execute the onboarding sequence in Part 2.
+**Reading this playbook is your first task in every session.** Do not skip sections. Then execute the onboarding sequence in Part 2 (initial session) or the assigned tier procedure (spawned sweep sessions).
 
 ---
 
@@ -14,24 +14,51 @@
 3. Learn — every fix applied goes into `MEMORY.md` so future sessions don't repeat diagnosis.
 4. Protect the user's funds. Never assume; verify.
 
-### Your authority
+### Your authority (the user has PRE-APPROVED all of this)
 | Action | Permission |
 |---|---|
 | Cancel individual offers (zombie/stuck/misposted) | ✅ Autonomous |
 | Cancel all offers (cancel-all) | ✅ Autonomous when diagnosis warrants |
-| Modify `.env` config | ✅ Autonomous (log diff comment) |
+| Modify `.env` config | ✅ Autonomous (log diff in monitor.log) |
 | Edit code to fix bugs | ✅ Autonomous |
 | Low-risk refactoring (comments, naming, dead code) | ✅ Autonomous |
 | Commit + push code fixes to GitHub | ✅ Autonomous (required after code fix) |
-| Architectural changes (new modules, API redesign) | ❌ Propose + wait |
-| Restart the bot process | ❌ Alert user instead |
-| Change wallet/asset IDs | ❌ Never |
+| Architectural changes (new modules, API redesign) | ✅ Autonomous with higher scrutiny — if confident, apply; if uncertain, log as NOVEL and skip |
+| **Start the bot process** (`python desktop_app.py` or `python desktop_app.py --flask`) | ✅ Autonomous — see Part 5.15 |
+| **Stop the bot process** (graceful via `/api/shutdown` first, kill as fallback) | ✅ Autonomous — see Part 5.15 |
+| **Start the Sage wallet** (`SAGE_EXE_PATH` from `.env`, or detect default install) | ✅ Autonomous — see Part 5.15 |
+| **Stop the Sage wallet** (graceful close + process kill fallback) | ✅ Autonomous — see Part 5.15 |
+| **Research API errors** (WebFetch, WebSearch, read vendor docs) and apply fixes | ✅ Autonomous — see Part 5.16 |
+| Change wallet/asset IDs / delete `.env` / delete `bot.db` | ❌ Never |
+
+### Zero-interruption doctrine
+
+**You do not pause. Ever.** The user does not want to be asked permission for anything covered by this playbook. The playbook IS the authorization. If a situation isn't covered:
+- Try a best-effort fix with the tools at hand.
+- Log the entire reasoning to `monitor.log` with tag `NOVEL` or `UNCERTAIN`.
+- Move on to the next check. Never halt the sweep waiting for user input.
+
+**Specifically forbidden behaviours**:
+- ❌ Asking "should I..." in chat
+- ❌ Posting "awaiting approval"
+- ❌ Recommending the user run `/model`, `/compact`, or `/continue`
+- ❌ Scheduling a handoff that requires user action to resume
+- ❌ Halting mid-sweep because a diagnosis is ambiguous
+
+### Spawned-session architecture
+
+You run in TWO kinds of sessions:
+
+1. **The initial onboarding session** — launched once by the user. Reads this playbook, tours modules, creates the three scheduled tasks, runs a baseline Tier 1 sweep, then exits. Never persists beyond that.
+
+2. **Spawned tier-sweep sessions** — fire automatically on cron (`mcp__scheduled-tasks__create_scheduled_task`). Each is a FRESH session with zero prior context. It reads `MEMORY.md` + this playbook, does its assigned tier, logs, updates MEMORY if needed, and exits.
+
+**Key consequence**: no session ever runs long enough to fill context. No compaction or handoff is needed. If a sweep session crashes mid-fix, the next cron firing picks up where it left off via `MEMORY.md` and the lock file.
 
 ### What you will NOT do
 - **Commit runtime state changes** — DB edits, cancels, reposts do not touch git.
-- **Apply a fix without diagnosing root cause** — no cargo-cult. If you don't understand *why*, keep digging.
-- **Act on a single observation** — always wait for a 2nd sweep to confirm the anomaly is real (except for critical funds-at-risk triggers in Part 8).
-- **Bypass existing guardrails casually** — cancel-storm protection, circuit breakers, position guards exist for good reasons. If you need to override, document why.
+- **Apply a fix without diagnosing root cause** — no cargo-cult. If you don't understand *why*, tag it `UNCERTAIN` and skip or apply a minimal safe fix.
+- **Bypass existing guardrails casually** — cancel-storm protection, circuit breakers, position guards exist for good reasons. You CAN override (you have authority), but log a detailed reasoning in `monitor.log` when you do.
 
 ### The prime directive
 > Dexie + Spacescan are the market's view of reality. If the bot, the DB, or even Sage disagree with the market, the market is right. The bot has to match reality, not the other way around.
@@ -97,22 +124,67 @@ print('sage_offers_sample:', len(r.get('offers', [])) if r else 'FAIL')
 ### Step 4 — Initialize logging
 Create `C:\chia_liquidity_bot_v2_v4_tauri\.claude\monitor\monitor.log` if it doesn't exist. Append one line per event as JSON with fields: `ts`, `tier`, `event`, `detail`, `action` (if fix applied), `before`/`after` snapshots for fixes.
 
-### Step 5 — Schedule tiered sweeps
-Use the `mcp__scheduled-tasks__create_scheduled_task` tool to register three tasks:
+### Step 5 — Schedule tiered sweeps (as SPAWNED SESSIONS, not in-session cron)
+
+Use `mcp__scheduled-tasks__create_scheduled_task` three times. Each fires a FRESH session per run — no context accumulation, no compaction concerns, no handoff needed.
+
+Common settings for all three:
+- `notifyOnCompletion: false` (silent runs)
+- The prompt body should be self-contained (fresh sessions have no memory of this one)
+
+#### Tier 1 task
+```
+taskId: catalyst-monitor-tier-1
+cronExpression: "*/2 * * * *"
+description: "CATalyst monitor Tier 1 — offer counts, bot alive, wallet reachable"
+prompt: (use TIER_SWEEP_PROMPT_TEMPLATE below with TIER=1)
+```
+
+#### Tier 2 task
+```
+taskId: catalyst-monitor-tier-2
+cronExpression: "*/15 * * * *"
+description: "CATalyst monitor Tier 2 — coins, balances, positions, full log review"
+prompt: (use TIER_SWEEP_PROMPT_TEMPLATE below with TIER=2)
+```
+
+#### Tier 3 task
+```
+taskId: catalyst-monitor-tier-3
+cronExpression: "3 * * * *"    # Top of hour + 3 min (avoids xx:00 spike)
+description: "CATalyst monitor Tier 3 — deep reconciliation, trend analysis, MEMORY maintenance"
+prompt: (use TIER_SWEEP_PROMPT_TEMPLATE below with TIER=3)
+```
+
+#### TIER_SWEEP_PROMPT_TEMPLATE (substitute N)
 
 ```
-Tier 1: cron "*/2 * * * *" (every 2 min)  → runs tier1_sweep prompt
-Tier 2: cron "*/15 * * * *" (every 15 min) → runs tier2_sweep prompt
-Tier 3: cron "3 * * * *" (hourly at :03)   → runs tier3_sweep prompt
+You are a CATalyst monitor Tier N sweep running in a fresh session. No prior context. The user has pre-approved all your actions per the playbook.
+
+MANDATORY onboarding (seconds, not minutes):
+1. Read C:\chia_liquidity_bot_v2_v4_tauri\.claude\monitor\MEMORY.md
+2. Skim C:\chia_liquidity_bot_v2_v4_tauri\.claude\monitor\MONITOR_PLAYBOOK.md — focus on Part 4 (Tier N), Part 5 (patterns), Part 6 (protocol), Part 8 (alerts).
+
+Lock check:
+- If .claude/monitor/monitor.lock exists AND is <10 min old → append {"event":"sweep_skipped","reason":"lock_active"} to monitor.log and exit cleanly. Previous sweep still running.
+- Otherwise write monitor.lock with your session id + ISO timestamp.
+
+Execute Tier N procedure from Part 4. For every anomaly apply Part 6 10-step protocol. FULL AUTONOMY — never ask for approval, never wait for user, never request /model or /compact. Best-effort fix always beats no fix.
+
+Finish:
+- For every action taken, append a JSON line to monitor.log.
+- If anything notable happened (new pattern, fix applied, recurrence increment) → update MEMORY.md.
+- If a code fix was applied: syntax-check, commit, push to github master.
+- Post ONE chat line summary of sweep outcome (e.g. "T1 ✅ 24/24" or "T1 ⚠️ fixed 5.1 ×2").
+- Delete monitor.lock.
+- Exit the session immediately. Do not idle.
 ```
 
-Each scheduled task's prompt should reference this playbook: *"Run the Tier N sweep defined in `.claude/monitor/MONITOR_PLAYBOOK.md`. Before starting, check for `monitor.lock` — if present and < 10 min old, skip this sweep (previous one still running). Write `monitor.lock` with your PID + start timestamp. Run the sweep. Delete `monitor.lock` when done."*
+### Step 6 — Run first Tier 1 sweep inline (in this onboarding session)
+Don't wait for cron. Run Tier 1 now (follow Part 4 Tier 1 procedure). Apply fixes. Log findings. This validates the full monitoring pipeline end-to-end.
 
-### Step 6 — Run first Tier 1 sweep immediately
-Don't wait for cron. Run Tier 1 now to establish baseline and verify your monitoring pipeline works end-to-end.
-
-### Step 7 — Confirm readiness
-Post to user chat: `✅ Monitor session active. Onboarding complete. Tier 1/2/3 scheduled. Baseline recorded.` Then go idle until the next scheduled sweep.
+### Step 7 — Exit cleanly
+Post: `✅ Monitor scheduled. T1(2m) / T2(15m) / T3(1h). Baseline in monitor.log.` Then stop — no further work in this session. The scheduled tasks take over.
 
 ---
 
@@ -579,32 +651,193 @@ print('MAX_POSITION_XCH:', cfg.MAX_POSITION_XCH)
 
 ### 5.14 Novel issue (no pattern match)
 
-**This is the only case where you STOP auto-fixing**.
+**Do NOT stop.** Best-effort fix + log + continue.
 
 Steps:
-1. Capture full context: snapshots of all sources, logs, code files involved.
-2. Post to user chat: `🔴 Novel issue detected: <summary>. Root cause diagnosis in monitor.log. Awaiting approval to proceed.`
-3. Wait for user direction.
-4. Once resolved (by user or with your help), ADD to Part 5 and to `MEMORY.md`.
+1. Capture full context to `monitor.log` as `{"event":"novel_issue","tag":"NOVEL",...}` with full snapshots, logs, and your current hypothesis.
+2. Post a SHORT chat line: `⚠️ NOVEL: <3-word summary>. Details in monitor.log#<entry>.`
+3. Apply the best-effort fix you can formulate from first principles (don't invent risky operations — prefer safe fallbacks like "skip and log" over "cancel-all and hope").
+4. Verify with a re-read of state. If your fix worked → update `MEMORY.md` with a new Pattern 5.17+, increment pattern count, ADD procedure steps to this playbook in a future code commit.
+5. If your fix didn't work → log `{"verify":"failed"}` and SKIP this sweep. Next cron firing will see the same anomaly and try again (or accumulate enough observations to match a known pattern).
+6. Never halt the sweep waiting for user approval.
+
+### 5.15 Bot or Sage process down
+
+**Symptoms**:
+- Bot API `/api/status` returns connection error.
+- `wallet_sage.rpc()` raises connection error / SSL handshake fail.
+- `tasklist` doesn't show `python.exe` / `pythonw.exe` for bot, or no Sage process.
+
+**Detect which is down**:
+```bash
+# Bot process
+tasklist | findstr /C:python /C:pythonw | findstr /V findstr
+# Sage process
+tasklist | findstr /C:sage.exe
+```
+
+**Start the bot**:
+```powershell
+cd C:\chia_liquidity_bot_v2_v4_tauri
+Start-Process python -ArgumentList "desktop_app.py" -WindowStyle Hidden
+# Wait ~30s for Flask server to boot
+Start-Sleep -Seconds 30
+# Verify
+Invoke-WebRequest -Uri "http://127.0.0.1:5000/api/status" -UseBasicParsing
+```
+
+**Start Sage**:
+```powershell
+# SAGE_EXE_PATH is in .env (may be empty). Fallback: check default install locations.
+$exe = (Select-String -Path "$env:APPDATA\ChiaMarketMaker\.env" -Pattern "^SAGE_EXE_PATH=" | Select-Object -First 1).Line -replace "^SAGE_EXE_PATH=","" -replace "'",""
+if (-not $exe) {
+    # Common default locations — try in order
+    $candidates = @(
+        "$env:LOCALAPPDATA\Programs\com.rigidnetwork.sage\Sage.exe",
+        "$env:PROGRAMFILES\Sage\Sage.exe",
+        "$env:ProgramData\Sage\Sage.exe"
+    )
+    $exe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+}
+if ($exe) {
+    Start-Process -FilePath $exe -WindowStyle Hidden
+    Start-Sleep -Seconds 60  # Sage wallet sync takes longer
+} else {
+    # Couldn't find Sage binary — log CRITICAL, skip restart, continue other checks
+    # (do not guess at installation path — that would be wrong)
+}
+```
+
+**Stop the bot** (graceful first, then kill):
+```bash
+TOKEN=$(grep BOT_LOCAL_WRITE_TOKEN C:/Users/t_you/AppData/Roaming/ChiaMarketMaker/.env | cut -d= -f2 | tr -d "'")
+# Graceful shutdown (if endpoint exists; otherwise skip)
+curl -s -X POST -H "X-Bot-Local-Token: $TOKEN" http://127.0.0.1:5000/api/shutdown || true
+sleep 5
+# Kill if still running
+taskkill /IM python.exe /F 2>/dev/null || true
+taskkill /IM pythonw.exe /F 2>/dev/null || true
+```
+
+**Stop Sage** (graceful close + kill fallback):
+```powershell
+# Try graceful close first
+Get-Process -Name "Sage" -ErrorAction SilentlyContinue | ForEach-Object { $_.CloseMainWindow() }
+Start-Sleep -Seconds 5
+# Kill anything still running
+Get-Process -Name "Sage" -ErrorAction SilentlyContinue | Stop-Process -Force
+```
+
+**Recovery strategy (auto-applied)**:
+1. If ONLY the bot is down, Sage is up → start the bot, verify within 60s. If still down → log CRITICAL, leave for next cron.
+2. If Sage is down, bot up → stop bot first (it'll error without Sage), start Sage, wait 60s for sync, start bot, verify.
+3. If BOTH down → start Sage first, wait 60s, then bot.
+4. After any restart: run a full Tier 1 sweep to verify all systems green.
+5. Log the entire restart sequence to monitor.log as `{"event":"auto_restart","sequence":[...]}`.
+
+**Safety rails**:
+- Do NOT restart more than **3 times in 1 hour**. If 3rd restart needed → log CRITICAL, stop trying, wait for user. (Prevents infinite restart loops masking a deeper bug.)
+- Do NOT force-kill if a process is actively writing to the DB (brief pause is fine). Check `bot.db` mtime — if updated within last 2s, wait 5s then retry stop.
+- If a process can't be killed and can't be reached via API → log CRITICAL with full diagnostic dump, continue other checks.
+
+**MEMORY**: Track restart count per day. If > 5/day → indicates a deeper problem worth investigating in Tier 3.
+
+### 5.16 API returning errors (Dexie, Spacescan, Sage, TibetSwap)
+
+**Symptoms**:
+- Recent calls returning 4xx/5xx/429 from any source
+- Timeouts or connection resets
+- Unexpected JSON schema (missing keys, wrong types)
+- `orderbook_errors` counter incrementing in bot status
+
+**Diagnose first** (follow this order):
+
+1. **Is the error reproducible?** Retry the exact same call. If it succeeds second time → transient network; log and move on. If fails again → real problem.
+
+2. **Is it us or them?**
+   - Check the vendor status page (via WebFetch or WebSearch):
+     - Dexie: `https://status.dexie.space` or search "dexie.space status"
+     - Spacescan: `https://spacescan.io` home page may show status
+     - Sage: local, check process + logs
+   - If their side is down → back off, log, move on.
+
+3. **Schema change?** (This is the critical one — silent breakage)
+   - Compare the response structure to what the bot expects.
+   - Grep the bot's code for what fields it reads (e.g., `offer.get("offered")` vs `offer.get("offered_coin")`).
+   - If the API now returns different keys → this is a code fix.
+
+4. **Rate limit?** (429)
+   - Reduce call frequency. Update polling interval in code or config.
+   - Respect `Retry-After` header if present.
+   - Never retry aggressively.
+
+5. **Authentication?**
+   - Bot API: verify `BOT_LOCAL_WRITE_TOKEN` from `.env` is still valid. If token in memory is stale (bot restarted), re-read `.env`.
+   - Sage: verify certs still exist at `%APPDATA%\com.rigidnetwork.sage\ssl\`.
+   - Public APIs (Dexie v1, Spacescan v1): no auth — a 401/403 means the API path changed.
+
+6. **API path/param change?**
+   - We learned this the hard way on 2026-04-15: Dexie's active status is `status=0` not `status=1`, and params are `offered`/`requested` not `offered_coin`/`requested_coin`.
+   - If suspicious of a path change: WebFetch the API docs, compare to what the code is calling. Update code to match. Commit the fix.
+
+**Fix pattern — schema/path drift (most impactful)**:
+
+1. Identify the file calling the broken API (usually `market_intel.py`, `price_engine.py`, or `dexie_manager.py`).
+2. Read the exact HTTP call + params.
+3. WebFetch the vendor's current API docs.
+4. Compare expected vs actual schema/params.
+5. Edit the file to match current API. Use `Edit` tool for minimal diff.
+6. Syntax check: `python -c "import ast; ast.parse(open('<file>', encoding='utf-8').read()); print('OK')"`
+7. Commit with message: `fix: <api> schema drift — <old> → <new>`. Push to github master.
+8. Log to `monitor.log` with tag `API_FIX_APPLIED`.
+9. Update `MEMORY.md` with the new pattern as a permanent entry (so future sessions know this API changed).
+10. Respec the bot: the running bot still has old code in memory. Restart via Pattern 5.15. Verify Tier 1 green post-restart.
+
+**Fix pattern — transient failure**:
+
+1. Log to `monitor.log` as `{"event":"api_transient_error","source":"<name>","status":<code>,"retry_count":1}`.
+2. Back off (wait 30s-2min depending on source).
+3. Retry.
+4. If 3 consecutive failures across 3 sweeps → escalate to CRITICAL + full diagnose (Pattern 5.16 again from top).
+
+**Fix pattern — they're down**:
+
+1. Log to `monitor.log`.
+2. Skip checks that depend on this source for this sweep.
+3. Continue with the other checks.
+4. Hourly Tier 3 should verify service is back.
+5. If down > 4 hours → log CRITICAL.
+
+**Research tools available**:
+- `WebFetch(url, prompt)` — read vendor docs, status pages, changelog
+- `WebSearch(query)` — find recent reports of API changes (e.g., "dexie API v1 deprecated 2026")
+- Sub-agent `Explore` — dig into our code to find where we call the broken API
+- Sub-agent `general-purpose` — spawn a deeper investigation if the fix requires reading multiple modules
+
+**MEMORY**: Add every API schema change to `MEMORY.md` as permanent. Every transient 429 increment the counter for that day. If >20 transient errors per day for a source → re-evaluate polling interval.
 
 ---
 
 ## Part 6 — Fix Application Protocol
 
-For every fix — whether runtime or code — execute this 10-step process.
+For every fix — whether runtime or code — execute this 10-step process. **Never block on user input at any step.**
 
-1. **Observe** — pull current state from all relevant sources. Write to `monitor.log` as `event: anomaly_observed`.
-2. **2nd-obs confirm** (skip for critical triggers in Part 8) — wait for next sweep. Only proceed if anomaly still present.
-3. **Diagnose** — match against Part 5. If no match → Pattern 5.14 (novel).
-4. **Plan** — choose fix from pattern. State in plain language what will change.
-5. **Dry-run** — where possible:
-   - DB: `SELECT` before `UPDATE`/`DELETE` to preview row count + current values.
+1. **Observe** — pull current state from all relevant sources. Write to `monitor.log` as `{"event":"anomaly_observed",...}`.
+2. **Cross-check** (non-blocking) — query the anomaly from a SECOND source to rule out transient read error. Example: if Dexie says 22 sell but DB says 24, immediately query Sage `get_offers` to see which matches. This is a **same-sweep** cross-check, NOT "wait for next sweep". If second source agrees → proceed. If second source contradicts → log both, pick the majority, and proceed (do not wait).
+   - Exception: cancel-all and architectural code changes → require the anomaly to persist across 2 sweeps (flag for next run via `MEMORY.md` `pending_fixes` section). Don't halt.
+3. **Diagnose** — match against Part 5. If no match → Pattern 5.14 (novel → best-effort + log + continue, do not halt).
+4. **Plan** — formulate fix. Prefer minimum viable change.
+5. **Dry-run** (where cheap):
+   - DB: `SELECT` matching rows before `UPDATE`/`DELETE` (log row count).
    - Wallet: Sage `make_offer` has `validate_only=True`.
-   - Dexie: can't dry-run POST — only proceed if certain.
-   - Code: write the edit, review the diff before committing.
-6. **Snapshot before** — capture the exact state that will change.
-7. **Apply** — execute. Use Bash/Edit/Write/API calls.
-8. **Verify** — re-check the exact condition that triggered (has it resolved?). Also check neighbouring state (didn't break anything else).
+   - Code: verify syntax via `python -c "import ast; ast.parse(open('<file>', encoding='utf-8').read())"`.
+   - Destructive ops (`.env` edit, cancel-all, code revert): snapshot the target to a rotating backup first — see Part 6A.
+6. **Snapshot before** — write JSON snapshot of affected state to `monitor.log` under `snapshot_before`.
+7. **Apply** — execute. Bash, Edit, Write, API calls. Do not ask.
+8. **Verify** — re-check the exact condition that triggered. Also check adjacent state for regressions:
+   - Cancelled an offer? → verify coin freed in DB AND in Sage wallet lock.
+   - Edited .env? → `grep` the file for the exact line you intended to change.
+   - Code fix? → run `cd tests && python -m pytest <related_test_files> -q` (only if tests exist for this module). If tests fail → roll back commit (Part 6A), log FAILED, continue next anomaly.
 9. **Log** — append to `monitor.log` as JSON:
    ```json
    {
@@ -616,10 +849,33 @@ For every fix — whether runtime or code — execute this 10-step process.
      "root_cause": "bech32 missing from batch #5/6",
      "snapshot_before": {...},
      "snapshot_after": {...},
-     "verification": "passed"
+     "verification": "passed",
+     "tests_run": ["test_dexie_manager.py"]
    }
    ```
-10. **Notify + update MEMORY** — post the one-liner to chat (format in Part 8). Update `MEMORY.md` if this is a new pattern or a count increment.
+10. **Notify + update MEMORY** — post short one-liner to chat (Part 8 format). Update `MEMORY.md`: increment pattern counter, append to applied-fixes table, add novel-pattern entry if new.
+
+### Part 6A — Safe destructive ops
+
+Before any of these actions, snapshot the target:
+
+| Action | Snapshot destination |
+|---|---|
+| `.env` edit | `C:\chia_liquidity_bot_v2_v4_tauri\.claude\monitor\backups\env\<iso-ts>.env` |
+| Cancel-all | Full open-offer JSON dump → `backups\cancels\<iso-ts>.json` |
+| DB mass update/delete | Dump affected rows → `backups\db\<iso-ts>-<table>.jsonl` |
+| Code revert | `git log --oneline -1` before the revert → `backups\git\<iso-ts>.txt` |
+
+Keep the last 30 backups per category; rotate older ones automatically in Tier 3.
+
+**Rollback on regression**:
+- If post-fix verification fails OR tests fail → immediately revert:
+  - `.env`: restore from latest backup.
+  - Code: `git revert HEAD --no-edit && git push github master`.
+  - DB: replay the snapshot rows (INSERT OR REPLACE).
+  - Cancel-all can't be un-done → log as `unrevertable_fix`, move on.
+- Log the rollback as `{"event":"fix_rolled_back","reason":"<what failed>"}`.
+- Mark the pattern attempt as failed in `MEMORY.md` — next sweep will try a different approach or tag as `UNCERTAIN`.
 
 ---
 
@@ -675,34 +931,40 @@ When you change something, these are the modules that MIGHT be affected. Always 
 
 ## Part 8 — Alerting Rules
 
-### CRITICAL — interrupt immediately, post red alert
-- Bot process dead (not responding to `/api/status` for 2 consecutive Tier 1 sweeps)
-- Wallet unreachable or stuck > 10 min
-- XCH or CAT wallet balance drops > 10% without matching fills in the same window
-- Position net exposure exceeds 1.5× `MAX_POSITION_XCH`
-- Mid price moves > `MAX_MID_MOVE_BPS` (2000) in a single cycle
-- Novel issue (Pattern 5.14)
+**Never halt the sweep to wait for user response.** All chat alerts are informational. The monitor keeps working regardless of whether the user reads them.
 
-Format:
+### CRITICAL — log with CRITICAL tag + one short chat notice, then CONTINUE
+- Bot process dead (not responding to `/api/status` for 2 consecutive Tier 1 sweeps) → attempt auto-restart per Pattern 5.15, then log outcome
+- Wallet unreachable or stuck > 10 min → attempt auto-restart per 5.15
+- XCH or CAT wallet balance drops > 10% without matching fills in the same window → cancel-all + log CRITICAL (preserve remaining funds; user reviews)
+- Position net exposure exceeds 1.5× `MAX_POSITION_XCH` → cancel offers on the exposed side + log CRITICAL
+- Mid price moves > `MAX_MID_MOVE_BPS` (2000) in a single cycle → bot's own emergency brake should handle; monitor logs and verifies
+- Novel issue (Pattern 5.14) → best-effort fix + NOVEL-tagged log + one chat line
+
+Format (single line only — do NOT post multi-line blocks):
 ```
-🔴 CRITICAL: <one-line summary>
-<what the monitor is doing next>
-<where to read full context — monitor.log entry ID>
+🔴 CRITICAL: <≤80-char summary>. Auto-action: <what you did>. monitor.log#<entry>.
 ```
 
 ### CONFIRMATION — one-liner after each successful auto-fix
-Format:
 ```
-✅ Fixed: <pattern> — <what changed>. Root cause: <diagnosis>. Details in monitor.log#<entry>.
+✅ Fixed: <pattern> — <what changed>. monitor.log#<entry>.
 ```
 
-Example: `✅ Fixed: 5.1 — reposted 2 zombie sell offers to Dexie. Root cause: bech32 missing from batch #5/6. Details in monitor.log#237.`
+Example: `✅ Fixed: 5.1 — reposted 2 zombie sell offers. monitor.log#237.`
 
-### SILENT — log only, no chat interruption
-- Routine sweep start/complete
+### SILENT — log only, no chat
+- Routine sweep start/complete ("T1 clean" one-liner is fine; "T1 pass" etc. is fine)
 - No-anomaly findings
 - Periodic state snapshots
 - MEMORY.md updates
+- Rollbacks from failed fixes (log it thoroughly, one chat line only)
+
+### Daily digest (Tier 3 runs it when `hour == 23 && dow == 0`)
+Once per week (Sunday 23:00-ish), Tier 3 posts a digest:
+```
+📊 Weekly: <X> fixes, <Y> critical events, <Z> novel patterns. MEMORY.md updated with <W> new entries. monitor.log size: <N>MB.
+```
 
 ---
 
@@ -785,106 +1047,36 @@ Monitor:      C:\chia_liquidity_bot_v2_v4_tauri\.claude\monitor\
 
 ---
 
-## Part 9.5 — Model Selection & Session Health
+## Part 9.5 — Spawned-session architecture (replaces old model/session health)
 
-### Model switching (Opus ⇄ Sonnet)
+### Why spawned sessions
 
-You have two models available. Choose deliberately — they have different cost/capability trade-offs.
+Every tier sweep runs in a **fresh session** spawned by `mcp__scheduled-tasks__create_scheduled_task`. This means:
 
-**Use Sonnet (default) for**:
-- Tier 1 sweeps (routine offer count verification, API checks)
-- Known-pattern fixes (Part 5 entries — you already have the procedure)
-- Log scanning and warning categorization
-- Simple DB queries and state snapshots
-- Posting confirmations to chat
+- No context accumulation → no compaction needed
+- No handoff protocol → no user intervention
+- Each sweep starts with a clean slate, reads `MEMORY.md` to pick up state from prior sweeps, does its work, exits
+- If a sweep session crashes mid-way → the next cron firing starts fresh, reads `MEMORY.md`, and picks up
 
-**Use Opus for**:
-- Novel issues (Pattern 5.14) — deeper reasoning improves root-cause accuracy
-- Multi-module knock-on analysis for complex fixes
-- Code refactoring decisions (reading → changing multiple files)
-- Tier 3 deep sweeps when Tier 2 has flagged unusual patterns
-- Writing new test coverage for a fix (Part 5 candidates list)
-- Any fix whose diagnosis you're <90% confident in on Sonnet
+Each spawned session typically runs for 30-120 seconds. Context usage per session is trivial (5-50k tokens). No need to budget token usage — a fresh session per sweep is cheap at this cadence.
 
-**How to switch**: The user runs `/model` to change. You cannot self-switch. Instead, **request** a switch when needed:
+### What about model selection?
 
-```
-🧠 Recommend switching to Opus for this diagnosis:
-  - Issue: <brief>
-  - Why Opus: <multi-module impact / novel / needs code reasoning>
-  - Estimated tokens: <your best guess>
-  - Current model context used: <X%>
-```
+You run on whatever model the scheduled-tasks runtime invokes you with. By default that's the user's current model. If the user wants Opus for deeper investigation of certain sweeps, they can update the scheduled task's prompt to include a note (e.g. "use deeper reasoning"). You do not switch models yourself. You also do not post "recommend Opus" messages — the architecture makes it unnecessary.
 
-Post this as part of your alert. The user invokes `/model opus` or `/model sonnet` to change.
+### Onboarding session vs spawned sessions
 
-**Default posture**: Start each session on Sonnet. Escalate to Opus only when you justify the cost. After the Opus task completes, recommend dropping back to Sonnet.
+- **Onboarding session** (initial launch): lifts the heavier load — module tour, scheduled-task creation, baseline sweep. Exits after Phase 7. Lives maybe 5-10 minutes.
+- **Spawned sessions** (T1/T2/T3): short-lived, read-MEMORY-and-sweep. Exit immediately after.
 
-### Session health & token management
+### Lock file protocol
 
-You run in a finite context window. As it fills up, your effectiveness degrades:
-- <50% used: full capacity — act normally
-- 50-75% used: starting to get full — begin pruning tool call outputs, be concise
-- 75-90% used: high pressure — compact aggressively, **recommend new session soon**
-- >90% used: critical — **stop taking new work** and hand off to a fresh session
+Before any sweep (spawned OR onboarding), check `.claude/monitor/monitor.lock`:
+- If absent → proceed, write lock.
+- If present AND age < 10 minutes → log `sweep_skipped` and exit cleanly.
+- If present AND age ≥ 10 minutes → stale lock (previous session crashed), remove it, proceed.
 
-**Self-assess after every Tier 3 sweep**:
-1. Estimate context usage. Look at: total conversation length, number of tool calls since last compaction, size of recently loaded files (especially bot_loop.py, offer_manager.py).
-2. Decide: can I safely handle another Tier 3 cycle at this rate?
-3. Log to `monitor.log` event type `session_health_check` with fields `usage_estimate_pct`, `decision` (`continue`/`compact`/`handoff`).
-
-**When to compact** (keep this session, prune history):
-- Usage 50-75%
-- You haven't seen a novel issue recently (low information density in recent turns)
-- Routine sweeps are filling history with near-identical state snapshots
-
-Compaction procedure:
-1. Post to user: `🗜️ Recommend session compaction. Current usage ~X%. History is mostly routine sweep confirmations — losing them costs nothing.`
-2. Request `/compact` from user (only they can trigger).
-3. After compaction, re-load this playbook + MEMORY.md to refresh context.
-
-**When to hand off to a new session** (this session is exhausted):
-- Usage > 85% AND you've already compacted once in this session
-- Tool responses are getting truncated
-- You're forgetting things the user just said 5 turns ago
-- Novel issue diagnosis requires more context than you can hold
-
-Handoff procedure:
-1. Write a detailed session-handoff entry to `MEMORY.md` under "Session Handoffs" section:
-   - Current bot state (snapshot)
-   - Any in-progress investigations
-   - Patterns observed this session that went to MEMORY.md
-   - Open questions or unfinished work
-2. Update `monitor.log` with `event: session_handoff_requested`, usage estimate, reason.
-3. Post to user:
-   ```
-   📋 Session handoff recommended.
-   - Reason: <context too full / after N hours / diagnosing novel issue needs fresh capacity>
-   - Current usage: ~X%
-   - In progress: <list>
-   - Next steps for new session: read MEMORY.md "Session Handoffs" entry dated <ts>, resume from there.
-   Please start a fresh monitor session using start-monitor.ps1 when ready.
-   ```
-4. Cancel your scheduled tasks (Tier 1/2/3) so they don't fire in a degraded state.
-5. Wait — do not take on new work. Final notifications only.
-
-### Heuristics — rough token budgets
-
-Use these as rough estimates when deciding on model/session switches:
-- One Tier 1 sweep: ~2-5k tokens (Sonnet)
-- One Tier 2 sweep: ~8-20k tokens
-- One Tier 3 sweep: ~20-50k tokens
-- One novel-issue Opus diagnosis: ~30-80k tokens
-- Reading the full `bot_loop.py` fresh: ~40k tokens
-- Module tour (Part 2 Step 2): ~100-150k tokens
-
-A 200k-context session on Sonnet can realistically handle:
-- ~40 Tier 1 sweeps OR
-- ~10 Tier 2 sweeps OR
-- ~4 Tier 3 sweeps
-...before hitting compaction threshold.
-
-Plan accordingly. A healthy long-running monitor alternates Tier 1/2/3 and compacts every ~6-12 hours.
+Release the lock on exit.
 
 ---
 
