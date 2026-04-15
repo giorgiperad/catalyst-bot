@@ -5983,8 +5983,13 @@ class BotLoop:
                             if trade_id not in self._sage_anomaly_seen:
                                 self._sage_anomaly_seen.add(trade_id)
                                 new_anomalies += 1
+                                # Per-offer detail at DEBUG — the summary below
+                                # handles operator visibility at WARNING level.
+                                # These fire ~40 times per cleanup run for
+                                # historical offers that pre-date the local DB,
+                                # generating thousands of WARNING lines per session.
                                 log_event(
-                                    "warning",
+                                    "debug",
                                     "sage_cleanup_anomaly",
                                     f"Sage reports offer {trade_id[:16]}... as "
                                     f"{reason} but no local DB record exists. "
@@ -6000,8 +6005,9 @@ class BotLoop:
                             if trade_id not in self._sage_anomaly_seen:
                                 self._sage_anomaly_seen.add(trade_id)
                                 new_anomalies += 1
+                                # Per-offer detail at DEBUG (see comment above).
                                 log_event(
-                                    "warning",
+                                    "debug",
                                     "sage_cleanup_anomaly",
                                     f"Sage says {reason} for {trade_id[:16]}... "
                                     f"but local DB shows '{local_status}'. "
