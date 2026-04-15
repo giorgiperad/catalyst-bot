@@ -94,6 +94,29 @@ class DexieManager:
                 "force": force,
             })
 
+    def purge_trade_ids(self, trade_ids):
+        """Remove queued (not-yet-posted) entries for specific trade IDs.
+
+        Call this when an offer is cancelled so it doesn't generate an
+        "Invalid Offer" 400 error on the next Dexie flush cycle.
+
+        Args:
+            trade_ids: iterable of trade_id strings to remove from the queue
+        """
+        if not trade_ids:
+            return
+        ids = set(trade_ids)
+        with self._lock:
+            before = len(self._queue)
+            self._queue = [
+                item for item in self._queue
+                if item.get("trade_id") not in ids
+            ]
+            removed = before - len(self._queue)
+        if removed:
+            log_event("debug", "dexie_queue_purged",
+                      f"Removed {removed} cancelled offer(s) from Dexie queue")
+
     def flush_queue(self, flush_all: bool = False) -> Dict:
         """Post all queued offers to Dexie.
 
@@ -317,7 +340,17 @@ class DexieManager:
             if attempt < cfg.DEXIE_POST_RETRIES:
                 time.sleep(cfg.DEXIE_POST_RETRY_SLEEP)
 
-        _level = "warning" if _permanent else "error"
+        # "Invalid Offer" 400s are an expected race condition: the offer may
+        # have been filled or cancelled between creation and the Dexie flush.
+        # Downgrade to debug so these don't flood the log during high-churn
+        # periods; genuine network/server failures stay at warning/error.
+        _invalid_offer = _permanent and "invalid offer" in last_err.lower()
+        if _invalid_offer:
+            _level = "debug"
+        elif _permanent:
+            _level = "warning"
+        else:
+            _level = "error"
         _retries_text = "1 attempt (permanent 4xx)" if _permanent else f"{cfg.DEXIE_POST_RETRIES + 1} attempts"
         log_event(_level, "dexie_post_failed",
                   f"Failed to post to Dexie after {_retries_text}: {last_err}")

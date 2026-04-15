@@ -634,6 +634,10 @@ class _QuietRequestFilter(logging.Filter):
 
 # Apply the filter to Werkzeug's logger
 logging.getLogger("werkzeug").addFilter(_QuietRequestFilter())
+# Suppress the "This is a development server" startup warning.
+# Flask's built-in server is intentional here (single-user desktop app),
+# so the warning adds no value and clutters the console.
+logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
 
 # ---------------------------------------------------------------------------

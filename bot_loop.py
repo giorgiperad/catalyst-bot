@@ -203,6 +203,10 @@ class BotLoop:
         # Wire fee coin pool so each create/cancel gets a dedicated fee coin
         # (prevents MEMPOOL_CONFLICT from concurrent Sage operations)
         self.offer_manager._fee_pool = self.coin_manager.fee_pool
+        # Wire dexie_manager into offer_manager so cancel_offers can purge
+        # cancelled trade IDs from the Dexie post queue, preventing spurious
+        # "Invalid Offer" 400 errors on the next flush cycle.
+        self.offer_manager.dexie_manager = self.dexie_manager
         # Wire boost_manager into risk_manager for spread convergence
         self.risk_manager._boost_manager = self.boost_manager
 
@@ -373,6 +377,14 @@ class BotLoop:
             "last_discovery_at": 0,
         }
 
+        # ---- Probe warning log-rate limits ----
+        # probe_timeout_status / probe_max_retries / probe_edge_lost can fire
+        # every cycle during sustained failure windows (e.g. coin exhaustion).
+        # Each key maps event-name → last log timestamp; only emit once per
+        # cooldown period so a 2-hour stall doesn't generate 150+ WARNING lines.
+        self._probe_warn_ts: Dict[str, float] = {}
+        self._probe_warn_cooldown: float = 600.0  # 10 minutes between repeats
+
         # ---- Startup repost tracking (V1 parity) ----
         self._startup_repost_done: bool = False
         self._startup_repost_thread: Optional[threading.Thread] = None
@@ -502,6 +514,21 @@ class BotLoop:
                     self._event_bus._alert_store.clear(alert_id)
             except Exception:
                 pass
+
+    def _probe_warn(self, event: str, message: str) -> bool:
+        """Emit a probe-related warning at most once per _probe_warn_cooldown seconds.
+
+        Returns True if the message was emitted (caller may want to know).
+        Use this for events that fire every cycle during sustained failure
+        windows (probe_max_retries, probe_timeout_status, probe_edge_lost).
+        """
+        now = time.time()
+        last = self._probe_warn_ts.get(event, 0.0)
+        if (now - last) < self._probe_warn_cooldown:
+            return False
+        self._probe_warn_ts[event] = now
+        log_event("warning", event, message)
+        return True
 
     def _recovery_is_active(self) -> bool:
         return bool((self._recovery_state or {}).get("active"))
@@ -1217,8 +1244,7 @@ class BotLoop:
             return current_buy_ids, current_sell_ids, False
 
         self._mark_recovery_probe_churn()
-        log_event(
-            "warning",
+        self._probe_warn(
             "probe_edge_lost",
             f"Confirmed probe edge disappeared before ladder creation: "
             f"{'+'.join(missing_sides)} missing. Re-arming probe first.",
@@ -1318,11 +1344,11 @@ class BotLoop:
                 probe["confirmed_price"] = survived_price
                 probe["confirmed_at"] = now_ts
                 probe["active"] = False
-                log_event("warning", "probe_max_retries",
-                          f"Probe gave up after {probe['attempt']} attempts. "
-                          f"Using best available price: {survived_price:.8f}")
-                log_event("warning", "probe_timeout_status",
-                          "Probe timed out - deploying main offers from best probe edge")
+                self._probe_warn("probe_max_retries",
+                                 f"Probe gave up after {probe['attempt']} attempts. "
+                                 f"Using best available price: {survived_price:.8f}")
+                self._probe_warn("probe_timeout_status",
+                                 "Probe timed out - deploying main offers from best probe edge")
                 self._clear_alert("probe_status")
             else:
                 # ----------------------------------------------------------
@@ -3305,7 +3331,8 @@ class BotLoop:
                           f"offer(s) not tracked by probe state — cancelling")
                 try:
                     self.offer_manager.cancel_offers(
-                        list(_orphan_snipes), reason="sniper_orphan_sweep"
+                        list(_orphan_snipes), reason="sniper_orphan_sweep",
+                        skip_confirmation=True,
                     )
                     with self.sniper._snipe_lock:
                         for _tid in _orphan_snipes:
@@ -3582,8 +3609,11 @@ class BotLoop:
                 log_event("info", "step7_refresh",
                           f"Pre-emptive refresh: cancelling {len(expiring_tids)} "
                           f"offers expiring within {cfg.OFFER_REFRESH_BEFORE}s")
+                # skip_confirmation=True: expiry refreshes happen every cycle;
+                # blocking 60-90s for coins to return would stall the loop.
                 cancel_result = self.offer_manager.cancel_offers(
-                    expiring_tids, reason="pre_emptive_refresh")
+                    expiring_tids, reason="pre_emptive_refresh",
+                    skip_confirmation=True)
                 expired = sum(1 for r in cancel_result.values()
                               if r and r.get("success"))
                 # Update live counts so Step 10 sees the slots as free
@@ -3705,9 +3735,13 @@ class BotLoop:
                 f"({reason})",
             )
 
+            # skip_confirmation=True: probe retirement is fire-and-forget.
+            # The main ladder builds immediately after; waiting 60-90s for
+            # coins to return from the probe cancel blocks the whole cycle.
             cancel_result = self.offer_manager.cancel_offers(
                 live_probe_ids,
                 reason=reason,
+                skip_confirmation=True,
             )
             cancelled = {
                 tid for tid, res in cancel_result.items()
@@ -3822,11 +3856,11 @@ class BotLoop:
                 probe["confirmed_at"] = now_ts
                 probe["active"] = False
                 self._mark_recovery_probe_churn()
-                log_event("warning", "probe_max_retries",
-                          f"Probe gave up after {probe['attempt']} attempts. "
-                          f"Using best available price: {survived_price:.8f}")
-                log_event("warning", "probe_timeout_status",
-                          "Probe timed out — deploying main offers from best probe edge")
+                self._probe_warn("probe_max_retries",
+                                 f"Probe gave up after {probe['attempt']} attempts. "
+                                 f"Using best available price: {survived_price:.8f}")
+                self._probe_warn("probe_timeout_status",
+                                 "Probe timed out — deploying main offers from best probe edge")
                 self._clear_alert("probe_status")
 
             else:
@@ -4076,7 +4110,8 @@ class BotLoop:
                                   f"{[t[:16] + '...' for t in _orphan_tids]}")
                         try:
                             self.offer_manager.cancel_offers(
-                                list(_orphan_tids), reason="probe_orphan_cleanup"
+                                list(_orphan_tids), reason="probe_orphan_cleanup",
+                                skip_confirmation=True,
                             )
                             # Also prune from sniper's tracking so the cap
                             # doesn't stay inflated.
@@ -4279,8 +4314,11 @@ class BotLoop:
                       f"Sniper edge window ended ({cleanup_reason}) — cancelling "
                       f"{len(snipe_ids_to_cancel)} sniper offers")
             try:
+                # skip_confirmation=True: sniper cleanup is routine maintenance;
+                # blocking 60-90s for coins freezes the cycle unnecessarily.
                 result = self.offer_manager.cancel_offers(
-                    snipe_ids_to_cancel, reason="sniper_cleanup")
+                    snipe_ids_to_cancel, reason="sniper_cleanup",
+                    skip_confirmation=True)
                 cancelled_ids = [
                     tid for tid, res in (result or {}).items()
                     if res and res.get("success")

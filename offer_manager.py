@@ -113,6 +113,12 @@ class OfferManager:
         # so we never post inside TibetSwap's arb zone.
         self.amm_monitor = None
 
+        # ----- Dexie Manager reference -----
+        # Injected by bot_loop after instantiation.
+        # Used to purge cancelled offer IDs from the Dexie post queue so
+        # they don't generate spurious "Invalid Offer" 400 errors on flush.
+        self.dexie_manager = None
+
         # ----- Fee coin pool reference -----
         # Injected by bot_loop: self.offer_manager._fee_pool = self.coin_manager.fee_pool
         # Each create/cancel reserves a dedicated fee coin from this pool
@@ -143,6 +149,11 @@ class OfferManager:
         # Set of f"{side}_{slot}" keys that are currently suspended
         self._suspended_slots: set = set()
         self._slot_suspend_threshold: int = 3  # consecutive failures before suspension
+        # Per-slot warn cooldown: only emit slot_suspended log once every 10 min
+        # per slot to prevent repeated log entries when the suspend/unsuspend
+        # cycle triggers rapidly during sustained coin exhaustion.
+        self._slot_warned_at: Dict[str, float] = {}
+        self._slot_warn_cooldown: float = 600.0  # seconds
 
         # ----- Wallet sync fail-closed cache -----
         # When Sage get_offers times out, we must not treat that as an empty
@@ -196,9 +207,17 @@ class OfferManager:
             self._suspended_slots.add(key)
             self._slot_suspended_at = getattr(self, '_slot_suspended_at', {})
             self._slot_suspended_at[key] = time.time()
-            log_event("warning", "slot_suspended",
-                      f"Slot {side} #{slot} suspended after {count} consecutive "
-                      f"coin failures — will retry when coins are available")
+            # Rate-limit the warning to once per cooldown window per slot.
+            # During sustained coin exhaustion the suspend→auto-clear→suspend
+            # cycle fires every ~20 cycles; without this guard the same slot
+            # generates a new WARNING every ~15 minutes indefinitely.
+            _now = time.time()
+            _last_warn = self._slot_warned_at.get(key, 0.0)
+            if (_now - _last_warn) >= self._slot_warn_cooldown:
+                self._slot_warned_at[key] = _now
+                log_event("warning", "slot_suspended",
+                          f"Slot {side} #{slot} suspended after {count} consecutive "
+                          f"coin failures — will retry when coins are available")
         # F63: auto-clear after 20 cycles (~10 minutes at typical loop speed).
         # This prevents permanent ladder degradation if unsuspend_slots
         # never fires or coins are replenished via topup without triggering
@@ -1669,8 +1688,16 @@ class OfferManager:
             if not res or not res.get("success"):
                 error_msg = str(res.get("error", "")) if res else ""
                 fail_msg = (f"Offer #{i+1}/{num} {side} FAILED: {error_msg[:100]}")
-                print(f"  ❌ {fail_msg}", flush=True)
-                log_event("error", "offer_create_failed", fail_msg)
+                # Coin exhaustion is an expected operational state (not a code
+                # defect) — already tracked by record_slot_coin_failure /
+                # slot_suspended, so downgrade to debug to avoid log spam.
+                _fail_level = (
+                    "debug" if error_msg == "no_unique_coin_preselected"
+                    else "error"
+                )
+                if _fail_level != "debug":
+                    print(f"  ❌ {fail_msg}", flush=True)
+                log_event(_fail_level, "offer_create_failed", fail_msg)
                 continue
 
             trade_record = res.get("trade_record") or {}
@@ -2293,6 +2320,15 @@ class OfferManager:
         if successes > 0:
             log_event("info", "offers_cancelled",
                       f"Cancelled {successes} offers (reason: {reason})")
+            # Purge successfully cancelled offers from the Dexie post queue so
+            # they don't generate "Invalid Offer" 400 errors on the next flush.
+            if self.dexie_manager is not None:
+                cancelled_ids = [tid for tid, r in results.items()
+                                 if r and r.get("success")]
+                try:
+                    self.dexie_manager.purge_trade_ids(cancelled_ids)
+                except Exception:
+                    pass  # non-critical — flush will handle the 400 gracefully
         if failures > 0:
             log_event("warning", "offers_cancel_pending",
                       f"{failures} offers failed to cancel and remain queued for retry "
