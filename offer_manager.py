@@ -1004,26 +1004,19 @@ class OfferManager:
                 log_event("warning", "coin_snapshot_before_fail",
                           f"Could not snapshot coins before offer: {e}")
 
-        # ---- Reserve a dedicated fee coin for this create ----
-        # Prevents MEMPOOL_CONFLICT when multiple creates run concurrently:
-        # each gets its own fee coin instead of Sage auto-picking (and
-        # potentially re-using) the same one.
-        _fee_coin_id = None
-        if hasattr(self, '_fee_pool') and self._fee_pool is not None:
-            _fee_coin_id = self._fee_pool.reserve()
-
+        # Offers are created with fee=0 so no fee coin is needed.
+        # Fee coins are reserved only for coin management transactions
+        # (splits, combines) where a non-zero tx fee is actually charged.
         try:
             for attempt in range(max_retries + 1):
                 # Pass coin_ids to wallet if we pre-selected a coin
                 if use_coin_ids_mode and selected_coin_id:
                     res = create_offer(offer_dict, validate_only=False, max_time=offer_max_time,
                                        min_coin_amount=min_coin_hint, max_coin_amount=max_coin_hint,
-                                       coin_ids=[selected_coin_id],
-                                       fee_coin_id=_fee_coin_id)
+                                       coin_ids=[selected_coin_id])
                 else:
                     res = create_offer(offer_dict, validate_only=False, max_time=offer_max_time,
-                                       min_coin_amount=min_coin_hint, max_coin_amount=max_coin_hint,
-                                       fee_coin_id=_fee_coin_id)
+                                       min_coin_amount=min_coin_hint, max_coin_amount=max_coin_hint)
 
                 if res and res.get("success"):
                     # Include expiry info so caller can record it in DB
@@ -2164,9 +2157,18 @@ class OfferManager:
                   f"Requote {side}: creating {create_count} new offers "
                   f"({spare_count} spares, target {target_count})")
 
+        # Use the full ladder size for tier classification so that
+        # each replacement offer lands in the correct tier (inner/mid/outer/
+        # extreme) with the right coin-size cap.  Using target_count (the
+        # number of offers being replaced) caused all slots to classify as
+        # "inner" whenever target_count ≤ BUY_INNER_TIER_COUNT, which forced
+        # an inner-sized coin cap on every offer regardless of its real
+        # position — rejecting all available larger coins and returning 0.
+        _full_slots = (cfg.MAX_ACTIVE_BUY_OFFERS if side == "buy"
+                       else cfg.MAX_ACTIVE_SELL_OFFERS)
         new_offers = self.create_ladder(
             current_price, side, num_offers=create_count,
-            slot_start=0, total_slots=target_count,
+            slot_start=0, total_slots=_full_slots,
             risk_manager=risk_manager,
             spread_fraction=spread_fraction,
             coin_ids_enabled=cfg.COIN_IDS_ENABLED,

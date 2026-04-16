@@ -8816,9 +8816,10 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
         ),
 
         # Ladder Strategy
-        # Reverse buy ladder is always recommended — it limits XCH exposure by placing
-        # small offers closest to price. A large offer only fills on a genuine deep drop.
-        "buy_ladder_reversed": True,
+        # Reversed (True) is the recommended default: buy and sell sides both taper
+        # large→small away from mid. Toggle ON = BUY_LADDER_REVERSED=True = large inner,
+        # small extreme. Toggle OFF = False = small inner, large extreme.
+        "buy_ladder_reversed": False,
 
         # Offer Sizing (capital-derived — requires reserve params from frontend step 1)
         "max_active_buy": _smart_max_buy,
