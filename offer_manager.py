@@ -2437,6 +2437,16 @@ class OfferManager:
         if successes > 0:
             log_event("info", "offers_cancelled",
                       f"Cancelled {successes} offers (reason: {reason})")
+            # F75: request a fast reconcile so the returned coins are
+            # picked up into their tier pools before the next rebuild
+            # attempt. Without this, the normal 2-cycle reconcile
+            # cadence races the rebuild and the bot tries to create
+            # ladder slots before seeing the newly-freed backing coins.
+            try:
+                from coin_manager import request_fast_reconcile
+                request_fast_reconcile(reason=f"cancel:{reason}")
+            except Exception:
+                pass  # best-effort; the normal cadence still runs
             # Purge successfully cancelled offers from the Dexie post queue so
             # they don't generate "Invalid Offer" 400 errors on the next flush.
             if self.dexie_manager is not None:

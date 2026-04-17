@@ -86,6 +86,17 @@ P1_PIPELINE: tuple = (
     Stage.WAITING_FOR_CONFIRMATION,
 )
 
+P2_PIPELINE: tuple = (
+    Stage.CANCELLING,
+    Stage.WAITING_FOR_CONFIRMATION,
+    Stage.CHECKING_COINS,
+    Stage.REBUILDING,
+)
+
+# The pipeline the orchestrator currently uses. Bumping this constant
+# after new stages are added unlocks them in the UI.
+ACTIVE_PIPELINE: tuple = P2_PIPELINE
+
 
 # ---------------------------------------------------------------------------
 # Flow state
@@ -123,9 +134,11 @@ class FlowState:
             return "complete"
         return "running"
 
-    def to_dict(self, pipeline: tuple = P1_PIPELINE) -> dict:
+    def to_dict(self, pipeline: tuple = None) -> dict:
         """Render to a SSE-friendly dict. Includes the full pipeline so
         the UI can render past/current/future stages consistently."""
+        if pipeline is None:
+            pipeline = ACTIVE_PIPELINE
         completed = [s.value for s in self.stages_completed]
         return {
             "flow_id": self.flow_id,
@@ -165,6 +178,15 @@ class ShapeFixOrchestrator:
     # give sub-3s detection latency without spinning the CPU.
     CONFIRMATION_POLL_INTERVAL_S: float = 2.0
     CONFIRMATION_TIMEOUT_S: float = 180.0   # 3 min — generous for slow mempool
+
+    # P2 tuning — the rebuild wait is longer because we're waiting for:
+    #   - the main loop's next requote tick (up to ~45s)
+    #   - the bot to create_ladder(), posted to Dexie/Splash
+    # If rebuild is blocked by the position guard, we detect that after
+    # 2 min of no progress and halt with POSITION_GUARD_BLOCKED.
+    REBUILD_POLL_INTERVAL_S: float = 3.0
+    REBUILD_TIMEOUT_S: float = 600.0        # 10 min — covers guard stalemates
+    POSITION_GUARD_SUSPICION_S: float = 120.0  # 2 min of no progress = guard
 
     def __init__(self, bot: Any, event_bus: Any):
         """:param bot: the BotLoop instance (needs offer_manager)
@@ -325,11 +347,21 @@ class ShapeFixOrchestrator:
             if flow.halt_reason is not None:
                 return
 
-            # P1 terminal: COMPLETE. P2 adds REBUILDING before this.
+            # Stage 3 (P2): verify tier-correct coin availability.
+            self._stage_checking_coins(flow)
+            if flow.halt_reason is not None:
+                return
+
+            # Stage 4 (P2): wait for main-loop rebuild to complete.
+            self._stage_rebuilding(flow)
+            if flow.halt_reason is not None:
+                return
+
+            # Terminal: COMPLETE.
             flow.stage = Stage.COMPLETE
             flow.detail = (
-                f"Cancelled {flow.cancelled_count} offer(s). "
-                "Main loop will rebuild the ladder on its next natural cycle."
+                f"Recovery complete — {flow.new_offer_count} new offer(s) "
+                f"on {flow.side} side"
             )
             self._emit(flow)
 
@@ -489,6 +521,246 @@ class ShapeFixOrchestrator:
         self._emit(flow)
 
     # ------------------------------------------------------------------
+    # P2 stages: checking coins + rebuilding
+    # ------------------------------------------------------------------
+
+    def _stage_checking_coins(self, flow: FlowState) -> None:
+        """Verify we have tier-correct coins in the free pool on the
+        relevant side. Triggers a reconcile first so any just-returned
+        coins from the cancel are picked up and classified.
+
+        Informational for P2 — the main loop's create_ladder will use
+        whatever coins are available (F70-guarded). If we find zero
+        tier-correct coins, we log a warning but still proceed; the
+        rebuild stage will halt with a clear reason if create_ladder
+        can't make offers.
+
+        P3 will promote this stage's output into a decision: if the
+        inventory is insufficient, insert a RESHAPING stage before
+        REBUILDING.
+        """
+        flow.stage = Stage.CHECKING_COINS
+        flow.detail = "Reconciling returned coins with wallet"
+        self._emit(flow)
+
+        if flow.abort_flag.is_set():
+            flow.halt_reason = HaltReason.USER_ABORTED
+            flow.stage = Stage.HALTED
+            flow.detail = "Aborted before coin check"
+            self._emit(flow)
+            return
+
+        # AGGRESSIVE reconcile — Sage may be mid-sync when the cancel
+        # first confirms; the new output coins might not appear until a
+        # second or third reconcile call. We call up to 3 times with
+        # short gaps to maximise the chance of catching them on this
+        # stage, so the REBUILD stage that follows has fresh inventory.
+        # Also reset the main-loop reconcile counter so the next cycle
+        # reconciles too (belt-and-braces).
+        try:
+            for _attempt in range(3):
+                if flow.abort_flag.is_set():
+                    break
+                try:
+                    self._bot.coin_manager.reconcile_with_wallet()
+                except Exception:
+                    pass
+                # Small pause lets Sage's coin-watcher pick up late arrivals
+                time.sleep(2.0)
+            # Trigger the main loop's next-cycle reconcile too
+            try:
+                if hasattr(self._bot.coin_manager, "_reconcile_counter"):
+                    self._bot.coin_manager._reconcile_counter = 99
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        # Inspect free-tier counts on the relevant side. 'sell' offers
+        # lock CAT coins (we give CAT, receive XCH); 'buy' offers lock
+        # XCH coins. So the returned coins and the tier pool we care
+        # about mirror that.
+        side = flow.side
+        asset_label = "CAT" if side == "sell" else "XCH"
+        try:
+            cm = self._bot.coin_manager
+            if side == "sell":
+                inv = getattr(cm, "_cat_inventory", {}) or {}
+            else:
+                inv = getattr(cm, "_xch_inventory", {}) or {}
+
+            def _bucket_count(key: str) -> int:
+                b = inv.get(key)
+                return len(b) if b is not None else 0
+
+            inner = _bucket_count("inner")
+            mid = _bucket_count("mid")
+            outer = _bucket_count("outer")
+            extreme = _bucket_count("extreme")
+        except Exception as e:
+            flow.stages_completed.append(Stage.CHECKING_COINS)
+            flow.detail = f"Could not read inventory (non-fatal): {e}"
+            self._emit(flow)
+            return
+
+        flow.stages_completed.append(Stage.CHECKING_COINS)
+        flow.detail = (
+            f"Free {asset_label} coins — inner {inner} | mid {mid} | "
+            f"outer {outer} | extreme {extreme}"
+        )
+        self._emit(flow)
+
+    def _stage_rebuilding(self, flow: FlowState) -> None:
+        """Wait for the main loop to rebuild the ladder to the
+        configured target count. We don't drive ``create_ladder``
+        directly — the main loop already has the full context (probe-
+        anchored mid, risk checks, price caps, slot sequencing). We
+        just:
+
+          1. Set ``_force_requote[side] = True`` so the next cycle
+             prioritises this side's rebuild.
+          2. Poll the open-offer count every ``REBUILD_POLL_INTERVAL_S``.
+          3. Emit progress as new offers land on-chain.
+          4. Detect the position-guard stalemate (no progress for
+             ``POSITION_GUARD_SUSPICION_S``) and halt with a
+             descriptive reason.
+          5. Hit the overall timeout ``REBUILD_TIMEOUT_S`` and halt if
+             the rebuild never completes.
+        """
+        flow.stage = Stage.REBUILDING
+        flow.detail = "Signalling main loop to rebuild the ladder"
+        self._emit(flow)
+
+        if flow.abort_flag.is_set():
+            flow.halt_reason = HaltReason.USER_ABORTED
+            flow.stage = Stage.HALTED
+            flow.detail = "Aborted before rebuild started"
+            self._emit(flow)
+            return
+
+        # Set force_requote so the next cycle prioritises rebuild.
+        # Note: this flag is consumed by bot_loop's requote path, which
+        # clears it after running. Safe to set from another thread.
+        try:
+            fr = getattr(self._bot, "_force_requote", None)
+            if isinstance(fr, dict):
+                fr[flow.side] = True
+        except Exception:
+            pass
+
+        try:
+            from database import get_open_offers
+            from config import cfg
+        except Exception as e:
+            flow.halt_reason = HaltReason.INTERNAL_ERROR
+            flow.stage = Stage.HALTED
+            flow.detail = f"Could not import DB helpers: {e}"
+            self._emit(flow)
+            return
+
+        target_count = (
+            int(getattr(cfg, "MAX_ACTIVE_BUY_OFFERS", 24) or 24)
+            if flow.side == "buy"
+            else int(getattr(cfg, "MAX_ACTIVE_SELL_OFFERS", 24) or 24)
+        )
+
+        def _count_side_offers() -> int:
+            try:
+                rows = get_open_offers(
+                    side=flow.side, cat_asset_id=cfg.CAT_ASSET_ID) or []
+                return len(rows)
+            except Exception:
+                return -1
+
+        starting_count = max(0, _count_side_offers())
+        last_emitted_count = starting_count
+        last_progress_at = time.time()
+        last_emit_at = 0.0
+        deadline = time.time() + self.REBUILD_TIMEOUT_S
+
+        while time.time() < deadline:
+            if flow.abort_flag.is_set():
+                flow.halt_reason = HaltReason.USER_ABORTED
+                flow.stage = Stage.HALTED
+                flow.detail = (
+                    f"Aborted during rebuild — "
+                    f"{max(0, last_emitted_count - starting_count)} "
+                    f"new offer(s) created before abort"
+                )
+                self._emit(flow)
+                return
+
+            current_count = _count_side_offers()
+            now = time.time()
+
+            if current_count >= 0 and current_count != last_emitted_count:
+                # Progress — either offers landed or (rare) some went away.
+                created_so_far = max(0, current_count - starting_count)
+                flow.new_offer_count = created_so_far
+                flow.detail = (
+                    f"{current_count}/{target_count} offers live on "
+                    f"{flow.side} side ({created_so_far} new this recovery)"
+                )
+                self._emit(flow)
+                last_emitted_count = current_count
+                last_emit_at = now
+                if current_count > starting_count:
+                    # Actual forward progress — reset the guard-suspicion
+                    # timer so we don't halt mid-rebuild.
+                    last_progress_at = now
+            elif (now - last_emit_at) >= 5.0:
+                # Heart-beat — show the elapsed time's still ticking
+                # even if the count hasn't changed.
+                flow.detail = (
+                    f"{last_emitted_count}/{target_count} — waiting for "
+                    f"main loop's next cycle to create offers "
+                    f"(elapsed {int(now - (flow.started_at or now))}s)"
+                )
+                self._emit(flow)
+                last_emit_at = now
+
+            # Success: we've hit (or got close to) the target count.
+            # ±1 tolerance accounts for sniper probe slots and in-flight
+            # creations the main loop hasn't committed yet.
+            if current_count >= target_count - 1:
+                flow.stages_completed.append(Stage.REBUILDING)
+                flow.new_offer_count = max(0, current_count - starting_count)
+                flow.detail = (
+                    f"Ladder rebuilt: {current_count}/{target_count} "
+                    f"offers live on {flow.side} side"
+                )
+                self._emit(flow)
+                return
+
+            # Detect the position-guard stalemate: if the count hasn't
+            # moved upward for POSITION_GUARD_SUSPICION_S, bail with a
+            # clear reason. The main loop logs position_hard_guard_blocked
+            # at WARN each cycle it trips, so the Logs tab has detail.
+            if (now - last_progress_at) > self.POSITION_GUARD_SUSPICION_S:
+                flow.halt_reason = HaltReason.POSITION_GUARD_BLOCKED
+                flow.stage = Stage.HALTED
+                flow.detail = (
+                    "Rebuild stalled — the position circuit breaker is "
+                    "likely blocking new offers. Opposite-side fills "
+                    "must unwind the position first. Check Activity for "
+                    "'position_hard_guard_blocked' events."
+                )
+                self._emit(flow)
+                return
+
+            time.sleep(self.REBUILD_POLL_INTERVAL_S)
+
+        # Outer timeout
+        flow.halt_reason = HaltReason.TIMEOUT_CONFIRMATION
+        flow.stage = Stage.HALTED
+        flow.detail = (
+            f"Timed out after {int(self.REBUILD_TIMEOUT_S)}s — only "
+            f"{last_emitted_count}/{target_count} offers on "
+            f"{flow.side} side"
+        )
+        self._emit(flow)
+
+    # ------------------------------------------------------------------
     # Finalisation
     # ------------------------------------------------------------------
 
@@ -517,4 +789,6 @@ __all__ = [
     "FlowState",
     "ShapeFixOrchestrator",
     "P1_PIPELINE",
+    "P2_PIPELINE",
+    "ACTIVE_PIPELINE",
 ]

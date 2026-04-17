@@ -22519,6 +22519,18 @@
             if (eventType === 'coin_fsm_violation')
                 return { icon: '🧭', msg: 'Coin state transition outside rules (diagnostic)', cls: 'la-warning' };
 
+            // --- Shape-fix recovery (F74) — user-triggered orchestrated recovery ---
+            if (eventType === 'shape_fix_flow_started')
+                return { icon: '🔧', msg: 'Cancel recovery started', cls: 'la-info' };
+            if (eventType === 'shape_fix_progress')
+                return null;  // Separate SSE event type handles the modal, keep out of ticker
+            if (eventType === 'shape_fix_internal_error')
+                return { icon: '⚠️', msg: 'Cancel recovery halted (internal error)', cls: 'la-error' };
+
+            // --- Fast-reconcile (F75) — picks up returned coins after cancels ---
+            if (eventType === 'fast_reconcile_applied')
+                return { icon: '🔁', msg: 'Fast reconcile (post-cancel) — picking up returned coins', cls: 'la-info' };
+
             // --- Everything else: skip from activity feed ---
             // Only specifically translated events appear in the activity ticker.
             // All other warnings/errors go to the Logs tab only.

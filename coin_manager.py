@@ -48,6 +48,61 @@ from typing import Dict, List, Optional, Tuple
 
 from config import cfg
 from database import log_event
+
+
+# ---------------------------------------------------------------------------
+# Fast-reconcile trigger (F75).
+#
+# Other modules (notably ``offer_manager.cancel_offers``) can call
+# :func:`request_fast_reconcile` to flag "please run reconcile ASAP on
+# the next loop tick, don't wait for the normal cadence". The main
+# bot loop consults :func:`consume_fast_reconcile` when deciding
+# whether to reconcile this cycle.
+#
+# Rationale: cancels create new output coins that the bot needs to see
+# before attempting to rebuild the ladder. The normal 2-cycle reconcile
+# cadence means the rebuild often races ahead of the reconcile and the
+# new coins don't appear in tier pools until a cycle later. This flag
+# closes that race — the reconcile runs on the very next cycle after a
+# cancel confirms, so returned coins are in the right tier pool before
+# create_ladder() looks for them.
+#
+# This is intentionally a module-level flag (not an instance attribute)
+# so offer_manager can signal without needing a reference to the
+# CoinManager instance. Matches the pattern used by
+# ``_bot_cancelled_ids`` in offer_manager for the same reason.
+# ---------------------------------------------------------------------------
+
+_fast_reconcile_flag: bool = False
+_fast_reconcile_lock: threading.Lock = threading.Lock()
+
+
+def request_fast_reconcile(reason: str = "unspecified") -> None:
+    """Request a reconcile on the next bot-loop cycle.
+
+    Thread-safe. Idempotent — calling multiple times before the flag
+    is consumed is equivalent to calling once.
+    """
+    global _fast_reconcile_flag
+    with _fast_reconcile_lock:
+        _fast_reconcile_flag = True
+    # Log at debug so we can correlate requests with cycle-level reconciles
+    try:
+        log_event("debug", "fast_reconcile_requested",
+                  f"Fast reconcile requested (reason={reason})")
+    except Exception:
+        pass
+
+
+def consume_fast_reconcile() -> bool:
+    """Return True once if a fast reconcile was requested, resetting
+    the flag. Subsequent calls return False until the next request.
+    """
+    global _fast_reconcile_flag
+    with _fast_reconcile_lock:
+        was = _fast_reconcile_flag
+        _fast_reconcile_flag = False
+    return was
 from tx_fees import (
     fee_pool_enabled,
     get_effective_transaction_fee_mojos,

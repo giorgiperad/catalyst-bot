@@ -5823,11 +5823,27 @@ class BotLoop:
         # V4 FIX: Changed default from 5 to 2 — active trading causes rapid
         # coin churn (create/cancel destroys and recreates coins) so the DB
         # drifts quickly. Every 2 loops (~2 min) keeps it much tighter.
+        #
+        # F75: Short-circuit the cadence when a fast-reconcile has been
+        # requested (e.g. cancel_offers just succeeded). Without this,
+        # returned backing coins don't appear in tier pools until up to
+        # 2 cycles after the cancel confirms, and rebuild attempts race
+        # ahead of the reconcile.
         self.coin_manager._reconcile_counter += 1
         reconcile_every = getattr(cfg, "RECONCILE_EVERY_N_LOOPS", 2)
-        if self.coin_manager._reconcile_counter >= reconcile_every:
+        fast_reconcile_requested = False
+        try:
+            from coin_manager import consume_fast_reconcile
+            fast_reconcile_requested = consume_fast_reconcile()
+        except Exception:
+            pass
+        if (fast_reconcile_requested
+                or self.coin_manager._reconcile_counter >= reconcile_every):
             self.coin_manager.reconcile_with_wallet()
             self.coin_manager._reconcile_counter = 0
+            if fast_reconcile_requested:
+                log_event("info", "fast_reconcile_applied",
+                          "Reconcile fast-path triggered by a recent cancel")
 
         # Log coin inventory every 10 loops (gives a running picture)
         if self._loop_count % 10 == 0:
