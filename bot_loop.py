@@ -5794,6 +5794,11 @@ class BotLoop:
             # genuine full rebuilds (empty book) or when drift pushes
             # the current mid far enough from the anchor that patching
             # would produce a ragged ladder anyway.
+            #
+            # Drift detection must compare against PLAIN mid (invariant
+            # of probe state), not probe_anchored_mid — otherwise probes
+            # toggling on/off between cycles looks like ~2-3% drift and
+            # triggers spurious requotes.
             _current_count_on_side = (
                 len(current_buy_ids or set()) if side == "buy"
                 else len(current_sell_ids or set())
@@ -5802,17 +5807,20 @@ class BotLoop:
             _is_full_rebuild = (_current_count_on_side == 0)
             ladder_mid_price = probe_anchored_mid
             if _is_full_rebuild or _anchor <= 0:
-                # Stamp the anchor at this build — any future replenishment
-                # on this side will use this as its price grid until a
-                # drift-triggered realign or an explicit full rebuild.
-                self._ladder_anchor_mid[side] = probe_anchored_mid
+                # Stamp the anchor at PLAIN mid so probe-state flipping
+                # later doesn't fake drift. Any future replenishment on
+                # this side uses this plain mid + same probe adjustment
+                # at that moment to compute its price grid.
+                self._ladder_anchor_mid[side] = mid_price
                 log_event("debug", "ladder_anchor_set",
-                          f"{side} ladder anchor set at {probe_anchored_mid:.8f} "
+                          f"{side} ladder anchor set at {mid_price:.8f} "
                           f"(full build — {_current_count_on_side} live offers)")
             else:
-                # Replacement: check drift vs anchor
+                # Replacement: check drift of PLAIN mid vs stored plain
+                # anchor. Both sides of the comparison are invariant of
+                # probe state, so only real market drift triggers.
                 try:
-                    drift_pct = abs(probe_anchored_mid - _anchor) / _anchor * Decimal("100")
+                    drift_pct = abs(mid_price - _anchor) / _anchor * Decimal("100")
                 except Exception:
                     drift_pct = Decimal("0")
                 if drift_pct > self._ladder_anchor_drift_pct:
@@ -5822,7 +5830,7 @@ class BotLoop:
                               f"{side} ladder anchor drift {drift_pct:.2f}% > "
                               f"{self._ladder_anchor_drift_pct}% threshold "
                               f"(anchor {_anchor:.8f} vs current "
-                              f"{probe_anchored_mid:.8f}) — flagging "
+                              f"{mid_price:.8f}) — flagging "
                               f"requote to realign ladder")
                     try:
                         self._force_requote[side] = True
@@ -5835,9 +5843,19 @@ class BotLoop:
                     _parallel_mid[side] = probe_anchored_mid
                     return
                 else:
-                    # Drift within bounds — use the anchor so new offers
-                    # slot into the existing price grid cleanly
-                    ladder_mid_price = _anchor
+                    # Drift within bounds — use the anchor (plus current
+                    # probe offset) so new offers slot into the existing
+                    # price grid cleanly. Apply the probe offset to the
+                    # stored plain anchor to match how the original
+                    # ladder was priced.
+                    if probe_anchored_mid != mid_price:
+                        try:
+                            _offset_ratio = probe_anchored_mid / mid_price
+                            ladder_mid_price = _anchor * _offset_ratio
+                        except Exception:
+                            ladder_mid_price = _anchor
+                    else:
+                        ladder_mid_price = _anchor
 
             price_cap = self._get_probe_price_boundary(side) if side == "buy" else None
             price_floor = self._get_probe_price_boundary(side) if side == "sell" else None
