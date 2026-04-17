@@ -1643,22 +1643,25 @@ class BotLoop:
             sell_counts = dict(buy_counts)
 
         # Wallet + inventory totals (for the invariant checks).
+        # Snapshot under the coin_manager lock to avoid torn reads while
+        # coin_manager is mid-update on another thread.
         try:
             inv = self.coin_manager
-            wallet_totals = {
-                "xch_total": int(inv._xch_total_coins or 0),
-                "cat_total": int(inv._cat_total_coins or 0),
-            }
-            inventory_dict = {
-                "xch": {
-                    "free": int(inv._xch_coins or 0),
-                    "locked": int(inv._xch_locked_coins or 0),
-                },
-                "cat": {
-                    "free": int(inv._cat_coins or 0),
-                    "locked": int(inv._cat_locked_coins or 0),
-                },
-            }
+            with inv._lock:
+                wallet_totals = {
+                    "xch_total": int(inv._xch_total_coins or 0),
+                    "cat_total": int(inv._cat_total_coins or 0),
+                }
+                inventory_dict = {
+                    "xch": {
+                        "free": int(inv._xch_coins or 0),
+                        "locked": int(inv._xch_locked_coins or 0),
+                    },
+                    "cat": {
+                        "free": int(inv._cat_coins or 0),
+                        "locked": int(inv._cat_locked_coins or 0),
+                    },
+                }
         except Exception:
             return
 
@@ -5900,7 +5903,10 @@ class BotLoop:
         # no actions — only WARN/ERROR log events for drift. Scheduled
         # overnight monitors pick up violations and apply fixes.
         # Safe to fail silently — watchdog errors mustn't break trading.
-        if self._loop_count % 10 == 0:
+        # Skipped during recovery mode: the bot is deliberately off-book,
+        # so invariants like "open_offers > 0" will fail legitimately and
+        # produce noise that masks real issues.
+        if self._loop_count % 10 == 0 and not self._recovery_is_active():
             try:
                 self._run_ladder_watchdog()
             except Exception as _wd_err:

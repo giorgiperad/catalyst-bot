@@ -60,6 +60,18 @@ def mojos_to_cat(mojos: int, decimals: int) -> Decimal:
     return Decimal(mojos) / scale
 
 
+# Methods that indicate Sage ACCEPTED the cancel submission but the cancel
+# transaction is NOT yet confirmed on-chain. The offer may still be live
+# and could still fill if the cancel TX fails in the mempool. DB status
+# MUST NOT be flipped to "cancelled" for these — a later cancel-confirm
+# poll or fill-detector is what authoritatively closes the offer.
+CANCEL_PENDING_METHODS = frozenset({
+    "submitted_pending_confirm",
+    "already_in_mempool",
+    "mempool_conflict_inflight",
+})
+
+
 # ---------------------------------------------------------------------------
 # Offer Manager
 # ---------------------------------------------------------------------------
@@ -2416,6 +2428,17 @@ class OfferManager:
         # Update database status + coin tracking
         for tid, result in results.items():
             if result and result.get("success"):
+                method = str(result.get("method") or "")
+                if method in CANCEL_PENDING_METHODS:
+                    # Submission accepted but not on-chain yet. Leave DB
+                    # status alone — a later cancel reconcile or fill
+                    # detection will catch the true state once the TX
+                    # confirms (or times out in the mempool).
+                    log_event("debug", "cancel_pending_mempool",
+                              f"Cancel for {tid[:16]}... submitted but not "
+                              f"yet confirmed (method={method}); leaving DB "
+                              f"status open")
+                    continue
                 # update_offer_status propagates lifecycle_state → "cancelled" automatically
                 update_offer_status(tid, "cancelled")
             else:
@@ -2498,7 +2521,18 @@ class OfferManager:
         def apply_batch_results(batch_results: Dict[str, Dict]) -> None:
             for tid, result in batch_results.items():
                 if result and result.get("success"):
-                    update_offer_status(tid, "cancelled")
+                    method = str(result.get("method") or "")
+                    if method in CANCEL_PENDING_METHODS:
+                        # Submission accepted but not on-chain yet. Leave
+                        # DB status alone — a later cancel reconcile or
+                        # fill detection will catch the true state once
+                        # the TX confirms (or times out in the mempool).
+                        log_event("debug", "cancel_pending_mempool",
+                                  f"Cancel for {tid[:16]}... submitted but "
+                                  f"not yet confirmed (method={method}); "
+                                  f"leaving DB status open")
+                    else:
+                        update_offer_status(tid, "cancelled")
                 else:
                     self._bot_cancelled_ids.discard(tid)
                     if tid not in self._pending_cancel_retries:
@@ -2612,11 +2646,8 @@ class OfferManager:
             "confirmed_by_coin_delta",
             "bulk",
         }
-        PENDING_METHODS = {
-            "submitted_pending_confirm",
-            "already_in_mempool",
-            "mempool_conflict_inflight",
-        }
+        # Reuse the module-level constant to avoid drift.
+        PENDING_METHODS = CANCEL_PENDING_METHODS
 
         def _classify(r):
             if not isinstance(r, dict):

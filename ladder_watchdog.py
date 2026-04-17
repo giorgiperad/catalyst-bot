@@ -124,9 +124,9 @@ def audit_ladder_shape(
     def _distance_key(o):
         p = o.get("price")
         try:
-            p = float(p) if p is not None else 0.0
+            p = Decimal(str(p)) if p is not None else Decimal("0")
         except Exception:
-            p = 0.0
+            p = Decimal("0")
         # For sells, lower price = closer to mid = inner. For buys,
         # higher price = closer to mid = inner. So "distance ascending"
         # means ascending for sells, descending for buys.

@@ -243,7 +243,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
 
         def fake_create_offer(offer_dict, validate_only=False, max_time=None,
                               min_coin_amount=None, max_coin_amount=None,
-                              coin_ids=None, fee_coin_id=None):
+                              coin_ids=None):
             seen["coin_ids"] = coin_ids
             return {
                 "success": True,
@@ -906,6 +906,69 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             offer_manager.OfferManager._slot_size_variation(250000, expected_unique_count=250000),
             Decimal("0.001"),
         )
+
+
+class CancelPendingMempoolTests(unittest.TestCase):
+    """Regression coverage: cancel TX that Sage accepted into the mempool
+    but didn't confirm on-chain must NOT flip the DB to 'cancelled' —
+    the offer is still live and can still fill. Previously the bot did
+    flip the DB, producing ghost offers during mempool congestion."""
+
+    def test_pending_methods_constant_covers_all_unconfirmed_sage_paths(self):
+        self.assertIn("submitted_pending_confirm",
+                      offer_manager.CANCEL_PENDING_METHODS)
+        self.assertIn("already_in_mempool",
+                      offer_manager.CANCEL_PENDING_METHODS)
+        self.assertIn("mempool_conflict_inflight",
+                      offer_manager.CANCEL_PENDING_METHODS)
+
+    def test_cancel_offers_skips_db_update_for_pending_methods(self):
+        manager = offer_manager.OfferManager()
+
+        # Mock the DB open-offers lookup to return one offer we want to cancel.
+        with patch.object(offer_manager, "get_open_offers",
+                          return_value=[{"trade_id": "tid-pending",
+                                         "coin_id": "0xc1", "side": "buy"}]), \
+             patch.object(offer_manager, "cancel_offers_batch",
+                          return_value={"tid-pending": {
+                              "success": True,
+                              "method": "submitted_pending_confirm",
+                              "note": "Cancel submitted, awaiting on-chain confirm",
+                          }}), \
+             patch.object(offer_manager, "update_offer_status") as mock_update, \
+             patch.object(offer_manager, "transition_offer"), \
+             patch.object(offer_manager, "cleanup_expired_offers", return_value=0):
+            manager.cancel_offers(["tid-pending"], reason="test")
+
+        # The DB must NOT be flipped to cancelled — the offer is still live.
+        cancelled_calls = [c for c in mock_update.call_args_list
+                           if len(c.args) >= 2 and c.args[1] == "cancelled"]
+        self.assertEqual(cancelled_calls, [],
+                         "DB must not be marked cancelled while cancel TX is "
+                         "still pending in the mempool")
+
+    def test_cancel_offers_flips_db_for_confirmed_methods(self):
+        """Sanity check: the happy path (truly confirmed) DOES flip the DB."""
+        manager = offer_manager.OfferManager()
+
+        with patch.object(offer_manager, "get_open_offers",
+                          return_value=[{"trade_id": "tid-ok",
+                                         "coin_id": "0xc2", "side": "buy"}]), \
+             patch.object(offer_manager, "cancel_offers_batch",
+                          return_value={"tid-ok": {
+                              "success": True,
+                              "method": "confirmed_by_unlock",
+                          }}), \
+             patch.object(offer_manager, "update_offer_status") as mock_update, \
+             patch.object(offer_manager, "transition_offer"), \
+             patch.object(offer_manager, "cleanup_expired_offers", return_value=0):
+            manager.cancel_offers(["tid-ok"], reason="test")
+
+        cancelled_calls = [c for c in mock_update.call_args_list
+                           if len(c.args) >= 2 and c.args[1] == "cancelled"]
+        self.assertEqual(len(cancelled_calls), 1,
+                         "DB must be flipped to cancelled when Sage confirms "
+                         "the cancel via coin unlock")
 
 
 if __name__ == "__main__":

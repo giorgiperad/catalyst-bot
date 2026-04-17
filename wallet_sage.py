@@ -2150,8 +2150,7 @@ def send_cat_multi(payments: list, fee_mojos: int = 0):
 def create_offer(offer_dict: dict, validate_only: bool = True, max_time: int = None,
                   _reuse_puzhash: bool = True,
                   min_coin_amount: int = None, max_coin_amount: int = None,
-                  coin_ids: list = None, fee_mojos: int = 0,
-                  fee_coin_id: str = None):
+                  coin_ids: list = None, fee_mojos: int = 0):
     """Create an offer via Sage's make_offer endpoint.
 
     Sage's make_offer uses offered_assets / requested_assets arrays:
@@ -2248,15 +2247,8 @@ def create_offer(offer_dict: dict, validate_only: bool = True, max_time: int = N
 
     # Pass specific coin IDs if provided (requires Sage PR #761 / coin_ids feature)
     # IMPORTANT: Strip 0x prefix — Sage expects bare hex (like split/combine endpoints)
-    # When fee_coin_id is provided, append it to coin_ids so Sage uses it for the
-    # tx fee instead of auto-picking (prevents MEMPOOL_CONFLICT on concurrent ops).
-    _all_coin_ids = list(coin_ids) if coin_ids else []
-    if fee_coin_id:
-        bare_fee = fee_coin_id.replace("0x", "").lower()
-        if bare_fee not in {cid.replace("0x", "").lower() for cid in _all_coin_ids}:
-            _all_coin_ids.append(fee_coin_id)
-    if _all_coin_ids:
-        bare_ids = [cid.replace("0x", "") for cid in _all_coin_ids]
+    if coin_ids:
+        bare_ids = [cid.replace("0x", "") for cid in coin_ids]
         payload["coin_ids"] = bare_ids
         if WALLET_DEBUG:
             print(f"  [Sage] Using specific coin_ids: {bare_ids}")

@@ -123,10 +123,10 @@ class TestDisallowedTransitions:
         ok, _ = validate_transition(_s("free", "tier_spare"), _s("locked", "reserve"))
         assert ok is False
 
-    def test_reserve_cant_lock_into_tier_active_improperly(self):
-        """Actually, the FSM does allow (free, reserve) -> (locked, tier_active)
-        for the occasional case where a reserve coin is used to back an
-        offer. This documents that intent — adjust if policy tightens."""
+    def test_reserve_can_lock_into_tier_active(self):
+        """The FSM allows (free, reserve) -> (locked, tier_active) for the
+        occasional case where a reserve coin is used to back an offer.
+        This documents that intent — adjust if policy tightens."""
         ok, _ = validate_transition(_s("free", "reserve"), _s("locked", "tier_active"))
         # Allowed by current policy.
         assert ok is True

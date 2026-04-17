@@ -1,7 +1,16 @@
 # Coin Lifecycle Finite-State Machine — Design Doc
 
 **Status:** design only (Phase 6 of the 2026-04-17 permanent refactor).
-A minimal `validate_transition` helper is implemented and hooked at DB-write sites as a non-blocking *assertion*. Full replacement of the current status+designation model is deferred until after CHIP-0052 partial offers land, because partial offers change the coin model substantially.
+A minimal `validate_transition` helper is implemented in `coin_fsm.py` but
+**is not yet hooked into any DB-write path** — it is callable by tests but
+not wired into production code. Originally this doc claimed the helper was
+hooked at `update_coin_status()` / `set_coin_designation()`; that was
+aspirational. `update_coin_status` does not exist as a function (status is
+updated inline at ~12 SQL sites in `database.py`), and `set_coin_designation`
+performs a raw UPDATE with no FSM call. Wiring is tracked as a follow-up.
+Full replacement of the current status+designation model is deferred until
+after CHIP-0052 partial offers land, because partial offers change the coin
+model substantially.
 
 ---
 
@@ -102,7 +111,7 @@ Terminal states: `spent` and `gone`. Once a coin reaches either, its row should 
 
 ## What IS implemented
 
-A lightweight validator — `coin_fsm.py::validate_transition(from_state, to_state)` — that returns True / False for whether a specific transition is currently allowed. Hooked as a **non-blocking log-only check** at `database.py::update_coin_status()` and `database.py::set_coin_designation()`. Any disallowed transition is logged at WARN level; nothing is blocked. This gives us visibility into FSM violations without risking a regression.
+A lightweight validator — `coin_fsm.py::validate_transition(from_state, to_state)` — that returns True / False for whether a specific transition is currently allowed. The validator is **not yet wired into production code**. The intent is to hook it as a **non-blocking log-only check** at the coin-status and coin-designation write sites in `database.py`, logging disallowed transitions at WARN level while blocking nothing. Until that wiring lands, the module is exercised only by its unit tests (`tests/test_coin_fsm.py`) and gives no live-trading visibility.
 
 Once the log shows clean behaviour for weeks, we can promote the validator from WARN-only to ERROR-blocking in a follow-up.
 
