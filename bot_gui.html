@@ -10168,8 +10168,8 @@
                     <div>
                         <div class="v4-modal-kicker">Offer Control</div>
                         <h3 class="v4-modal-title" id="cancelProgressTitle">Cancelling offers<span id="cancelProgressDots"></span></h3>
-                        <p class="v4-modal-copy" id="cancelProgressMessage">Sending paced cancel requests to Sage and waiting between batches so the wallet stays stable.</p>
-                        <p class="v4-modal-copy" id="cancelProgressTimeNote" style="margin-top: 4px; font-size: 11px; color: var(--text-muted); opacity: 0.8;">Depending on the number of offers, this can take several minutes — please keep this window open.</p>
+                        <p class="v4-modal-copy" id="cancelProgressMessage">Submitting all cancels in a single bulk transaction, then waiting for on-chain confirmation.</p>
+                        <p class="v4-modal-copy" id="cancelProgressTimeNote" style="margin-top: 4px; font-size: 11px; color: var(--text-muted); opacity: 0.8;">Usually confirms within a block or two (well under a minute).</p>
                     </div>
                 </div>
                 <div class="v4-modal-panel" style="margin-bottom: 12px;">
@@ -25444,10 +25444,10 @@
             if (iconEl) iconEl.textContent = phase === 'complete' ? '✅' : phase === 'error' ? '❌' : '⏳';
             if (messageEl) {
                 messageEl.textContent = phase === 'complete'
-                    ? 'All batches have finished. The offer list will refresh automatically.'
+                    ? 'Cancel transaction confirmed on-chain. The offer list will refresh automatically.'
                     : phase === 'error'
                         ? 'The cancel run stopped early. Check the status below for the wallet error.'
-                        : 'Sending paced cancel requests to Sage and waiting between batches so the wallet stays stable.';
+                        : 'Submitting all cancels in a single bulk transaction, then waiting for on-chain confirmation.';
             }
             if (summaryEl) {
                 summaryEl.textContent = total > 0
