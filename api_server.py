@@ -3230,6 +3230,11 @@ def api_config_update():
             "requote_batch_size": "REQUOTE_BATCH_SIZE",
             "xch_reserve": "XCH_RESERVE",
             "cat_reserve": "CAT_RESERVE",
+            # F76 (2026-04-17): newly exposed trading-control toggles.
+            # Consumed by bot_loop/boost_manager; previously .env-only.
+            "dry_run": "DRY_RUN",
+            "enable_buy": "ENABLE_BUY",
+            "enable_sell": "ENABLE_SELL",
             # F49 (2026-04-09): topup pool (two-tier reserve system)
             "topup_pool_pct": "TOPUP_POOL_PCT",
             "topup_pool_xch": "TOPUP_POOL_XCH",
@@ -9085,7 +9090,11 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
             "arb_gap_bps": round(arb_gap_bps, 1),
             "pool_depth_xch": pool_xch,
             "competitor_spread_bps": round(orderbook.get("competitor_spread_bps", 0), 0),
-            "xch_balance": round(xch_spendable, 2),
+            # F76: return full precision (was rounding to 2dp, which caused a
+            # systematic over-report — 110.6773 → 110.68 — that bled into
+            # the GUI's F66 residual-filler and tripped its own preflight).
+            # Truncate rather than round so we NEVER over-report the balance.
+            "xch_balance": int(float(xch_spendable) * 10000) / 10000,
             "data_quality_score": quality_score,
             "data_quality_label": quality_label,
             "volatility_regime": regime,

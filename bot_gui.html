@@ -9374,6 +9374,29 @@
                     <!-- ══ SECTION: Safety & Limits ══ -->
                     <div class="v4-settings-section v4-settings-blue">
                         <div class="v4-settings-section-title" style="color: var(--status-info);">Safety & Limits <span class="cc-help">?<span class="cc-tooltip">Emergency protection settings. These circuit breakers halt trading if something unexpected happens — price crashes, spikes, or moves outside your comfort zone.</span></span></div>
+                        <!-- F76 (2026-04-17): expose DRY_RUN / ENABLE_BUY / ENABLE_SELL. These
+                             config flags were already consumed by bot_loop and boost_manager
+                             but had no UI — users had to edit .env by hand. -->
+                        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 10px;">
+                            <div class="form-group" style="margin-bottom: 0;">
+                                <label style="display: flex; align-items: center; gap: 8px; font-size: 0.85em;">
+                                    <input type="checkbox" id="configDryRun" style="width: auto; margin: 0;">
+                                    <span>Dry Run Mode <span class="cc-help">?<span class="cc-tooltip">When on, the bot runs all logic but does NOT create real offers. Useful for dev/testing and for running through a live cycle without committing capital. OFF for normal trading.</span></span></span>
+                                </label>
+                            </div>
+                            <div class="form-group" style="margin-bottom: 0;">
+                                <label style="display: flex; align-items: center; gap: 8px; font-size: 0.85em;">
+                                    <input type="checkbox" id="configEnableBuy" style="width: auto; margin: 0;" checked>
+                                    <span>Enable Buy Side <span class="cc-help">?<span class="cc-tooltip">When off, the bot never creates buy offers. Sells still run. Useful for unwinding a long-CAT position without buying more. The position guard may also auto-disable buys dynamically when position limits trip — this toggle is the user override.</span></span></span>
+                                </label>
+                            </div>
+                            <div class="form-group" style="margin-bottom: 0;">
+                                <label style="display: flex; align-items: center; gap: 8px; font-size: 0.85em;">
+                                    <input type="checkbox" id="configEnableSell" style="width: auto; margin: 0;" checked>
+                                    <span>Enable Sell Side <span class="cc-help">?<span class="cc-tooltip">When off, the bot never creates sell offers. Buys still run. Useful for unwinding a short-CAT position. The position guard may also auto-disable sells dynamically — this toggle is the user override.</span></span></span>
+                                </label>
+                            </div>
+                        </div>
                         <div class="form-group" style="margin-bottom: 8px;">
                             <label style="font-size: 0.85em;">Max Price Move (%) <span class="cc-help">?<span class="cc-tooltip">If the mid-price changes by more than this percentage in a single loop, the bot pauses. Protects against flash crashes or price manipulation.</span></span></label>
                             <input type="number" id="configMaxMidMove" value="5" min="0" max="100" step="0.5" oninput="checkRiskWarnings()">
@@ -11523,6 +11546,26 @@
 
                         // AUTO_REQUOTE toggle is a user preference — always load
                         const ar = g('AUTO_REQUOTE'); if (ar !== null) document.getElementById('configAutoRequote').checked = ar !== false && ar !== 'false' && ar !== '0';
+                        // F76 (2026-04-17): load the three trading-control
+                        // toggles (DRY_RUN / ENABLE_BUY / ENABLE_SELL). All
+                        // user preferences — always load, never gated by
+                        // blankFreshTemplates.
+                        const _dr = g('DRY_RUN');
+                        if (_dr !== null) {
+                            const _el = document.getElementById('configDryRun');
+                            if (_el) _el.checked = _dr === true || _dr === 'true' || _dr === '1' || _dr === 'True';
+                        }
+                        const _eb = g('ENABLE_BUY');
+                        if (_eb !== null) {
+                            const _el = document.getElementById('configEnableBuy');
+                            // Default to true when not set — matches the config.py default
+                            if (_el) _el.checked = _eb !== false && _eb !== 'false' && _eb !== '0' && _eb !== 'False';
+                        }
+                        const _es = g('ENABLE_SELL');
+                        if (_es !== null) {
+                            const _el = document.getElementById('configEnableSell');
+                            if (_el) _el.checked = _es !== false && _es !== 'false' && _es !== '0' && _es !== 'False';
+                        }
                         if (!blankFreshTemplates) {
                             const rb = parseFloat(g('REQUOTE_BPS') || 0); if (rb > 0) document.getElementById('configRequoteBps').value = (rb / 100).toFixed(1);
                             const rc = g('REQUOTE_COOLDOWN'); if (rc) document.getElementById('configRequoteCooldown').value = rc;
@@ -17992,11 +18035,28 @@
                 // balance. Use _smartXchBalance (set by Smart Settings run) or
                 // fall back to the live bot_state balance so it also works when
                 // loading existing config without re-running Smart Settings.
-                const _smartXchBal = Number(window._smartXchBalance || 0)
-                    || Number(typeof bot_state !== 'undefined' && bot_state?.balances?.xch?.total || 0);
+                //
+                // F76 (2026-04-17): previously used `_smartXchBalance || liveBal`,
+                // which short-circuited on the FIRST truthy value. If the API
+                // over-reported (rounded up), the residual overshot the live
+                // balance and tripped the preflight check. Now we prefer the
+                // Smart Settings value but CLAMP to live balance so we can
+                // never synthesise a plan larger than the wallet holds.
+                const _smartXchBalRaw = Number(window._smartXchBalance || 0);
+                const _liveXchBal = Number(
+                    typeof bot_state !== 'undefined' && bot_state?.balances?.xch?.total || 0);
+                const _smartXchBal = _smartXchBalRaw > 0
+                    ? (_liveXchBal > 0 ? Math.min(_smartXchBalRaw, _liveXchBal) : _smartXchBalRaw)
+                    : _liveXchBal;
                 if (_smartXchBal > 0) {
                     const _reserveForTopup = parseFloat(document.getElementById('configXchReserve')?.value) || 0;
-                    _topupBufferXch = Math.max(0, _smartXchBal - _reserveForTopup - plan.totalXchForCoinPrep);
+                    // F76: leave a small explicit safety margin (~0.5%) so the
+                    // plan total doesn't land exactly on the balance. Protects
+                    // the preflight from float-precision noise and gives Sage
+                    // a tiny buffer for fee variability at creation time.
+                    const _safetyMarginXch = _smartXchBal * 0.005;
+                    _topupBufferXch = Math.max(0,
+                        _smartXchBal - _reserveForTopup - plan.totalXchForCoinPrep - _safetyMarginXch);
                 }
                 const _topupBufferCat = Number(window._topupBufferCat || 0);
                 if (_topupBufferXch > 0 || _topupBufferCat > 0) {
@@ -18319,13 +18379,18 @@
             let coinPrepImpossible = false;
             let coinPrepImpossibleReasons = [];
 
-            if (_botXchForCoinPrep > xchBalance && xchBalance > 0 && tradeSize > 0 && maxBuy > 0) {
+            // F76: allow 0.5% tolerance to absorb float precision + 4-decimal
+            // truncation at the API boundary. A plan that's 0.5% over balance
+            // is almost certainly a rounding artefact, not a real over-spend.
+            const _xchPreflightTolerance = xchBalance * 0.005;
+            const _catPreflightTolerance = catBalance * 0.005;
+            if (_botXchForCoinPrep > xchBalance + _xchPreflightTolerance && xchBalance > 0 && tradeSize > 0 && maxBuy > 0) {
                 coinPrepImpossible = true;
                 coinPrepImpossibleReasons.push(
                     `XCH: coin prep needs ${_botXchForCoinPrep.toFixed(4)} XCH across ${xchCoinsNeeded} prepared coins (+${prepHeadroomPct}% headroom), but total balance is only ${xchBalance.toFixed(4)} XCH.`
                 );
             }
-            if (_botCatForCoinPrep > catBalance && catBalance > 0 && catPerCoin > 0 && maxSell > 0) {
+            if (_botCatForCoinPrep > catBalance + _catPreflightTolerance && catBalance > 0 && catPerCoin > 0 && maxSell > 0) {
                 coinPrepImpossible = true;
                 coinPrepImpossibleReasons.push(
                     `${tokenName}: coin prep needs ~${_botCatForCoinPrep.toLocaleString()} tokens across ${catCoinsNeeded} prepared coins (+${prepHeadroomPct}% headroom), but total balance is only ${Math.floor(catBalance).toLocaleString()}.`
@@ -26480,6 +26545,8 @@
             'configLoopSeconds','configSpreadBps','configTradeXch',
             'configMaxBuy','configMaxSell',
             'configXchReserve','configCatReserve',
+            // F76 (2026-04-17): trading-control toggles
+            'configDryRun','configEnableBuy','configEnableSell',
             'configAutoRequote','configRequoteBps','configRequoteCooldown','configRequoteBatchSize',
             'configMaxMidMove','configDynamicLimitPct','configMaxStepChange',
             'configMinMid','configMaxMid',
@@ -27021,7 +27088,13 @@
                 default_trade_xch: parseFloat(document.getElementById('configTradeXch').value),
                 max_active_buy: effectiveOffers.maxBuy,
                 max_active_sell: effectiveOffers.maxSell,
-                
+
+                // F76 (2026-04-17): surface three previously .env-only flags
+                // that are consumed by bot_loop/boost_manager.
+                dry_run: !!document.getElementById('configDryRun')?.checked,
+                enable_buy: !!document.getElementById('configEnableBuy')?.checked,
+                enable_sell: !!document.getElementById('configEnableSell')?.checked,
+
                 // Save new settings (convert % to BPS)
                 auto_requote: document.getElementById('configAutoRequote').checked,
                 requote_bps: Math.round(parseFloat(document.getElementById('configRequoteBps').value) * 100),
