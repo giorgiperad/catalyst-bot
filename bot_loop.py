@@ -1864,7 +1864,34 @@ class BotLoop:
 
         # Clear any previously-raised watchdog alerts that did NOT fire
         # this pass — those conditions have resolved.
-        previously_raised = getattr(self, "_watchdog_active_alert_ids", set())
+        #
+        # Seed previously_raised from the live alert store on the first
+        # run after startup. Otherwise stale watchdog alerts raised by the
+        # previous process instance (before a restart) would sit in the
+        # alert panel forever, because our in-memory tracker starts empty
+        # and has no record of them. With the seed, the first clean pass
+        # clears any pre-existing watchdog_* alerts automatically.
+        previously_raised = getattr(self, "_watchdog_active_alert_ids", None)
+        if previously_raised is None and has_event_bus:
+            try:
+                store = getattr(self._event_bus, "_alert_store", None)
+                existing = set()
+                # AlertStore exposes its live state via the `_alerts` dict
+                # (keyed by alert_id). Walk it and collect any watchdog_*
+                # entries that aren't already dismissed.
+                raw = getattr(store, "_alerts", None) if store else None
+                if isinstance(raw, dict):
+                    for aid, payload in raw.items():
+                        if not aid or not aid.startswith("watchdog_"):
+                            continue
+                        if isinstance(payload, dict) and payload.get("dismissed"):
+                            continue
+                        existing.add(aid)
+                previously_raised = existing
+            except Exception:
+                previously_raised = set()
+        if previously_raised is None:
+            previously_raised = set()
         to_clear = previously_raised - raised_alert_ids
         if has_event_bus and to_clear:
             try:
