@@ -4217,7 +4217,7 @@ class CoinManager:
                     xch_topup_threshold = max(1, int(round(xch_spare_target * _topup_tier_pct(tier_name, "xch")))) if xch_spare_target > 0 else 0
                     if xch_spare_target > 0 and xch_have < xch_topup_threshold and cfg.ENABLE_BUY:
                         any_tier_needed = True
-                        xch_tier_size = int(live_tier_sizes_xch.get(tier_name, cfg.MID_SIZE_XCH) * xch_scale)
+                        xch_tier_size = int(live_tier_sizes_xch.get(tier_name, cfg.MID_SIZE_XCH) * self._get_coin_prep_headroom_multiplier() * xch_scale)
                         target_full = xch_spare_target
                         # Buffer: 25% of spare allocation, min 1, max 2.
                         # Scales with tier depth rather than being flat +2 for all
@@ -4315,7 +4315,7 @@ class CoinManager:
                     sniper_xch_have = len(xch_inv.get("sniper", []))
                     if sniper_xch_have < sniper_threshold and cfg.ENABLE_BUY and sniper_xch_size_dec > 0:
                         any_tier_needed = True
-                        sniper_xch_size = int(sniper_xch_size_dec * xch_scale)
+                        sniper_xch_size = int(sniper_xch_size_dec * self._get_coin_prep_headroom_multiplier() * xch_scale)
                         deficit = (sniper_target - sniper_xch_have) + 2
                         log_event("info", "topup_xch_sniper",
                                   f"XCH sniper pool low: {sniper_xch_have}/{sniper_threshold} threshold "
