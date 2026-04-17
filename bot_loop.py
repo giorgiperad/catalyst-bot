@@ -228,6 +228,25 @@ class BotLoop:
         self._watchdog_post_fill_cooldown_secs: float = 120.0
         self._watchdog_persistence_threshold: int = 2
 
+        # ---- Ladder anchor state ----
+        # Replacement offers must price against the mid used at the last
+        # full ladder build, not the current (possibly drifted) mid — else
+        # replacement prices land on a different grid and interleave with
+        # existing offers on Dexie, producing the "mixed size at slot" drift
+        # the watchdog flags. The anchor is:
+        #   - stamped when the book is empty and we build a full ladder
+        #   - reused for every replenishment (keeps grid aligned)
+        #   - cleared + force_requote when current mid drifts > threshold
+        #     so the ladder wholesale-realigns instead of patching a stale
+        #     grid with mismatched prices.
+        self._ladder_anchor_mid: Dict[str, Decimal] = {
+            "buy": Decimal("0"), "sell": Decimal("0"),
+        }
+        # Drift threshold in percent. 1.5% ≈ 150 bps — generous enough to
+        # absorb normal noise, tight enough that a directional move forces
+        # a realign before the ladder looks ragged to takers.
+        self._ladder_anchor_drift_pct: Decimal = Decimal("1.5")
+
         # ---- Price tracking ----
         self._last_quoted_price: Dict[str, Decimal] = {"buy": Decimal("0"), "sell": Decimal("0")}
         # F67: Un-anchored (plain) mid captured alongside probe-anchored
@@ -5761,16 +5780,67 @@ class BotLoop:
                 if side == "buy"
                 else cfg.MAX_ACTIVE_SELL_OFFERS
             )
-            ladder_mid_price = self._get_probe_anchored_mid(side, mid_price)
-            price_cap = self._get_probe_price_boundary(side) if side == "buy" else None
-            price_floor = self._get_probe_price_boundary(side) if side == "sell" else None
-            if ladder_mid_price != mid_price:
+            probe_anchored_mid = self._get_probe_anchored_mid(side, mid_price)
+            if probe_anchored_mid != mid_price:
                 log_event(
                     "info",
                     "probe_anchor_apply",
                     f"Anchoring {side} ladder to probe edge: mid {mid_price:.8f} "
-                    f"-> {ladder_mid_price:.8f}",
+                    f"-> {probe_anchored_mid:.8f}",
                 )
+
+            # Ladder-anchor logic — keep replacement offers on the same
+            # price grid as the already-live offers. Only re-anchor on
+            # genuine full rebuilds (empty book) or when drift pushes
+            # the current mid far enough from the anchor that patching
+            # would produce a ragged ladder anyway.
+            _current_count_on_side = (
+                len(current_buy_ids or set()) if side == "buy"
+                else len(current_sell_ids or set())
+            )
+            _anchor = self._ladder_anchor_mid.get(side, Decimal("0")) or Decimal("0")
+            _is_full_rebuild = (_current_count_on_side == 0)
+            ladder_mid_price = probe_anchored_mid
+            if _is_full_rebuild or _anchor <= 0:
+                # Stamp the anchor at this build — any future replenishment
+                # on this side will use this as its price grid until a
+                # drift-triggered realign or an explicit full rebuild.
+                self._ladder_anchor_mid[side] = probe_anchored_mid
+                log_event("debug", "ladder_anchor_set",
+                          f"{side} ladder anchor set at {probe_anchored_mid:.8f} "
+                          f"(full build — {_current_count_on_side} live offers)")
+            else:
+                # Replacement: check drift vs anchor
+                try:
+                    drift_pct = abs(probe_anchored_mid - _anchor) / _anchor * Decimal("100")
+                except Exception:
+                    drift_pct = Decimal("0")
+                if drift_pct > self._ladder_anchor_drift_pct:
+                    # Drift too large — realign wholesale on next cycle
+                    # rather than patch with mismatched prices
+                    log_event("info", "ladder_anchor_drift",
+                              f"{side} ladder anchor drift {drift_pct:.2f}% > "
+                              f"{self._ladder_anchor_drift_pct}% threshold "
+                              f"(anchor {_anchor:.8f} vs current "
+                              f"{probe_anchored_mid:.8f}) — flagging "
+                              f"requote to realign ladder")
+                    try:
+                        self._force_requote[side] = True
+                    except Exception:
+                        pass
+                    # Skip this replenishment build — requote will cancel
+                    # existing offers and rebuild fresh next cycle. Avoids
+                    # adding more misaligned offers right before the
+                    # requote cancels them.
+                    _parallel_mid[side] = probe_anchored_mid
+                    return
+                else:
+                    # Drift within bounds — use the anchor so new offers
+                    # slot into the existing price grid cleanly
+                    ladder_mid_price = _anchor
+
+            price_cap = self._get_probe_price_boundary(side) if side == "buy" else None
+            price_floor = self._get_probe_price_boundary(side) if side == "sell" else None
             _parallel_mid[side] = ladder_mid_price
             # Pass live wallet IDs so replenishment can filter out DB offers
             # that have expired but haven't been reconciled yet (Step 13 runs
