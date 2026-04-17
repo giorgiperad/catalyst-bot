@@ -6604,21 +6604,32 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
     """
     # ── RISK PROFILE ──────────────────────────────────────────────────────────
     # Multipliers applied to Smart Settings outputs. Balanced = no change.
-    # Risk profiles only change HOW the bot reacts to market conditions.
-    # Total capital deployed and number of offers are IDENTICAL across all
-    # three profiles — only spread behaviour, requote speed, position
-    # tolerance, inventory rebalancing, and safety buffers differ.
     #
-    # conservative: wider spreads, slower requoting, tighter inventory
-    #               tolerance, gentler rebalancing, bigger safety buffers
-    # balanced:     baseline reactivity
-    # aggressive:   tighter spreads, faster requoting, looser inventory
-    #               tolerance, harder rebalancing, same safety buffers
+    # F77 (2026-04-17): capital/sizing multipliers no longer pinned at 1.0 for
+    # all three profiles. Conservative now deploys LESS capital into the
+    # trading ladder (keeping a larger cushion), and uses FEWER slots (so
+    # each slot is thicker and less spread out). Balanced/Aggressive keep
+    # current behaviour as the reference (full capital, full slot count).
+    #
+    # Profiles affect:
+    #  - Capital deployed (conservative shrinks the trading-XCH budget)
+    #  - Number of offers (conservative runs a shorter ladder)
+    #  - Spread width (conservative earns more per fill)
+    #  - Requote speed (conservative lets offers ride longer)
+    #  - Position-cap sensitivity (conservative trips sooner)
+    #  - Inventory rebalancing (conservative rebalances gentler)
+    #  - Safety buffers (conservative keeps more spares)
     _RISK_PROFILES = {
         "conservative": {
-            # ── Capital / sizing (IDENTITY — all 1.0) ──
-            "capital_mult":       1.0,
-            "max_offers_mult":    1.0,
+            # ── Capital / sizing ──
+            # F77: actually deploy less capital — "conservative" was cosmetic
+            # before (same capital as balanced, only spread differed). 0.85
+            # means 85% of the trading-XCH budget is committed; the other
+            # 15% stays as extra buffer on top of the backend's normal
+            # headroom. 0.80 offer count means fewer slots (7 vs 10 at
+            # default), each slot thicker and less spread out.
+            "capital_mult":       0.85,
+            "max_offers_mult":    0.80,
             "inner_tier_mult":    1.0,
             "tier_size_mult":     1.0,
             # ── Spread behaviour ──
@@ -6632,7 +6643,7 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
             "coin_prep_adj":     +0.5,   # more coin-prep buffer (floor enforced at 2.0 max)
         },
         "balanced": {
-            # Baseline — everything at 1.0
+            # Baseline — everything at 1.0 (full wallet into trading ladder)
             "capital_mult":       1.0,
             "max_offers_mult":    1.0,
             "inner_tier_mult":    1.0,
@@ -6645,7 +6656,11 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
             "coin_prep_adj":      0.0,
         },
         "aggressive": {
-            # ── Capital / sizing (IDENTITY — all 1.0) ──
+            # ── Capital / sizing (same as balanced — already at max) ──
+            # capital can't exceed 100% and adding slots beyond the balanced
+            # budget just makes each slot thinner → worse fill economics.
+            # "Aggressive" differentiates through tighter spreads, faster
+            # requote, looser inventory limits, not more capital.
             "capital_mult":       1.0,
             "max_offers_mult":    1.0,
             "inner_tier_mult":    1.0,

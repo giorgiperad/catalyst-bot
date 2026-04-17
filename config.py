@@ -164,8 +164,12 @@ class Config:
         self.SAGE_CERT_PATH = _str("SAGE_CERT_PATH")
         self.SAGE_KEY_PATH = _str("SAGE_KEY_PATH")
         self.SAGE_EXE_PATH = _str("SAGE_EXE_PATH")           # Auto-detected if empty
+        # SAGE_FINGERPRINT is read directly via os.getenv() in sage_node.py
+        # (line 416). Kept in cfg for to_dict() exclusion list completeness.
         self.SAGE_FINGERPRINT = _str("SAGE_FINGERPRINT")      # Auto-login fingerprint
-        self.SAGE_DATA_DIR = _str("SAGE_DATA_DIR")            # Sage data dir (auto-detected)
+        # SAGE_DATA_DIR removed 2026-04-17 (F77) — auto-detected at runtime;
+        # the env var was never read. Retained in to_dict() exclusion set
+        # as a defensive no-op against stale .env files.
         self.SAGE_SET_CHANGE_ADDRESS = _bool("SAGE_SET_CHANGE_ADDRESS", False)
 
         # ----- Wallet Address (for Spacescan self-spend detection) -----
@@ -275,7 +279,9 @@ class Config:
         # the rest to subsequent cycles. This prevents costly full-ladder
         # rebuilds from a single price move.
         self.CYCLE_MAX_CANCELS = _int("CYCLE_MAX_CANCELS", 6)
-        self.CYCLE_MAX_CREATES = _int("CYCLE_MAX_CREATES", 6)
+        # CYCLE_MAX_CREATES removed 2026-04-17 (F77) — was never read by any
+        # trading code. The equivalent clamping happens via MAX_POSTS_PER_LOOP
+        # and the per-side slot limits (MAX_ACTIVE_BUY/SELL_OFFERS).
         # Max expiry refreshes per cycle (prevents mass-refresh when many
         # offers approach expiry at the same time).
         self.CYCLE_MAX_EXPIRY_REFRESH = _int("CYCLE_MAX_EXPIRY_REFRESH", 4)
@@ -332,20 +338,18 @@ class Config:
 
         # F51 (2026-04-09): cancel-all poll & retry tuning.
         # The verification loop after cancel_offers_batch polls Sage for
-        # on-chain confirmation of submitted cancels. Poll interval is
-        # how often we check; max_wait is the first polling window
-        # (covers several blocks); retry_wait is the second window after
-        # we resubmit any cancels that are still stuck in ACTIVE state.
-        # Total max wait = CANCEL_MAX_WAIT_SECS + CANCEL_RETRY_WAIT_SECS.
-        # Defaults give ~150s which comfortably covers 5-8 Chia blocks at
-        # the target 18-52s per block cadence.
+        # on-chain confirmation of submitted cancels.
+        # CANCEL_POLL_INTERVAL_SECS + CANCEL_MAX_WAIT_SECS cover the first
+        # polling window. CANCEL_RETRY_WAIT_SECS was removed 2026-04-17
+        # (F77) — never read by any verification code.
         self.CANCEL_POLL_INTERVAL_SECS = _int("CANCEL_POLL_INTERVAL_SECS", 10)
         self.CANCEL_MAX_WAIT_SECS = _int("CANCEL_MAX_WAIT_SECS", 90)
-        self.CANCEL_RETRY_WAIT_SECS = _int("CANCEL_RETRY_WAIT_SECS", 60)
 
         # ----- Coin Preparation -----
         self.ENABLE_COIN_PREP = _bool("ENABLE_COIN_PREP", False)
-        self.COIN_PREP_COOLDOWN_SECS = _int("COIN_PREP_COOLDOWN_SECS", 3600)
+        # COIN_PREP_COOLDOWN_SECS removed 2026-04-17 (F77) — never read by
+        # the coin-prep worker. The drip-topup worker has its own cooldown
+        # via TOPUP_POOL_PCT rate limiting.
         self.XCH_TARGET_COINS = _int("XCH_TARGET_COINS", 50)
         self.XCH_COIN_SIZE = _decimal("XCH_COIN_SIZE", "0.25")
         self.CAT_TARGET_COINS = _int("CAT_TARGET_COINS", 50)
@@ -388,7 +392,9 @@ class Config:
         # Mempool watching: poll Coinset for pending spends on our offer coins.
         # Gives ~30-50s earlier fill detection before block confirmation.
         self.ENABLE_MEMPOOL_WATCH = _bool("ENABLE_MEMPOOL_WATCH", False)
-        self.MEMPOOL_POLL_INTERVAL_SECS = _int("MEMPOOL_POLL_INTERVAL_SECS", 10)
+        # MEMPOOL_POLL_INTERVAL_SECS removed 2026-04-17 (F77) — mempool_watcher
+        # uses a hardcoded 5-second interval (see mempool_watcher.py:94).
+        # If tuning is ever needed, restore here and read via cfg.
         # Known arb bot puzzle hashes (hex, no 0x prefix, comma-separated).
         # Used to classify fills as arb sweeps vs retail/combined.
         self.KNOWN_ARB_PUZZLE_HASHES = [
@@ -449,6 +455,18 @@ class Config:
         # capital plans and writes them directly, so each side can fully
         # consume its own balance minus reserve. Fall back to the shared
         # legacy keys when per-side values are zero (upgrade path).
+        #
+        # ⚠ F77 audit note (2026-04-17): the per-side size values are
+        # WRITTEN by Smart Settings and LOADED by the GUI but NOT actually
+        # consumed by the trading code path — the ladder planner and offer
+        # manager still read INNER_SIZE_XCH etc. (unified). This means
+        # editing a per-side value in the GUI has no runtime effect.
+        # F62 is incomplete; completing it requires threading the
+        # per-side resolution (see get_buy_tier_size_xch /
+        # get_sell_tier_size_xch helpers below) through ladder_planner
+        # and offer_manager's coin-selection path. Left in config for
+        # forward compatibility; Smart Settings still writes them so a
+        # future wire-up can light them up without schema migration.
         self.BUY_INNER_SIZE_XCH = _decimal("BUY_INNER_SIZE_XCH", "0")
         self.BUY_MID_SIZE_XCH = _decimal("BUY_MID_SIZE_XCH", "0")
         self.BUY_OUTER_SIZE_XCH = _decimal("BUY_OUTER_SIZE_XCH", "0")
@@ -653,10 +671,10 @@ class Config:
         # Reserves + topup pool (F49)
         "XCH_RESERVE", "CAT_RESERVE", "MZ_RESERVE",
         "TOPUP_POOL_PCT", "TOPUP_POOL_XCH", "TOPUP_POOL_CAT",
-        # Cancel poll + retry tuning (F51)
-        "CANCEL_POLL_INTERVAL_SECS", "CANCEL_MAX_WAIT_SECS", "CANCEL_RETRY_WAIT_SECS",
-        # Coin prep
-        "ENABLE_COIN_PREP", "COIN_PREP_COOLDOWN_SECS",
+        # Cancel poll tuning (F51). CANCEL_RETRY_WAIT_SECS removed F77.
+        "CANCEL_POLL_INTERVAL_SECS", "CANCEL_MAX_WAIT_SECS",
+        # Coin prep. COIN_PREP_COOLDOWN_SECS removed F77 (never consumed).
+        "ENABLE_COIN_PREP",
         "XCH_TARGET_COINS", "XCH_COIN_SIZE",
         "CAT_TARGET_COINS", "CAT_COIN_SIZE",
         "COIN_PREP_MULTIPLIER", "COIN_PREP_HEADROOM_PCT", "COIN_MAX_SIZE_RATIO",
