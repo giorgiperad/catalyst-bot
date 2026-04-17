@@ -28,7 +28,7 @@ import secrets
 import webbrowser
 from decimal import Decimal
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from urllib.parse import urlparse, quote
 
 # ---------------------------------------------------------------------------
@@ -1036,6 +1036,44 @@ try:
     print("  [SSE] log_event → SSE callback registered ✓", flush=True)
 except Exception as e:
     print(f"  [SSE] ⚠️ Failed to register log_event callback: {e}", flush=True)
+
+
+def _get_live_mid_price_str() -> Optional[str]:
+    """Return the bot's current weighted mid as a decimal string, or None.
+
+    Used to seed the coin-prep subprocess with the same price the bot trades
+    against, so CAT-coin sizes align with live ladder sizes. Tries the cached
+    last_price first, then a fresh fetch via get_price() if the cache is empty
+    or stale (common when prep is triggered before the bot loop has started
+    and no cycle has populated the cache yet).
+
+    Returns None only when both paths fail; the worker then falls back to
+    Dexie's last_price ticker, which may lag on thin markets.
+    """
+    try:
+        pe = getattr(bot, "price_engine", None) if "bot" in globals() else None
+        if pe is None:
+            return None
+        p = pe.get_last_price()
+        if p is None or Decimal(str(p)) <= 0:
+            # Cache miss — force a fresh fetch of the weighted mid so prep
+            # and the bot agree on price even on first run.
+            try:
+                fresh = pe.get_price()
+                if isinstance(fresh, dict):
+                    p = fresh.get("mid_price") or fresh.get("mid") or fresh.get("price")
+                else:
+                    p = fresh
+            except Exception:
+                p = None
+        if p is None:
+            return None
+        p_dec = Decimal(str(p))
+        if p_dec <= 0:
+            return None
+        return format(p_dec, "f")
+    except Exception:
+        return None
 
 
 def create_bot() -> BotLoop:
@@ -11136,6 +11174,12 @@ def api_coin_prep_trigger():
                     buy_sizes_str  = ",".join(f"{t}={s}" for t, s in _buy_sizes_for_cli.items())
                     sell_sizes_str = ",".join(f"{t}={s}" for t, s in _sell_sizes_for_cli.items())
 
+                    # Pass the live weighted mid (Tibet+Dexie) so prep sizes
+                    # CAT coins against the same price the bot uses for live
+                    # offers. Without this, prep defaults to Dexie's last_price,
+                    # which can lag by 40%+ on thin markets and undersize the
+                    # CAT sniper pool (sniper sell creation then fails).
+                    _live_price_arg = _get_live_mid_price_str()
                     cmd = [
                         "python", worker_path,
                         "--xch-target", str(xch_total_coins),
@@ -11148,15 +11192,19 @@ def api_coin_prep_trigger():
                         "--prep-headroom-pct", str(getattr(cfg, "COIN_PREP_HEADROOM_PCT", Decimal("10"))),
                         "--run-id", run_id,
                     ]
+                    if _live_price_arg:
+                        cmd += ["--live-price", _live_price_arg]
                     log_event("info", "coin_prep_config",
                               f"GUI tier coin prep (per-side): "
                               f"XCH={xch_total_coins} {xch_counts_str} | "
                               f"CAT={cat_total_coins} {cat_counts_str} "
-                              f"(+{getattr(cfg, 'COIN_PREP_HEADROOM_PCT', Decimal('10'))}% headroom)")
+                              f"(+{getattr(cfg, 'COIN_PREP_HEADROOM_PCT', Decimal('10'))}% headroom) "
+                              f"live_price={_live_price_arg or 'unavailable→Dexie fallback'}")
                 else:
                     # Uniform coin prep — uses _prep_coin_multiplier from request context
                     coin_multiplier = _prep_coin_multiplier
                     total_coins = int((max_buy + max_sell) * coin_multiplier)
+                    _live_price_arg = _get_live_mid_price_str()
                     cmd = [
                         "python", worker_path,
                         "--xch-target", str(total_coins),
@@ -11165,6 +11213,8 @@ def api_coin_prep_trigger():
                         "--prep-headroom-pct", str(getattr(cfg, "COIN_PREP_HEADROOM_PCT", Decimal("10"))),
                         "--run-id", run_id,
                     ]
+                    if _live_price_arg:
+                        cmd += ["--live-price", _live_price_arg]
                     log_event("info", "coin_prep_config",
                               f"GUI coin prep: {total_coins} coins "
                               f"({max_buy}+{max_sell} × {coin_multiplier}), "

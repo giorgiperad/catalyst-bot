@@ -5903,10 +5903,18 @@ class BotLoop:
         # no actions — only WARN/ERROR log events for drift. Scheduled
         # overnight monitors pick up violations and apply fixes.
         # Safe to fail silently — watchdog errors mustn't break trading.
-        # Skipped during recovery mode: the bot is deliberately off-book,
-        # so invariants like "open_offers > 0" will fail legitimately and
-        # produce noise that masks real issues.
-        if self._loop_count % 10 == 0 and not self._recovery_is_active():
+        #
+        # Skipped during:
+        # - recovery mode: the bot is deliberately off-book, so invariants
+        #   like "open_offers > 0" will fail legitimately.
+        # - probe phase: only 1-2 probe offers are live by design; the
+        #   watchdog would flag "ladder has 1 offers, configured total 23"
+        #   as ERROR noise on every startup.
+        # Both states produce noise that masks real issues.
+        _probe_active = bool((getattr(self, "_probe_state", None) or {}).get("active"))
+        if (self._loop_count % 10 == 0
+                and not self._recovery_is_active()
+                and not _probe_active):
             try:
                 self._run_ladder_watchdog()
             except Exception as _wd_err:
@@ -6539,6 +6547,12 @@ class BotLoop:
             ("price-watcher", "_watcher_thread", self._start_price_watcher),
             ("coin-watcher", "_coin_watcher_thread", self._start_coin_watcher),
         )
+        # During shutdown the watchers exit cleanly as they observe
+        # self._running == False. Treating those clean exits as "thread
+        # crashed" spams ERROR logs and triggers futile restarts that
+        # immediately re-exit. Skip the whole check when shutting down.
+        if not self._running:
+            return
         for name, attr, restart_fn in critical_threads:
             t = getattr(self, attr, None)
             # If thread was never started or is alive, no action needed

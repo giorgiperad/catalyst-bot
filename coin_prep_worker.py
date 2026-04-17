@@ -1081,20 +1081,31 @@ class CoinPrepWorker:
         except Exception as de:
             self.log(f"   DB: debug file write failed: {de}")
 
-    def _derive_cat_coin_size(self, trade_size_xch: Decimal) -> Decimal:
-        """Calculate CAT coin size from XCH trade size using current price.
+    def _get_live_price(self) -> Optional[Decimal]:
+        """Return the live XCH/CAT mid the bot is trading against.
 
-        For sell offers, the bot needs CAT coins big enough to cover
-        trade_size_xch worth of CAT at current prices.
-        e.g. if trade_size = 0.6 XCH and price = 0.000064 XCH/CAT:
-             CAT needed = 0.6 / 0.000064 = 9375 CAT per coin
-
-        We add the configured prep headroom and round up.
-        Falls back to CAT_COIN_SIZE or 4000 if price fetch fails.
+        Priority:
+        1. `_CLI_LIVE_PRICE` env var — set by api_server when launching prep
+           via `--live-price`. This is the weighted Tibet+Dexie mid the bot
+           itself uses, so prep sizes CAT coins consistent with the live
+           ladder. Use this whenever available.
+        2. Dexie `last_price` fallback — for historical callers that launch
+           the worker directly (CLI, tests) without the `--live-price` arg.
+           Note: Dexie's last_price can lag the live mid significantly on
+           thin-liquidity markets, which undersizes CAT coins and breaks
+           sniper sell creation. Prefer path 1.
         """
+        cli_price = os.getenv("_CLI_LIVE_PRICE", "").strip()
+        if cli_price:
+            try:
+                p = Decimal(cli_price)
+                if p > 0:
+                    return p
+            except Exception as e:
+                self.log(f"   ⚠️ Invalid _CLI_LIVE_PRICE ({cli_price!r}): {e}")
+
         try:
             import requests
-            # Try Dexie API for current price
             cat_asset_id = os.getenv("CAT_ASSET_ID", "")
             if cat_asset_id:
                 _dexie_base = os.getenv("DEXIE_API_BASE", "https://api.dexie.space").rstrip("/")
@@ -1106,20 +1117,42 @@ class CoinPrepWorker:
                     data = resp.json()
                     tickers = data.get("tickers", [])
                     if tickers and tickers[0].get("last_price"):
-                        price = Decimal(str(tickers[0]["last_price"]))
-                        if price > 0:
-                            cat_per_offer = trade_size_xch / price
-                            cat_coin_size = (
-                                cat_per_offer * self.coin_prep_headroom_multiplier
-                            ).quantize(Decimal("1"))
+                        p = Decimal(str(tickers[0]["last_price"]))
+                        if p > 0:
                             self.log(
-                                f"   CAT prep coin size: {cat_coin_size} "
-                                f"(derived: {trade_size_xch} XCH / {price} price × "
-                                f"{self.coin_prep_headroom_multiplier} headroom)"
+                                f"   ⚠️ Using Dexie last_price {p} for CAT sizing "
+                                f"(no live mid passed via --live-price; may lag "
+                                f"the bot's weighted mid)"
                             )
-                            return cat_coin_size
+                            return p
         except Exception as e:
-            self.log(f"   ⚠️ Price fetch failed for CAT size derivation: {e}")
+            self.log(f"   ⚠️ Dexie price fetch failed: {e}")
+
+        return None
+
+    def _derive_cat_coin_size(self, trade_size_xch: Decimal) -> Decimal:
+        """Calculate CAT coin size from XCH trade size using current price.
+
+        For sell offers, the bot needs CAT coins big enough to cover
+        trade_size_xch worth of CAT at current prices.
+        e.g. if trade_size = 0.6 XCH and price = 0.000064 XCH/CAT:
+             CAT needed = 0.6 / 0.000064 = 9375 CAT per coin
+
+        We add the configured prep headroom and round up.
+        Falls back to CAT_COIN_SIZE or 4000 if price fetch fails.
+        """
+        price = self._get_live_price()
+        if price and price > 0:
+            cat_per_offer = trade_size_xch / price
+            cat_coin_size = (
+                cat_per_offer * self.coin_prep_headroom_multiplier
+            ).quantize(Decimal("1"))
+            self.log(
+                f"   CAT prep coin size: {cat_coin_size} "
+                f"(derived: {trade_size_xch} XCH / {price} price × "
+                f"{self.coin_prep_headroom_multiplier} headroom)"
+            )
+            return cat_coin_size
 
         # Fallback
         fallback = Decimal(os.getenv("CAT_COIN_SIZE", "4000"))
@@ -1136,27 +1169,7 @@ class CoinPrepWorker:
         Falls back to uniform CAT_COIN_SIZE if price fetch fails.
         """
         result = {}
-        price = None
-
-        # Try to get current price
-        try:
-            import requests
-            cat_asset_id = os.getenv("CAT_ASSET_ID", "")
-            if cat_asset_id:
-                _dexie_base = os.getenv("DEXIE_API_BASE", "https://api.dexie.space").rstrip("/")
-                resp = requests.get(
-                    f"{_dexie_base}/v2/prices/tickers?ticker_id={cat_asset_id}_xch",
-                    timeout=10
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    tickers = data.get("tickers", [])
-                    if tickers and tickers[0].get("last_price"):
-                        price = Decimal(str(tickers[0]["last_price"]))
-                        if price <= 0:
-                            price = None
-        except Exception as e:
-            self.log(f"   ⚠️ Price fetch failed for tier CAT sizes: {e}")
+        price = self._get_live_price()
 
         if price and price > 0:
             # F62 (2026-04-09): CAT coin sizes come from the SELL side live
@@ -5631,6 +5644,10 @@ def parse_arguments():
                         help='Per-side CAT tier counts (sell ladder): inner=4,mid=16,outer=16,extreme=14')
     parser.add_argument('--prep-headroom-pct', type=float, default=None,
                         help='Extra % headroom to add to prepared coins above live offer size')
+    parser.add_argument('--live-price', type=str, default=None,
+                        help='Live XCH/CAT mid price (weighted Tibet+Dexie). Overrides the '
+                             'subprocess\' own Dexie last_price fetch so prep sizes CAT coins '
+                             'against the same mid the bot uses. Format: decimal string.')
     parser.add_argument('--run-id', type=str, default=None,
                         help='Unique run ID for status file tracking (prevents stale status reads)')
 
@@ -5704,6 +5721,9 @@ def main():
     if args.prep_headroom_pct is not None:
         os.environ["_CLI_PREP_HEADROOM_PCT"] = str(args.prep_headroom_pct)
         overrides.append(f"PREP_HEADROOM={args.prep_headroom_pct}%")
+    if args.live_price is not None:
+        os.environ["_CLI_LIVE_PRICE"] = str(args.live_price)
+        overrides.append(f"LIVE_PRICE={args.live_price}")
 
     if overrides:
         print(f"📊 CLI Overrides: {', '.join(overrides)}")
