@@ -217,6 +217,17 @@ class BotLoop:
         self._start_time: float = 0  # Set when bot starts, used for uptime
         self._last_loop_duration: float = 0
 
+        # ---- Ladder watchdog state ----
+        # Fill-aware watchdog: skip violation checks for a window after any
+        # fill so the natural refill cycle can restore ladder shape before
+        # we warn. Persistence counter: same (side, code) must recur across
+        # consecutive non-fill watchdog passes before we promote it to WARN.
+        # One-shot spikes (e.g. mid-refill transient state) never fire an
+        # operator-visible warning.
+        self._watchdog_violation_streaks: Dict[tuple, int] = {}
+        self._watchdog_post_fill_cooldown_secs: float = 120.0
+        self._watchdog_persistence_threshold: int = 2
+
         # ---- Price tracking ----
         self._last_quoted_price: Dict[str, Decimal] = {"buy": Decimal("0"), "sell": Decimal("0")}
         # F67: Un-anchored (plain) mid captured alongside probe-anchored
@@ -1722,6 +1733,32 @@ class BotLoop:
         buy_reversed = _is_reversed(buy_sizes)
         sell_reversed = _is_reversed(sell_sizes)
 
+        # Fill-awareness gate. Right after a fill, the remaining offers
+        # shift in price-position, the next-cycle refill hasn't landed
+        # yet, and the watchdog would see "wrong-size at slot N" for
+        # several slots — all transient. Suppress noise by skipping the
+        # audit entirely for a cooldown window after any fill, and by
+        # requiring the same violation to recur across consecutive
+        # passes before we promote it to WARN.
+        _now = time.time()
+        try:
+            last_fill_buy = float(self.fill_tracker._last_fill_time.get("buy", 0) or 0)
+            last_fill_sell = float(self.fill_tracker._last_fill_time.get("sell", 0) or 0)
+        except Exception:
+            last_fill_buy = last_fill_sell = 0.0
+        _last_fill = max(last_fill_buy, last_fill_sell)
+        _in_post_fill_window = (
+            _last_fill > 0
+            and (_now - _last_fill) < self._watchdog_post_fill_cooldown_secs
+        )
+        if _in_post_fill_window:
+            log_event("debug", "watchdog_post_fill_skip",
+                      f"Watchdog skipped: in post-fill refill window "
+                      f"({int(_now - _last_fill)}s since last fill, "
+                      f"cooldown {int(self._watchdog_post_fill_cooldown_secs)}s). "
+                      f"Refill cycle will realign the ladder.")
+            return
+
         issues = run_periodic_audit(
             offers_buy=offers_buy,
             offers_sell=offers_sell,
@@ -1735,6 +1772,21 @@ class BotLoop:
             inventory=inventory_dict,
             db_locked_count={"xch": xch_locked, "cat": cat_locked},
         )
+
+        # Persistence: track (side, code) → consecutive-pass streak.
+        # A violation only warrants an operator-visible warning when it
+        # survives the refill cycle AND is still present on the next
+        # watchdog pass. This kills one-shot transient noise from requote
+        # churn, cancel-all reconciliation lag, and mid-refill states
+        # without suppressing genuine sustained drift.
+        seen_now: set = set()
+        for issue in issues:
+            _side = str((issue.details or {}).get("side") or "ladder").lower()
+            seen_now.add((_side, issue.code))
+        # Reset streaks for codes that did NOT recur
+        stale_keys = [k for k in self._watchdog_violation_streaks if k not in seen_now]
+        for k in stale_keys:
+            self._watchdog_violation_streaks.pop(k, None)
 
         # Log each issue at the appropriate severity. The overnight
         # monitors grep for these codes and follow up.
@@ -1754,9 +1806,26 @@ class BotLoop:
         has_event_bus = self._event_bus is not None
 
         for issue in issues:
+            _side = str((issue.details or {}).get("side") or "ladder").lower()
+            _streak_key = (_side, issue.code)
+            prev_streak = int(self._watchdog_violation_streaks.get(_streak_key, 0) or 0)
+            new_streak = prev_streak + 1
+            self._watchdog_violation_streaks[_streak_key] = new_streak
+
+            if new_streak < self._watchdog_persistence_threshold:
+                # First observation — likely a transient refill artefact.
+                # Log at debug level and do NOT raise an operator alert.
+                log_event("debug", f"watchdog_{issue.code}_pending",
+                          f"{issue.message} (first observation, streak "
+                          f"{new_streak}/{self._watchdog_persistence_threshold} "
+                          f"— will warn if it persists)",
+                          data=issue.details)
+                continue
+
             sev = "error" if issue.severity == Severity.ERROR else "warning"
             log_event(sev, f"watchdog_{issue.code}",
-                      f"{issue.message} — {issue.suggested_action}",
+                      f"{issue.message} — {issue.suggested_action} "
+                      f"(persisted for {new_streak} watchdog passes)",
                       data=issue.details)
 
             if issue.code in ACTIONABLE and has_event_bus:
