@@ -4777,6 +4777,34 @@ class CoinManager:
         _POOL_REBUILD_KEEP = 1   # spare coins to leave in each tier bucket
         _POOL_REBUILD_MIN  = 2   # minimum excess coins required to attempt rebuild
 
+        # Compute per-tier targets so we never poach from a tier that is
+        # itself below target. Previously the rebuild treated any coins
+        # beyond `_POOL_REBUILD_KEEP` as excess, which meant a freshly-
+        # refilled inner tier (say 5/10) could be stripped to build
+        # mid — undoing the split we just did. A coin is only "excess"
+        # if the tier already has >= its target count.
+        try:
+            _rebuild_max_per_side = max(
+                getattr(cfg, "MAX_ACTIVE_BUY_OFFERS", 25),
+                getattr(cfg, "MAX_ACTIVE_SELL_OFFERS", 25),
+            )
+            _rebuild_multiplier = getattr(cfg, "COIN_PREP_MULTIPLIER", Decimal("1.0"))
+            _rebuild_side_key = "cat" if is_cat else "xch"
+            _rebuild_tier_sizes = (
+                self._configured_tier_sizes_xch(side="sell")
+                if is_cat else
+                self._configured_tier_sizes_xch(side="buy")
+            )
+            _per_tier_targets = get_weighted_tier_prep_counts(
+                _rebuild_max_per_side, _rebuild_multiplier,
+                tier_sizes_xch=_rebuild_tier_sizes,
+                side=_rebuild_side_key,
+            )
+        except Exception:
+            # Fail-open: if we can't compute targets, fall back to the
+            # original behaviour (treat >_POOL_REBUILD_KEEP as excess).
+            _per_tier_targets = {}
+
         _pool_candidates = []
         # Deliberately exclude "sniper" and "fees" from rebuild candidates:
         # those tiers use different coin sizes and won't be replenished by the
@@ -4786,8 +4814,17 @@ class CoinManager:
             _bucket = inventory.get(_tname, [])
             if not _bucket:
                 continue
-            # Keep the safety buffer; collect the remainder for the new pool
-            _take = max(0, len(_bucket) - _POOL_REBUILD_KEEP)
+            _have = len(_bucket)
+            _target = int(_per_tier_targets.get(_tname, 0) or 0)
+            if _target > 0 and _have < _target:
+                # Tier is below its own target — do NOT poach. Rebuilding
+                # another tier from this would create an infinite
+                # split-then-steal loop. Skip silently; _pool_rebuild_none
+                # below will log if no candidates remain.
+                continue
+            # Keep the safety buffer AND never go below target.
+            _floor = max(_POOL_REBUILD_KEEP, _target)
+            _take = max(0, _have - _floor)
             _pool_candidates.extend(_bucket[:_take])
 
         if len(_pool_candidates) >= _POOL_REBUILD_MIN:
