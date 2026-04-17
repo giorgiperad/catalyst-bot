@@ -43,6 +43,9 @@ from database import (
 # ---------------------------------------------------------------------------
 DEXIE_BASE = "https://api.dexie.space"
 TIBET_BASE = "https://api.v2.tibetswap.io"
+# F78 (2026-04-17): additional data sources for richer Smart Settings.
+COINGECKO_BASE = "https://api.coingecko.com/api/v3"
+COINSET_BASE_DEFAULT = "https://api.coinset.org"
 
 # Cache TTLs (minutes)
 CACHE_TTL_TRADES = 60       # Dexie trade history — changes slowly
@@ -50,6 +53,10 @@ CACHE_TTL_TICKER = 5        # Dexie ticker — changes frequently
 CACHE_TTL_SPACESCAN = 1440  # Spacescan token info — 24 hours (rate limited)
 CACHE_TTL_TIBET = 30        # TibetSwap pool — matches price_engine cache
 CACHE_TTL_ANALYSIS = 30     # Full analysis result
+# F78 (2026-04-17):
+CACHE_TTL_XCH_USD = 5       # XCH/USD fiat price — moves moderately
+CACHE_TTL_BLOCKCHAIN = 1    # Chia blockchain state — block-cadence sensitive
+CACHE_TTL_TRENDING = 10     # Dexie trending pairs — discovery use, not critical
 
 _session = requests.Session()
 _session.headers.update({"Content-Type": "application/json"})
@@ -90,6 +97,10 @@ def collect_all_market_data(asset_id: str, ticker_id: str,
         "tibet_quote": None,
         "spacescan": None,
         "internal_db": None,
+        # F78 (2026-04-17): XCH/USD, blockchain state, Dexie trending
+        "xch_usd": None,
+        "blockchain_state": None,
+        "dexie_trending": None,
         "_metadata": {
             "collected_at": datetime.now(timezone.utc).isoformat(),
             "sources_ok": [],
@@ -207,6 +218,65 @@ def collect_all_market_data(asset_id: str, ticker_id: str,
     except Exception as e:
         print(f"[MARKET_DATA] Internal DB failed: {e}")
         meta["sources_failed"].append("internal_db")
+
+    # ---- 6. F78: XCH/USD price (CoinGecko) ----
+    try:
+        cached = get_market_analysis_cache("_global_", "xch_usd")
+        if cached:
+            result["xch_usd"] = cached
+            meta["cache_hits"].append("xch_usd")
+        else:
+            xch_usd = _fetch_xch_usd_price()
+            if xch_usd:
+                result["xch_usd"] = xch_usd
+                set_market_analysis_cache("_global_", "xch_usd", xch_usd, CACHE_TTL_XCH_USD)
+        if result["xch_usd"]:
+            meta["sources_ok"].append("xch_usd")
+        else:
+            # Fiat price is supplementary — missing it is non-fatal, don't
+            # list as failure (wouldn't ding data-quality score either).
+            meta["sources_ok"].append("xch_usd_empty")
+    except Exception as e:
+        print(f"[MARKET_DATA] XCH/USD fetch failed: {e}")
+        meta["sources_ok"].append("xch_usd_empty")
+
+    # ---- 7. F78: Coinset blockchain state ----
+    try:
+        cached = get_market_analysis_cache("_global_", "blockchain_state")
+        if cached:
+            result["blockchain_state"] = cached
+            meta["cache_hits"].append("blockchain_state")
+        else:
+            bc = _fetch_coinset_blockchain_state()
+            if bc:
+                result["blockchain_state"] = bc
+                set_market_analysis_cache("_global_", "blockchain_state", bc, CACHE_TTL_BLOCKCHAIN)
+        if result["blockchain_state"]:
+            meta["sources_ok"].append("blockchain_state")
+        else:
+            meta["sources_ok"].append("blockchain_state_empty")
+    except Exception as e:
+        print(f"[MARKET_DATA] Blockchain state fetch failed: {e}")
+        meta["sources_ok"].append("blockchain_state_empty")
+
+    # ---- 8. F78: Dexie trending pairs (market-wide context) ----
+    try:
+        cached = get_market_analysis_cache("_global_", "dexie_trending")
+        if cached:
+            result["dexie_trending"] = cached
+            meta["cache_hits"].append("dexie_trending")
+        else:
+            trending = _fetch_dexie_trending_pairs(limit=20)
+            if trending:
+                result["dexie_trending"] = trending
+                set_market_analysis_cache("_global_", "dexie_trending", trending, CACHE_TTL_TRENDING)
+        if result["dexie_trending"]:
+            meta["sources_ok"].append("dexie_trending")
+        else:
+            meta["sources_ok"].append("dexie_trending_empty")
+    except Exception as e:
+        print(f"[MARKET_DATA] Dexie trending fetch failed: {e}")
+        meta["sources_ok"].append("dexie_trending_empty")
 
     _progress(6, "Data collection complete")
 
@@ -638,6 +708,135 @@ def _fetch_tibet_quote(pair_id: str, amount_mojos: int = 10000000000) -> Optiona
 
 
 # ---------------------------------------------------------------------------
+# F78 (2026-04-17) — additional data sources
+# ---------------------------------------------------------------------------
+
+def _fetch_xch_usd_price() -> Optional[Dict]:
+    """Fetch XCH/USD fiat price from CoinGecko.
+
+    Free, no API key required. Used by Smart Settings to:
+      - Display settings + ladder values in USD alongside XCH
+      - Detect systemic XCH moves (e.g. XCH +15% today → widen spreads)
+        separately from token-specific volatility
+    Returns None on any failure — caller treats as "USD data unavailable".
+    """
+    try:
+        resp = _session.get(
+            f"{COINGECKO_BASE}/simple/price",
+            params={
+                "ids": "chia",
+                "vs_currencies": "usd",
+                "include_24hr_change": "true",
+                "include_last_updated_at": "true",
+            },
+            timeout=8,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        chia = data.get("chia") or {}
+        if not chia.get("usd"):
+            return None
+        return {
+            "has_data": True,
+            "xch_usd": _safe_float(chia.get("usd", 0)),
+            "xch_usd_24h_change_pct": _safe_float(chia.get("usd_24h_change", 0)),
+            "last_updated_at": int(chia.get("last_updated_at", 0) or 0),
+        }
+    except Exception as e:
+        print(f"[MARKET_DATA] CoinGecko XCH/USD fetch failed: {e}")
+        return None
+
+
+def _fetch_coinset_blockchain_state() -> Optional[Dict]:
+    """Fetch current Chia blockchain state from Coinset.
+
+    Returns peak height, network difficulty, sync status, mempool
+    volume. Used by Smart Settings to refine fee timing and detect
+    network congestion (high mempool → widen fee estimates).
+    """
+    try:
+        base = str(
+            getattr(cfg, "COINSET_API_URL", COINSET_BASE_DEFAULT)
+            or COINSET_BASE_DEFAULT
+        ).rstrip("/")
+        resp = _session.post(
+            f"{base}/get_blockchain_state",
+            json={},
+            headers={"content-type": "application/json"},
+            timeout=8,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if not data.get("success"):
+            return None
+        state = data.get("blockchain_state") or {}
+        if not state:
+            return None
+        peak = state.get("peak") or {}
+        # mempool_size / mempool_cost are sibling fields on the response;
+        # Coinset mirrors the full-node shape.
+        return {
+            "has_data": True,
+            "peak_height": int(peak.get("height", 0) or 0),
+            "peak_timestamp": int(peak.get("timestamp", 0) or 0),
+            "sync_progress_pct": _safe_float(state.get("sync", {}).get("sync_progress_height", 0)),
+            "synced": bool(state.get("sync", {}).get("synced", False)),
+            "mempool_size": int(data.get("mempool_size", 0) or 0),
+            "mempool_cost": int(data.get("mempool_cost", 0) or 0),
+            "mempool_min_fees": int(data.get("mempool_min_fees", 0) or 0),
+            "space_network": _safe_float(state.get("space", 0)),
+            "difficulty": int(state.get("difficulty", 0) or 0),
+        }
+    except Exception as e:
+        print(f"[MARKET_DATA] Coinset blockchain_state fetch failed: {e}")
+        return None
+
+
+def _fetch_dexie_trending_pairs(limit: int = 20) -> Optional[Dict]:
+    """Fetch Dexie's top pairs by 24h volume.
+
+    Feeds the Smart Settings "market context" layer — is the bot's pair
+    moving in line with the broader market? Currently informational; a
+    future pass could correlate the bot's CAT vs top-10 for systemic-vs-
+    idiosyncratic vol decomposition.
+    """
+    try:
+        resp = _session.get(
+            f"{DEXIE_BASE}/v1/pairs",
+            params={"sort": "volume_24h", "dir": "desc", "page_size": int(limit)},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        pairs = data.get("pairs") or data.get("data") or []
+        if not isinstance(pairs, list) or not pairs:
+            return None
+        # Keep only the fields Smart Settings actually uses
+        trimmed = []
+        for p in pairs[:limit]:
+            if not isinstance(p, dict):
+                continue
+            trimmed.append({
+                "ticker": str(p.get("ticker_id") or p.get("id") or ""),
+                "name": str(p.get("name") or ""),
+                "volume_24h": _safe_float(p.get("volume_24h", 0)),
+                "price": _safe_float(p.get("price", 0)),
+                "price_change_24h_pct": _safe_float(p.get("price_change_24h", 0)),
+            })
+        return {
+            "has_data": bool(trimmed),
+            "pairs": trimmed,
+            "total_volume_24h": sum(p["volume_24h"] for p in trimmed),
+        }
+    except Exception as e:
+        print(f"[MARKET_DATA] Dexie trending pairs fetch failed: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # 4. Spacescan Token Analytics
 # ---------------------------------------------------------------------------
 
@@ -961,6 +1160,13 @@ def _fetch_internal_db_history(asset_id: str) -> Dict:
         "latest_net_position": 0,
         "pool_snapshots": 0,
         "pool_trend": "unknown",
+        # F78 (2026-04-17): bot's own-fill volatility — rolling std-dev
+        # of our actual fill prices. Uses ground-truth data we already
+        # store; previously ignored despite being the best volatility
+        # signal we have (Dexie trades are noisier aggregates).
+        "own_fill_stddev_pct": 0.0,      # std-dev of log-returns ×100
+        "own_fill_range_pct": 0.0,        # (max-min)/mean ×100 of recent fills
+        "own_fill_samples": 0,            # number of fills used in the calc
     }
 
     conn = get_connection()
@@ -1024,6 +1230,49 @@ def _fetch_internal_db_history(asset_id: str) -> Dict:
                     result["pool_trend"] = "shrinking"
                 else:
                     result["pool_trend"] = "stable"
+
+        # F78 (2026-04-17): bot's own-fill volatility.
+        # Use log-returns of consecutive fill prices — standard vol metric
+        # that handles price scale invariantly. Annualised conversion is
+        # skipped; we emit the raw sigma so downstream can pick a window.
+        try:
+            rows = conn.execute(
+                "SELECT CAST(price_xch AS REAL) AS price, filled_at "
+                "FROM fills WHERE cat_asset_id = ? "
+                "AND filled_at >= datetime('now', '-30 days') "
+                "AND price_xch IS NOT NULL "
+                "ORDER BY filled_at ASC",
+                (asset_id,)
+            ).fetchall()
+            prices = [r["price"] for r in rows if r["price"] and r["price"] > 0]
+            n = len(prices)
+            if n >= 3:
+                # Log-return std-dev (expressed as percentage)
+                import math as _math
+                returns = [
+                    _math.log(prices[i] / prices[i - 1])
+                    for i in range(1, n)
+                    if prices[i - 1] > 0 and prices[i] > 0
+                ]
+                if returns:
+                    mean_ret = sum(returns) / len(returns)
+                    variance = sum(
+                        (r - mean_ret) ** 2 for r in returns
+                    ) / max(1, len(returns) - 1)
+                    sigma = variance ** 0.5
+                    result["own_fill_stddev_pct"] = round(sigma * 100, 4)
+                # Range-based measure (robust to small samples)
+                p_min = min(prices)
+                p_max = max(prices)
+                p_mean = sum(prices) / n
+                if p_mean > 0:
+                    result["own_fill_range_pct"] = round(
+                        (p_max - p_min) / p_mean * 100, 2
+                    )
+                result["own_fill_samples"] = n
+        except Exception as _own_vol_err:
+            # Non-fatal — leave the defaults (0.0) in place
+            print(f"[MARKET_DATA] Own-fill vol calc failed: {_own_vol_err}")
 
     except Exception as e:
         print(f"[MARKET_DATA] Internal DB query failed: {e}")
@@ -1181,6 +1430,35 @@ def _analyze_volatility(raw: Dict) -> Dict:
                     f"max_move={max_move*100:.1f}% "
                     f"(from {len(daily_avgs)} days of trades)"
                 )
+
+    # --- F78 (2026-04-17): own-fill vol cross-check ---
+    # Our own fills are ground truth (no Dexie aggregation noise). If we
+    # have enough of them, they either CORROBORATE the Dexie-derived vol
+    # (good) or DIVERGE (means Dexie trade data is stale/thin). When
+    # divergent, prefer own-fill vol as the primary signal.
+    own_vol = float((raw.get("internal_db") or {}).get("own_fill_stddev_pct", 0) or 0)
+    own_samples = int((raw.get("internal_db") or {}).get("own_fill_samples", 0) or 0)
+    if own_samples >= 10 and own_vol > 0:
+        result["own_fill_stddev_pct"] = own_vol
+        result["own_fill_samples"] = own_samples
+        current_std = result["std_dev_pct"]
+        # Divergence > 40% in either direction → trust our own fills
+        if current_std > 0:
+            ratio = own_vol / current_std
+            if ratio > 1.4 or ratio < 0.71:
+                result["std_dev_pct"] = own_vol
+                result["confidence"] = "high"
+                result["explanation"] = (
+                    f"Own-fill vol {own_vol:.1f}% used as primary "
+                    f"(diverges from Dexie {current_std:.1f}%, n={own_samples})"
+                )
+        else:
+            # No Dexie signal — own fills are our only source
+            result["std_dev_pct"] = own_vol
+            result["confidence"] = "medium"
+            result["explanation"] = (
+                f"Own-fill vol {own_vol:.1f}% (Dexie trades unavailable, n={own_samples})"
+            )
 
     # --- Determine regime ---
     # Use the best available metric

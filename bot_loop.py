@@ -1503,6 +1503,55 @@ class BotLoop:
             log_event("debug", "coin_update_event_failed",
                       f"Coin update GUI event failed (non-critical): {e}")
 
+    def _try_start_mempool_watcher(self, *, log_skip: bool = False) -> bool:
+        """F78 (2026-04-17): attempt to start the mempool watcher.
+
+        Split out from :meth:`start` so the main loop can call it each
+        cycle when the initial attempt at boot failed (usually because
+        the TibetSwap pair_id hadn't been resolved yet).
+
+        Returns True on successful start or when already running;
+        False when it couldn't start (caller should retry next cycle).
+        """
+        if not (_mempool_watcher_mod
+                and getattr(cfg, "COINSET_ENABLED", True)
+                and cfg.CAT_ASSET_ID):
+            return False
+        # Already running?
+        try:
+            if getattr(_mempool_watcher_mod, "_watcher_instance", None) is not None:
+                return True
+        except Exception:
+            pass
+
+        try:
+            pair_id = getattr(cfg, "_cached_tibet_pair_id", "") or ""
+            if not pair_id:
+                from price_engine import PriceEngine as _PE
+                _tmp_pe = _PE()
+                _tmp_pair = _tmp_pe._find_tibet_pair(cfg.CAT_ASSET_ID) or {}
+                pair_id = _tmp_pair.get("pair_id", "")
+            if not pair_id:
+                if log_skip:
+                    log_event("info", "mempool_watcher_deferred",
+                              "Mempool watcher deferred — TibetSwap pair_id "
+                              "not resolved yet; will retry on next cycle")
+                return False
+            _mempool_watcher_mod.start_watcher(
+                pair_id=pair_id,
+                asset_id=cfg.CAT_ASSET_ID,
+                cat_decimals=int(getattr(cfg, "CAT_DECIMALS", 3) or 3),
+                wake_callback=self._watcher_event.set,
+            )
+            log_event("info", "mempool_watcher_init",
+                      f"Mempool watcher started (pair {pair_id[:16]}...)")
+            return True
+        except Exception as _mw_err:
+            if log_skip:
+                log_event("warning", "mempool_watcher_skip",
+                          f"Mempool watcher could not start: {_mw_err}")
+            return False
+
     def _run_ladder_watchdog(self) -> None:
         """F72: Periodic ladder + coin-accounting integrity audit.
 
@@ -1943,27 +1992,16 @@ class BotLoop:
         # Polls Coinset mempool every 5s for pending Tibet pool spends,
         # giving up to one block (~18-54s) early warning of incoming swaps.
         # Only starts if COINSET_ENABLED is True.
+        #
+        # F78 (2026-04-17): if pair_id isn't cached yet (startup hasn't
+        # resolved it), we schedule a retry on each main-loop tick via
+        # self._mempool_watcher_needs_start. Previously this block
+        # failed silently and the watcher never started for the session.
+        self._mempool_watcher_needs_start = False
         if _mempool_watcher_mod and getattr(cfg, "COINSET_ENABLED", True) and cfg.CAT_ASSET_ID:
-            try:
-                pair_id = getattr(cfg, "_cached_tibet_pair_id", "") or ""
-                if not pair_id:
-                    # Try to resolve pair_id from the price engine cache
-                    from price_engine import PriceEngine as _PE
-                    _tmp_pe = _PE()
-                    _tmp_pair = _tmp_pe._find_tibet_pair(cfg.CAT_ASSET_ID) or {}
-                    pair_id = _tmp_pair.get("pair_id", "")
-                if pair_id:
-                    _mempool_watcher_mod.start_watcher(
-                        pair_id=pair_id,
-                        asset_id=cfg.CAT_ASSET_ID,
-                        cat_decimals=int(getattr(cfg, "CAT_DECIMALS", 3) or 3),
-                        wake_callback=self._watcher_event.set,
-                    )
-                    log_event("info", "mempool_watcher_init",
-                              f"Mempool watcher started (pair {pair_id[:16]}...)")
-            except Exception as _mw_err:
-                log_event("warning", "mempool_watcher_skip",
-                          f"Mempool watcher could not start: {_mw_err}")
+            started = self._try_start_mempool_watcher(log_skip=True)
+            if not started:
+                self._mempool_watcher_needs_start = True
 
         # Coin watcher thread (lifecycle tracking)
         self._coin_watcher_thread = threading.Thread(
@@ -5848,6 +5886,14 @@ class BotLoop:
         # Log coin inventory every 10 loops (gives a running picture)
         if self._loop_count % 10 == 0:
             self.coin_manager.log_inventory(reason="periodic")
+
+        # F78 (2026-04-17): if the mempool watcher couldn't start at boot
+        # (usually because TibetSwap pair_id wasn't resolved yet), retry
+        # on each cycle until it succeeds. After that, the flag is cleared
+        # and this branch is cheap.
+        if getattr(self, "_mempool_watcher_needs_start", False):
+            if self._try_start_mempool_watcher(log_skip=False):
+                self._mempool_watcher_needs_start = False
 
         # F72: Ladder + coin-accounting integrity watchdog.
         # Runs every 10 cycles (same cadence as inventory log). Produces
