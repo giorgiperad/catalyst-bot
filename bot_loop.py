@@ -875,9 +875,16 @@ class BotLoop:
         # F67: snap requote baseline from probe-anchored mid → plain mid.
         # At ladder creation we stored the probe-offset mid in
         # _last_quoted_price and the un-anchored mid in _last_quoted_plain_mid.
-        # Once the probe is gone, the offset is irrelevant — keeping the
-        # probe-anchored baseline would make the next requote cycle see
-        # ~2% drift and trigger a pointless requote of 6+6 offers.
+        # Once the probe is gone, the existing ladder offers are still priced
+        # against the STALE probe-anchored mid — they don't match the plain
+        # mid the bot now trades against. Replacement offers created while
+        # this stale ladder is live end up interleaved with the old price
+        # grid (inner offers sitting at mid-tier prices, etc.), breaking the
+        # ladder shape. Snapping the baseline silently (the original F67
+        # behaviour) prevents the drift-detection requote from firing and
+        # leaves the misaligned ladder in place. Correct fix: snap the
+        # baseline AND force a one-shot requote on this side so the ladder
+        # realigns to plain_mid cleanly, once.
         try:
             plain_mid = self._last_quoted_plain_mid.get(side, Decimal("0"))
             current_baseline = self._last_quoted_price.get(side, Decimal("0"))
@@ -885,9 +892,19 @@ class BotLoop:
                 self._last_quoted_price[side] = plain_mid
                 # Consumed — next creation/requote will set a fresh pair
                 self._last_quoted_plain_mid[side] = Decimal("0")
-                log_event("debug", "probe_baseline_snap",
+                # Flag this side for requote so the stale probe-anchored
+                # offers get replaced with plain-mid-anchored ones in a
+                # single coordinated batch, rather than drifting as
+                # individual fill-triggered replacements land at the new
+                # price grid.
+                try:
+                    self._force_requote[side] = True
+                except Exception:
+                    pass
+                log_event("info", "probe_baseline_snap",
                           f"{side} baseline snapped to plain mid "
-                          f"({current_baseline:.8f} -> {plain_mid:.8f}) on probe clear")
+                          f"({current_baseline:.8f} -> {plain_mid:.8f}) on probe clear; "
+                          f"requote flagged to realign ladder")
         except Exception as _e:
             log_event("debug", "probe_baseline_snap_failed",
                       f"Could not snap {side} baseline on probe clear: {_e}")
