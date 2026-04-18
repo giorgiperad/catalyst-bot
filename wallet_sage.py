@@ -2147,7 +2147,7 @@ def send_cat_multi(payments: list, fee_mojos: int = 0):
 # OFFER MANAGEMENT
 # ============================================================================
 
-def create_offer(offer_dict: dict, validate_only: bool = True, max_time: int = None,
+def create_offer(offer_dict: dict, validate_only: bool = False, max_time: int = None,
                   _reuse_puzhash: bool = True,
                   min_coin_amount: int = None, max_coin_amount: int = None,
                   coin_ids: list = None, fee_mojos: int = 0):
