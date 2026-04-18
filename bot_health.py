@@ -660,21 +660,39 @@ def check_ladder_overbuild(auto_repair: bool = True) -> HealthCheck:
 # calls every cycle but checks need at most ~once per minute)
 _last_run_lock_ts: float = 0.0
 _last_report: Optional[HealthReport] = None
-_MIN_INTERVAL_SECS = 60.0
+_MIN_INTERVAL_SECS_IDLE = 60.0   # normal throttle — full 60s between runs
+_MIN_INTERVAL_SECS_BUSY = 15.0   # F84: when last run found pending cancels,
+                                  # shorten the window so they get resolved
+                                  # faster. The 5-hour zombie test showed
+                                  # that waiting a full 60s after each cleanup
+                                  # pass leaves offers mis-tracked for ~5 min
+                                  # longer than necessary — the verifier
+                                  # could be confirming them within 15s.
 
 
 def run_runtime_checks(auto_repair: bool = True,
                        force: bool = False) -> HealthReport:
     """Run all runtime health checks and return a structured report.
 
-    Throttled to one run per ~60s unless force=True. Pass auto_repair=False
-    for a diagnostic-only run (e.g. from a GUI button that just shows
-    anomalies without acting on them).
+    F84 (2026-04-18): adaptive throttle — when the last run found pending
+    cancels (i.e. there's churn to resolve), the next run can fire after
+    15s instead of 60s. When the last run was clean (no anomalies) we stay
+    on the 60s idle cadence.
     """
     global _last_run_lock_ts, _last_report
 
     now = time.time()
-    if not force and _last_report and (now - _last_run_lock_ts) < _MIN_INTERVAL_SECS:
+    # Pick throttle based on last-run state — busy = pending work = fast
+    # cycle; idle = nothing to do = slow cycle.
+    if _last_report and any(
+        c.name == "pending_cancels" and c.anomaly_count > 0
+        for c in _last_report.checks
+    ):
+        throttle = _MIN_INTERVAL_SECS_BUSY
+    else:
+        throttle = _MIN_INTERVAL_SECS_IDLE
+
+    if not force and _last_report and (now - _last_run_lock_ts) < throttle:
         return _last_report
 
     start = now

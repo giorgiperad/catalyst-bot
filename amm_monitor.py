@@ -76,6 +76,13 @@ class AMMMonitor:
         self._last_quoted_buy: Optional[Decimal] = None
         self._last_quoted_sell: Optional[Decimal] = None
 
+        # F84 (2026-04-18): suppress repeated identical drift logs.
+        # Without this the same 83bps drift event fires every 10s after a
+        # requote because notify_quoted_price hasn't reset the baseline yet.
+        # Track last logged drift bucket and only re-log when it CHANGES
+        # by >5 bps OR drops below threshold (and re-emerges).
+        self._last_drift_bucket: Optional[int] = None
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -354,17 +361,33 @@ class AMMMonitor:
         # Invalidate tibet price cache if drift is significant
         drift_threshold = Decimal(str(getattr(cfg, "AMM_DRIFT_REQUOTE_BPS", "40")))
         if drift_bps is not None and drift_bps >= drift_threshold:
-            log_event("info", "amm_drift_detected",
-                      f"AMM price drifted {drift_bps:.1f}bps from last quoted mid "
-                      f"— invalidating Tibet cache for fresh requote",
-                      data={"drift_bps": str(drift_bps.quantize(Decimal("0.1"))),
-                            "threshold_bps": str(drift_threshold),
-                            "amm_price": str(state.get("amm_price", ""))})
+            # F84: suppress repeated identical drift firings. The drift value
+            # only changes when EITHER amm_price moves OR last_quoted_mid
+            # moves (post-requote). When both stall (e.g. requote failed or
+            # baseline reset wasn't called), the same value would fire every
+            # 10s. Bucket to nearest 5 bps so small ticks don't all fire.
+            current_bucket = int(round(float(drift_bps) / 5.0)) * 5
+            should_log = (
+                self._last_drift_bucket is None
+                or abs(current_bucket - self._last_drift_bucket) >= 5
+            )
+            self._last_drift_bucket = current_bucket
+            if should_log:
+                log_event("info", "amm_drift_detected",
+                          f"AMM price drifted {drift_bps:.1f}bps from last quoted mid "
+                          f"— invalidating Tibet cache for fresh requote",
+                          data={"drift_bps": str(drift_bps.quantize(Decimal("0.1"))),
+                                "threshold_bps": str(drift_threshold),
+                                "amm_price": str(state.get("amm_price", ""))})
             if self._price_engine is not None:
                 try:
                     self._price_engine.invalidate_tibet_cache()
                 except Exception:
                     pass
+        elif drift_bps is not None and drift_bps < drift_threshold:
+            # Drift dropped below threshold — clear bucket so next cross-up
+            # logs again.
+            self._last_drift_bucket = None
 
         # Also update the tibet_cache in price_engine with live reserve data
         # so the next get_price() call uses fresh values without a full /pairs fetch
