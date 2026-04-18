@@ -2623,10 +2623,29 @@ class BotLoop:
                         self._watcher_event.set()
                 elif sig_type == "price_move":
                     direction = sig.get("direction", "?")
-                    pct = sig.get("magnitude_pct", 0)
+                    pct_raw = sig.get("magnitude_pct", 0)
+                    pct = abs(float(pct_raw or 0))
                     log_event("info", "mempool_price_confirmed",
                               f"Pool reserves confirmed: {direction} {pct:.3f}% "
                               f"(XCH {sig.get('delta_xch', 0):+d} mojos)")
+                    # F82 (2026-04-18): defensive cancel on confirmed pool
+                    # move > 50 bps. F81 only fired on imminent_swap which
+                    # missed swaps that confirmed before the 5s mempool
+                    # poll caught them. Live test 2026-04-18 had two sell
+                    # fills 29-37 SECONDS AFTER price_move was logged —
+                    # plenty of warning, but no defensive action was taken.
+                    # This closes that gap. Bot's normal emergency requote
+                    # still runs after; defensive cancel is just faster.
+                    if pct >= 0.50:  # 50 bps
+                        try:
+                            n = self._defensive_cancel_inner_offers(
+                                reason=f"mempool_price_move_{pct:.2f}pct_{direction}")
+                            log_event("info", "mempool_defensive_cancel_done",
+                                      f"price_move {pct:.2f}% {direction} — "
+                                      f"cancelled {n} inner-tier offers")
+                        except Exception as _dc_err:
+                            log_event("warning", "mempool_defensive_cancel_failed",
+                                      f"price_move defensive cancel failed: {_dc_err}")
         except Exception as _drain_err:
             # F81: previously silent — meant we couldn't tell if the watcher
             # signal flow was broken. Now logged at warning so anomalies

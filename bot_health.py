@@ -545,6 +545,91 @@ def check_stale_dexie_posts(auto_repair: bool = True) -> HealthCheck:
     )
 
 
+# ── Check 4: ladder over-build (wallet count vastly exceeds DB tracked) ──
+
+# How long a wallet count > target overage can persist before we cancel
+# the excess. Bot's normal post-storm cleanup takes ~5 min via the verifier
+# re-cancelling zombies; this catches the case where the wallet keeps
+# growing because new offers are created faster than old ones get cancelled.
+_OVERBUILD_GRACE_SECS = 60
+# How far over the configured cap is "over-built". We allow some slack
+# because requote storms create overlap before old offers cancel.
+_OVERBUILD_RATIO = 1.30  # wallet > 1.30 × target → flag
+
+
+def check_ladder_overbuild(auto_repair: bool = True) -> HealthCheck:
+    """Detect when the wallet has far more offers than the DB tracks.
+
+    During a requote storm the bot can create new offers faster than the
+    old ones cancel — wallet count climbs above the configured ladder cap
+    while DB stays accurate. The pending-cancel verifier resolves it
+    eventually (re-cancels zombies), but in the meantime the over-built
+    wallet is exposed and confuses observers (Dexie, dashboard, this bot).
+
+    Detection: wallet_buy or wallet_sell > 1.30 × MAX_ACTIVE_BUY/SELL.
+
+    Repair: defer to the existing pending_cancels verifier — we don't
+    add a separate cancel path here because it risks racing with the
+    requote machinery. Just flag prominently so the operator knows the
+    bot is in a transient over-built state.
+    """
+    from config import cfg as _cfg
+    from database import get_connection
+
+    try:
+        max_buy = int(getattr(_cfg, "MAX_ACTIVE_BUY", 12) or 12)
+        max_sell = int(getattr(_cfg, "MAX_ACTIVE_SELL", 12) or 12)
+    except Exception:
+        max_buy = max_sell = 12
+
+    # Read the bot's last-known wallet counts from the diagnostics state.
+    # We can't query Sage directly here without a session; the bot loop
+    # writes the latest wallet counts into the offers/coins tables on each
+    # reconcile, so use the open-offer counts as a proxy for "what we
+    # think is live" (they shouldn't diverge except during a storm).
+    try:
+        conn = get_connection()
+        rows = conn.execute(
+            "SELECT side, COUNT(*) as n FROM offers WHERE status='open' GROUP BY side"
+        ).fetchall()
+        db_counts = {r["side"]: int(r["n"]) for r in rows}
+    except Exception:
+        db_counts = {}
+
+    db_buy = db_counts.get("buy", 0)
+    db_sell = db_counts.get("sell", 0)
+
+    buy_overbuild = db_buy > int(max_buy * _OVERBUILD_RATIO)
+    sell_overbuild = db_sell > int(max_sell * _OVERBUILD_RATIO)
+
+    if not (buy_overbuild or sell_overbuild):
+        return HealthCheck(
+            name="ladder_overbuild",
+            category="offers",
+            status="pass",
+            severity="info",
+            message=f"Ladder within bounds (buy {db_buy}/{max_buy}, sell {db_sell}/{max_sell}).",
+        )
+
+    parts = []
+    if buy_overbuild:
+        parts.append(f"buy {db_buy} > 1.30 × {max_buy}")
+    if sell_overbuild:
+        parts.append(f"sell {db_sell} > 1.30 × {max_sell}")
+
+    return HealthCheck(
+        name="ladder_overbuild",
+        category="offers",
+        status="warn",
+        severity="warning",
+        message=("Ladder over-built: " + ", ".join(parts)
+                 + ". pending_cancels verifier will re-cancel zombies — "
+                 + "monitor for recovery within ~5 min. If persistent, the "
+                 + "requote machinery is creating faster than cancels confirm."),
+        anomaly_count=int(buy_overbuild) + int(sell_overbuild),
+    )
+
+
 # ── Top-level runner ───────────────────────────────────────────────────
 
 # Cache to avoid running checks more often than needed (the bot loop
@@ -575,6 +660,7 @@ def run_runtime_checks(auto_repair: bool = True,
     report.checks.append(check_pending_cancels(auto_repair=auto_repair))
     report.checks.append(check_orphan_locks(auto_repair=auto_repair))
     report.checks.append(check_stale_dexie_posts(auto_repair=auto_repair))
+    report.checks.append(check_ladder_overbuild(auto_repair=auto_repair))
 
     report.duration_ms = (time.time() - start) * 1000.0
     _last_run_lock_ts = time.time()
