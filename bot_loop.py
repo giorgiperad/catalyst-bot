@@ -2522,40 +2522,55 @@ class BotLoop:
         log_event("info", "bot_loop_exit", "Bot loop exited cleanly")
 
     def _defensive_cancel_inner_offers(self, reason: str) -> int:
-        """F81: bulk-cancel inner-tier offers on both sides preemptively.
+        """Backwards-compat wrapper — cancel inner tier only."""
+        return self._defensive_cancel_tiers(("inner",), reason)
 
-        Triggered when the mempool watcher detects a pending TibetSwap pool
-        spend. Inner-tier offers (closest to mid) are most likely to be
-        arbed during an AMM move — cancelling them BEFORE the swap confirms
-        means the arber finds no profitable target on Dexie when their
-        TibetSwap trade lands ~50s later. Mid/outer/extreme offers stay in
-        place — they're far enough from mid to absorb the move and we want
-        SOME book presence while we figure out the new mid.
+    def _defensive_cancel_tiers(self, tiers: tuple, reason: str) -> int:
+        """F83: bulk-cancel offers in the given tiers on both sides.
 
-        Returns number of trade_ids submitted for cancel (best-effort —
-        actual on-chain confirmation arrives later via the bot_health
-        verifier loop).
+        Triggered when the mempool watcher detects a pool spend. The TIER
+        SET should grow with the magnitude of the move:
+
+          * small move (<= 5%):   ('inner',)            — minimum exposure
+          * medium move (5-10%):  ('inner', 'mid')      — inner+mid exposed
+          * large move (> 10%):   ('inner', 'mid', 'outer')
+
+        For confirmed price_move signals we know the magnitude and can pick
+        the right tier set. For pre-confirmation imminent_swap signals we
+        don't yet know magnitude, so default to inner-only (the most
+        conservative — at minimum protect the most-exposed offers).
+
+        Live evidence (test 3, 2026-04-18 ~13.1% Tibet drop):
+          - F82 cancelled inner-tier on imminent_swap → 0 inner fills ✓
+          - But 3 MID-TIER buy fills happened ~7 minutes later, when
+            Tibet was at 0.000115 and our mid bids at 0.000118-0.000119
+            were still profitable arbs. F82 didn't catch them because it
+            only cancels inner.
+
+        Returns number of trade_ids submitted for cancel.
         """
+        tiers_lc = tuple(t.lower() for t in tiers)
         try:
             from database import get_open_offers
             from config import cfg as _cfg
             asset_id = getattr(_cfg, "CAT_ASSET_ID", "") or ""
-            inner_buys = [o for o in (get_open_offers(side="buy",
-                                                     cat_asset_id=asset_id) or [])
-                          if (o.get("tier") or "").lower() == "inner"]
-            inner_sells = [o for o in (get_open_offers(side="sell",
-                                                      cat_asset_id=asset_id) or [])
-                           if (o.get("tier") or "").lower() == "inner"]
-            tids = [o.get("trade_id") for o in (inner_buys + inner_sells)
+            buys = [o for o in (get_open_offers(side="buy",
+                                                cat_asset_id=asset_id) or [])
+                    if (o.get("tier") or "").lower() in tiers_lc]
+            sells = [o for o in (get_open_offers(side="sell",
+                                                 cat_asset_id=asset_id) or [])
+                     if (o.get("tier") or "").lower() in tiers_lc]
+            tids = [o.get("trade_id") for o in (buys + sells)
                     if o.get("trade_id")]
+            tier_label = "+".join(tiers_lc)
             if not tids:
                 log_event("info", "defensive_cancel_skip",
-                          f"Defensive cancel: no inner-tier offers to cancel "
+                          f"Defensive cancel: no {tier_label} offers to cancel "
                           f"(reason={reason})")
                 return 0
             log_event("info", "defensive_cancel_start",
-                      f"Defensive cancel: firing on {len(tids)} inner-tier offers "
-                      f"({len(inner_buys)} buy + {len(inner_sells)} sell, reason={reason})")
+                      f"Defensive cancel: firing on {len(tids)} {tier_label} offers "
+                      f"({len(buys)} buy + {len(sells)} sell, reason={reason})")
             try:
                 self.offer_manager.cancel_offers(
                     tids, reason=reason, skip_confirmation=True)
@@ -2566,7 +2581,7 @@ class BotLoop:
             return len(tids)
         except Exception as e:
             log_event("warning", "defensive_cancel_failed",
-                      f"_defensive_cancel_inner_offers exception: {e}")
+                      f"_defensive_cancel_tiers exception: {e}")
             return 0
 
     def _drain_mempool_signals(self, in_cycle: bool = False) -> None:
@@ -2637,12 +2652,25 @@ class BotLoop:
                     # This closes that gap. Bot's normal emergency requote
                     # still runs after; defensive cancel is just faster.
                     if pct >= 0.50:  # 50 bps
+                        # F83 (2026-04-18): graduated tier set based on
+                        # magnitude. Big AMM moves expose more than just
+                        # the inner tier. Test 3 saw 3 mid-tier buy fills
+                        # 7 min after a -13.1% Tibet drop because F82
+                        # only cancelled inner. The mid offers were still
+                        # profitable arbs against the new mid.
+                        if pct >= 10.0:
+                            tiers = ("inner", "mid", "outer")
+                        elif pct >= 5.0:
+                            tiers = ("inner", "mid")
+                        else:
+                            tiers = ("inner",)
                         try:
-                            n = self._defensive_cancel_inner_offers(
+                            n = self._defensive_cancel_tiers(
+                                tiers=tiers,
                                 reason=f"mempool_price_move_{pct:.2f}pct_{direction}")
                             log_event("info", "mempool_defensive_cancel_done",
                                       f"price_move {pct:.2f}% {direction} — "
-                                      f"cancelled {n} inner-tier offers")
+                                      f"cancelled {n} offers across {'+'.join(tiers)}")
                         except Exception as _dc_err:
                             log_event("warning", "mempool_defensive_cancel_failed",
                                       f"price_move defensive cancel failed: {_dc_err}")

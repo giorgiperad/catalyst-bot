@@ -605,8 +605,16 @@ def check_ladder_overbuild(auto_repair: bool = True) -> HealthCheck:
     # think is live" (they shouldn't diverge except during a storm).
     try:
         conn = get_connection()
+        # F83 fix: exclude pending-cancel offers from the count. Those are
+        # already on the way out via the verifier, so flagging them as
+        # "overbuild" produces noise during requote storms. Match the
+        # default semantics of database.get_open_offers().
         rows = conn.execute(
-            "SELECT side, COUNT(*) as n FROM offers WHERE status='open' GROUP BY side"
+            "SELECT side, COUNT(*) as n FROM offers "
+            "WHERE status='open' "
+            "  AND (lifecycle_state IS NULL "
+            "       OR lifecycle_state NOT IN ('cancel_requested', 'cancel_sent')) "
+            "GROUP BY side"
         ).fetchall()
         db_counts = {r["side"]: int(r["n"]) for r in rows}
     except Exception:
