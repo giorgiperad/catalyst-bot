@@ -1711,10 +1711,24 @@ class CoinManager:
                           f"Could not update tier spare counts for {wallet_type}: {e}")
 
         except Exception as e:
-            # Fallback to legacy classification if DB is unavailable
+            # Fallback when DB is unavailable — use SSOT size inference so the
+            # old ±20% bounds from _classify_coins_tiered never reintroduce the
+            # 2026-04-17 misfit-as-inner bug on DB hiccups.
             log_event("warning", "designation_fallback",
-                      f"Designation classification failed ({e}), using legacy")
-            result = _classify_coins_tiered(records, tier_sizes_mojos)
+                      f"Designation classification failed ({e}), using SSOT size-inference fallback")
+            result = {k: [] for k in ["reserve", "inner", "mid", "outer", "extreme", "small"]}
+            for tier_name in tier_sizes_mojos:
+                if tier_name not in result:
+                    result[tier_name] = []
+            for rec in records:
+                amt = _coin_amount(rec)
+                desig, atier = _infer_designation_by_size(amt, tier_sizes_mojos)
+                if desig == "reserve":
+                    result["reserve"].append(rec)
+                elif desig == "tier_spare" and atier in result:
+                    result[atier].append(rec)
+                else:
+                    result["small"].append(rec)
 
         # Sort reserve and small by size descending
         result["reserve"].sort(key=_coin_amount, reverse=True)
