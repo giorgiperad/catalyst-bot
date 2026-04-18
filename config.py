@@ -1043,22 +1043,36 @@ def _legacy_tier_size(tier_name: str) -> Decimal:
 
 
 def get_buy_tier_size_xch(tier_name: str) -> Decimal:
-    """Return the XCH committed per buy offer at the given position tier.
+    """Return the XCH committed per buy offer at the given POSITION tier.
 
-    Prefers BUY_<tier>_SIZE_XCH; falls back to the shared legacy size with
-    BUY_LADDER_REVERSED flipping when the per-side field is zero.
+    The function is POSITION-semantic — caller asks "what size is the
+    inner-position buy slot?" Under BUY_LADDER_REVERSED, the inner POSITION
+    uses extreme-SIZE coins (small near mid), so the position is mapped to
+    the corresponding coin SIZE before reading the configured value.
+
+    F79 (2026-04-18): the position→size mapping was previously only applied
+    on the legacy fallback path. When BUY_*_SIZE_XCH fields were populated
+    (which Smart Defaults always does) the flip was bypassed and the buy
+    ladder came out non-reversed despite BUY_LADDER_REVERSED=True. Now the
+    flip happens BEFORE the field lookup so the result is always the right
+    size for the asked-about position.
+
+    Prefers BUY_<size>_SIZE_XCH; falls back to the shared legacy size.
     """
     tier = (tier_name or "").strip().lower()
     if tier not in _TIER_NAMES:
         return Decimal("0")
-    attr = f"BUY_{tier.upper()}_SIZE_XCH"
+    # Position → coin-size mapping (identity unless reverse-buy is on).
+    # Under reverse-buy: position inner uses extreme size, etc.
+    if getattr(cfg, "BUY_LADDER_REVERSED", False):
+        size_tier = _REVERSE_BUY_MAP[tier]
+    else:
+        size_tier = tier
+    attr = f"BUY_{size_tier.upper()}_SIZE_XCH"
     val = Decimal(str(getattr(cfg, attr, 0) or 0))
     if val > 0:
         return val
-    # Legacy fallback — apply reverse-buy flip if enabled
-    if getattr(cfg, "BUY_LADDER_REVERSED", False):
-        return _legacy_tier_size(_REVERSE_BUY_MAP[tier])
-    return _legacy_tier_size(tier)
+    return _legacy_tier_size(size_tier)
 
 
 def get_sell_tier_size_xch(tier_name: str) -> Decimal:
