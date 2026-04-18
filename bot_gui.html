@@ -7283,6 +7283,19 @@
                     <div style="font-size: 15px; font-weight: 700; color: var(--slate-200); margin-bottom: 8px;">Sage wallet isn't running</div>
                     <div style="font-size: 13px; color: var(--slate-400); line-height: 1.6;">Sage needs to be open to connect your wallet. Would you like us to launch it automatically, or would you prefer to open it yourself?</div>
                 </div>
+                <!-- First-run RPC hint: launching Sage alone isn't enough — the
+                     RPC server must be enabled inside Sage's own settings
+                     before this bot can talk to it. Shown up-front so first-run
+                     users don't hit a generic connection error after clicking
+                     "Launch Sage for me". -->
+                <div style="padding: 10px 14px; background: rgba(234,179,8,0.08); border: 1px solid rgba(234,179,8,0.25); border-radius: 10px; margin-bottom: 12px; text-align: left;">
+                    <div style="font-size: 12px; color: var(--slate-300); line-height: 1.55;">
+                        <strong style="color: #fbbf24;">First time using Sage?</strong>
+                        After Sage opens, enable its RPC server in
+                        <strong>Sage → Settings → Advanced → Start RPC Client</strong>.
+                        Without it, this bot can't connect to your wallet.
+                    </div>
+                </div>
                 <div style="display: flex; gap: 10px; flex-wrap: wrap;">
                     <button onclick="startupChooseLaunchSage()" style="flex: 1; min-width: 180px; padding: 13px 18px; background: linear-gradient(135deg, var(--status-success), var(--success-600)); border: none; color: white; border-radius: 10px; cursor: pointer; font-size: 14px; font-weight: 700;">Launch Sage for me</button>
                     <button onclick="startupChooseManualSage()" style="flex: 1; min-width: 180px; padding: 13px 18px; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.14); color: var(--slate-300); border-radius: 10px; cursor: pointer; font-size: 14px; font-weight: 600;">I'll open it myself</button>
