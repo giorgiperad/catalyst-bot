@@ -295,8 +295,14 @@ class MempoolWatcher:
                     )
                 break
 
-        except Exception:
-            pass  # Network error — skip silently, next poll will retry
+        except Exception as _e:
+            # F81: surface errors at debug so persistent failures are visible
+            # via the trace log without spamming the events feed.
+            try:
+                log_event("debug", "mempool_watcher_reserve_fetch_failed",
+                          f"Tibet reserve fetch failed: {_e}")
+            except Exception:
+                pass
 
     def _emit_price_move_signal(
         self,
@@ -410,7 +416,13 @@ class MempoolWatcher:
             if isinstance(items, dict):
                 items = list(items.values())
 
-        except Exception:
+        except Exception as _e:
+            # F81: surface errors at debug so persistent failures are visible
+            try:
+                log_event("debug", "mempool_watcher_poll_failed",
+                          f"Mempool poll failed: {_e}")
+            except Exception:
+                pass
             return  # network error, retry next interval
 
         # Single-pass scan: compute each removal's coin ID and check against

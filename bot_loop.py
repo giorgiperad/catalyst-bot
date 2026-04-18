@@ -2521,6 +2521,54 @@ class BotLoop:
 
         log_event("info", "bot_loop_exit", "Bot loop exited cleanly")
 
+    def _defensive_cancel_inner_offers(self, reason: str) -> int:
+        """F81: bulk-cancel inner-tier offers on both sides preemptively.
+
+        Triggered when the mempool watcher detects a pending TibetSwap pool
+        spend. Inner-tier offers (closest to mid) are most likely to be
+        arbed during an AMM move — cancelling them BEFORE the swap confirms
+        means the arber finds no profitable target on Dexie when their
+        TibetSwap trade lands ~50s later. Mid/outer/extreme offers stay in
+        place — they're far enough from mid to absorb the move and we want
+        SOME book presence while we figure out the new mid.
+
+        Returns number of trade_ids submitted for cancel (best-effort —
+        actual on-chain confirmation arrives later via the bot_health
+        verifier loop).
+        """
+        try:
+            from database import get_open_offers
+            from config import cfg as _cfg
+            asset_id = getattr(_cfg, "CAT_ASSET_ID", "") or ""
+            inner_buys = [o for o in (get_open_offers(side="buy",
+                                                     cat_asset_id=asset_id) or [])
+                          if (o.get("tier") or "").lower() == "inner"]
+            inner_sells = [o for o in (get_open_offers(side="sell",
+                                                      cat_asset_id=asset_id) or [])
+                           if (o.get("tier") or "").lower() == "inner"]
+            tids = [o.get("trade_id") for o in (inner_buys + inner_sells)
+                    if o.get("trade_id")]
+            if not tids:
+                log_event("info", "defensive_cancel_skip",
+                          f"Defensive cancel: no inner-tier offers to cancel "
+                          f"(reason={reason})")
+                return 0
+            log_event("info", "defensive_cancel_start",
+                      f"Defensive cancel: firing on {len(tids)} inner-tier offers "
+                      f"({len(inner_buys)} buy + {len(inner_sells)} sell, reason={reason})")
+            try:
+                self.offer_manager.cancel_offers(
+                    tids, reason=reason, skip_confirmation=True)
+            except Exception as e:
+                log_event("warning", "defensive_cancel_call_failed",
+                          f"cancel_offers raised: {e}")
+                return 0
+            return len(tids)
+        except Exception as e:
+            log_event("warning", "defensive_cancel_failed",
+                      f"_defensive_cancel_inner_offers exception: {e}")
+            return 0
+
     def _drain_mempool_signals(self, in_cycle: bool = False) -> None:
         """Drain pending mempool watcher signals and act on them.
 
@@ -2542,7 +2590,21 @@ class BotLoop:
                 if sig_type == "imminent_swap":
                     log_event("info", "mempool_imminent_wake",
                               "Mempool: pending pool-coin spend detected — "
-                              "pre-emptive requote cycle triggered")
+                              "pre-emptive defensive cancel + requote",
+                              data={"pool_coin_id": (sig.get("pool_coin_id") or "")[:24]})
+                    # F81 (2026-04-18): defensive bulk-cancel of inner-tier
+                    # offers BEFORE the swap confirms. Inner offers sit closest
+                    # to mid and are the most likely to be arbed during an AMM
+                    # move. Cancelling them immediately means the arber finds
+                    # no profitable target on Dexie when their TibetSwap swap
+                    # confirms ~50s later. Mid/outer/extreme offers stay in
+                    # place — they're far enough from mid to absorb the move.
+                    try:
+                        self._defensive_cancel_inner_offers(
+                            reason="mempool_imminent_swap")
+                    except Exception as _dc_err:
+                        log_event("warning", "mempool_defensive_cancel_failed",
+                                  f"Defensive cancel failed: {_dc_err}")
                     if not in_cycle:
                         # Fix C: wake the bot immediately so we can requote
                         # before the swap confirms, rather than sleeping up
@@ -2565,8 +2627,12 @@ class BotLoop:
                     log_event("info", "mempool_price_confirmed",
                               f"Pool reserves confirmed: {direction} {pct:.3f}% "
                               f"(XCH {sig.get('delta_xch', 0):+d} mojos)")
-        except Exception:
-            pass
+        except Exception as _drain_err:
+            # F81: previously silent — meant we couldn't tell if the watcher
+            # signal flow was broken. Now logged at warning so anomalies
+            # surface in the events feed.
+            log_event("warning", "mempool_drain_failed",
+                      f"Failed to drain mempool signals: {_drain_err}")
 
     # -------------------------------------------------------------------
     # Startup sync
