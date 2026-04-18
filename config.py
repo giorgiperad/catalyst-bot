@@ -376,7 +376,13 @@ class Config:
         # Set TIBET_PAIR_ID to the pair ID for your token on TibetSwap v2.
         # Find it at https://v2.tibetswap.io — the pair ID is in the URL.
         self.TIBET_PAIR_ID = _str("TIBET_PAIR_ID", "")
-        self.AMM_POLL_INTERVAL_SECS = _int("AMM_POLL_INTERVAL_SECS", 30)
+        # F80 (2026-04-18): default lowered from 30 → 10. At 30s a TibetSwap
+        # AMM trade could move the pool meaningfully and our exposed offers
+        # got arbed for ~30s before the bot noticed (verified live on
+        # 2026-04-18 user-test sell — bot took ~60s to detect a 9.8% pool
+        # move and 2 large extreme-position buys filled in the meantime).
+        # 10s reduces the worst-case lag to one Chia block window.
+        self.AMM_POLL_INTERVAL_SECS = _int("AMM_POLL_INTERVAL_SECS", 10)
         # AMM_DRIFT_REQUOTE_BPS: if AMM price moves this far from our last
         # quoted mid-price, invalidate the Tibet cache to force a fresh requote.
         # Default raised from 40 → 80 on 2026-04-07: 40 was too tight for

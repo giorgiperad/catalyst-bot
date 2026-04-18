@@ -444,10 +444,26 @@ def get_tier_sizes_mojos_from_cfg(is_cat: bool = False) -> Dict[str, int]:
     the check run when an instance isn't readily available.
 
     Returns ``{"inner": mojos, "mid": mojos, "outer": mojos, "extreme": mojos}``
-    for the configured tier sizes. For CAT we derive sizes as
-    ``(xch_tier_size / mid_price) * prep_headroom`` scaled to CAT mojos.
-    When mid_price is unknown, falls back to the XCH-denominated size
-    directly — good enough for rough misfit checks at startup.
+    where the keys are SIZE-tier (the labels coins carry in the DB
+    designation system: a coin named ``tier_spare/inner`` is an inner-SIZE
+    coin, regardless of which ladder POSITION it ends up backing). The F70
+    misfit-rejection path pairs this dict with a SIZE-indexed
+    ``preferred_tier`` from ``coin_size_tier_for_slot_position``, so both
+    sides of the comparison must use the same indexing scheme.
+
+    F80 (2026-04-18): under BUY_LADDER_REVERSED=True the per-side helper
+    ``get_buy_tier_size_xch`` is POSITION-semantic (returns the size for
+    the inner POSITION = small under reverse-buy). Reading sizes through
+    that helper produced a POSITION-indexed tier_sizes dict, which broke
+    F70 — the classifier saw a 0.29 XCH coin under {inner: 0.29, ...}
+    and labeled it "inner" (POSITION), but the selector wanted "extreme"
+    (SIZE). Every coin got rejected and buy slots suspended. The fix
+    reads the env fields directly under reverse-buy so the dict is
+    SIZE-indexed (matches the DB designation scheme).
+
+    For CAT we derive sizes as ``(xch_tier_size / mid_price) * prep_headroom``
+    scaled to CAT mojos. When mid_price is unknown, falls back to the
+    XCH-denominated size directly.
     """
     if not cfg.TIER_ENABLED:
         return {}
@@ -456,13 +472,28 @@ def get_tier_sizes_mojos_from_cfg(is_cat: bool = False) -> Dict[str, int]:
     except Exception:
         return {}
     side = "sell" if is_cat else "buy"
-    get = get_sell_tier_size_xch if side == "sell" else get_buy_tier_size_xch
     result_xch: Dict[str, Decimal] = {}
-    for tier in ("inner", "mid", "outer", "extreme"):
-        try:
-            result_xch[tier] = Decimal(str(get(tier)))
-        except Exception:
-            continue
+
+    if not is_cat and bool(getattr(cfg, "BUY_LADDER_REVERSED", False)):
+        # F80: read SIZE-indexed env fields directly so the dict matches
+        # the SIZE-indexed preferred_tier passed to the F70 misfit check.
+        # Going through get_buy_tier_size_xch would apply the position→size
+        # flip and produce a POSITION-indexed dict that fails the comparison.
+        for tier in ("inner", "mid", "outer", "extreme"):
+            attr = f"BUY_{tier.upper()}_SIZE_XCH"
+            val = Decimal(str(getattr(cfg, attr, 0) or 0))
+            if val <= 0:
+                # Legacy fallback (no per-side fields set) — shared key
+                val = Decimal(str(getattr(cfg, f"{tier.upper()}_SIZE_XCH", 0) or 0))
+            if val > 0:
+                result_xch[tier] = val
+    else:
+        get = get_sell_tier_size_xch if side == "sell" else get_buy_tier_size_xch
+        for tier in ("inner", "mid", "outer", "extreme"):
+            try:
+                result_xch[tier] = Decimal(str(get(tier)))
+            except Exception:
+                continue
 
     # Apply prep headroom (coins are prepped slightly larger than live
     # offer size — matches CoinManager._get_tier_sizes_mojos behaviour).
