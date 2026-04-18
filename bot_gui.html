@@ -16145,13 +16145,18 @@
                 const _smartDiffBefore = snapshotSmartDiffFields();
 
                 // Smart Pricing — Dynamic Spreads
-                // API already returns percentage values (bps / 100), so apply directly.
+                // F78 (2026-04-18): smart-defaults now returns integer basis
+                // points (matching field name semantics). Divide by 100 to
+                // populate the GUI input fields which expect percent values.
+                // The save path then × 100 back to bps — round-trips correctly.
+                // min_edge_bps is the renamed former "inner_edge_bps" (matches env).
+                const _bps2pct = v => (v == null ? '' : (Number(v) / 100).toFixed(1));
                 document.getElementById('configDynamicSpreadEnabled').checked = data.dynamic_spread_enabled;
-                document.getElementById('configBaseSpreadBps').value = data.base_spread_bps;
+                document.getElementById('configBaseSpreadBps').value = _bps2pct(data.base_spread_bps);
                 document.getElementById('configVolatilityWindow').value = data.volatility_window_hours;
-                document.getElementById('configMinEdgeBps').value = data.inner_edge_bps;
-                document.getElementById('configMinSpreadBps').value = data.min_spread_bps;
-                document.getElementById('configMaxSpreadBps').value = data.max_spread_bps;
+                document.getElementById('configMinEdgeBps').value = _bps2pct(data.min_edge_bps ?? data.inner_edge_bps);
+                document.getElementById('configMinSpreadBps').value = _bps2pct(data.min_spread_bps);
+                document.getElementById('configMaxSpreadBps').value = _bps2pct(data.max_spread_bps);
 
                 // Smart Pricing — Inventory Management
                 document.getElementById('configInventoryEnabled').checked = data.inventory_enabled;
@@ -16159,12 +16164,12 @@
                 document.getElementById('configMaxPositionXch').value = data.max_position_xch;
 
                 // Smart Pricing — Fallback
-                document.getElementById('configSpreadBps').value = data.spread_bps;
+                document.getElementById('configSpreadBps').value = _bps2pct(data.spread_bps);
                 document.getElementById('configLoopSeconds').value = data.loop_seconds;
 
                 // Auto-Requote
                 document.getElementById('configAutoRequote').checked = data.auto_requote;
-                document.getElementById('configRequoteBps').value = data.requote_bps;
+                document.getElementById('configRequoteBps').value = _bps2pct(data.requote_bps);
                 document.getElementById('configRequoteCooldown').value = data.requote_cooldown;
 
                 // Safety & Limits — Reserves (never overwritten by Smart Defaults — user's choice)

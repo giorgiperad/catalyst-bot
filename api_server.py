@@ -9028,23 +9028,30 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
     # ═══ END F65 FINAL SELL-SIDE CAT VERIFICATION ═════════════════════════
 
     # ═══ Build response ═══
+    # F78 (2026-04-18): *_bps fields now return integer basis points
+    # matching the field name and the env units. Previously they returned
+    # values divided by 100 (i.e. percent) which forced every consumer to
+    # know about the inversion. The GUI's read path now does the /100 for
+    # display only; the save path still × 100 (unchanged) — which together
+    # round-trips correctly. Direct API callers can apply the response
+    # straight to /api/config without conversion now.
     result = {
         # Smart Pricing
         "dynamic_spread_enabled": has_both_prices,
-        "base_spread_bps": round(base_spread_bps / 100, 1),
+        "base_spread_bps": int(round(base_spread_bps)),
         "volatility_window_hours": volatility_window,
-        "inner_edge_bps": round(inner_edge_bps / 100, 1),
-        "min_spread_bps": round(min_spread_bps / 100, 1),
-        "max_spread_bps": round(max_spread_bps / 100, 1),
+        "min_edge_bps": int(round(inner_edge_bps)),  # env key is MIN_EDGE_BPS
+        "min_spread_bps": int(round(min_spread_bps)),
+        "max_spread_bps": int(round(max_spread_bps)),
         "inventory_enabled": True,
         "skew_intensity": skew_intensity,
         "max_position_xch": max_position,
-        "spread_bps": round(base_spread_bps / 100, 1),
+        "spread_bps": int(round(base_spread_bps)),
         "loop_seconds": loop_seconds,
 
         # Auto-Requote
         "auto_requote": True,
-        "requote_bps": round(requote_bps / 100, 1),
+        "requote_bps": int(round(requote_bps)),
         "requote_cooldown": 60,
         "requote_batch_size": requote_batch_size,
 
@@ -9052,13 +9059,13 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
         "max_mid_move": round(max_mid_move, 1),
         "dynamic_limit_pct": dynamic_limit_pct,
         "max_step_change_pct": max_step_change_pct,
-        "arb_threshold_bps": round(arb_alert_threshold_bps / 100, 1),
+        "arb_alert_threshold_bps": int(round(arb_alert_threshold_bps)),  # env key is ARB_ALERT_THRESHOLD_BPS
         "min_mid": min_mid,
         "max_mid": max_mid,
 
         # Market Intelligence
         "competitor_aware_enabled": competitor_enabled,
-        "dbx_max_spread_bps": 5.0,
+        "dbx_max_spread_bps": 500,  # 5.0% in bps
         "pair_incentivized": bool(ticker.get("incentives")) if ticker else None,
 
         # Coin Prep (all market-derived)
@@ -9129,7 +9136,10 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
         # Reversed (True) is the recommended default: buy and sell sides both taper
         # large→small away from mid. Toggle ON = BUY_LADDER_REVERSED=True = large inner,
         # small extreme. Toggle OFF = False = small inner, large extreme.
-        "buy_ladder_reversed": False,
+        # F78: was hardcoded to False, contradicting the comment. Now returns
+        # True so the recommended layout actually gets applied. User can still
+        # override via the GUI toggle after Smart Settings runs.
+        "buy_ladder_reversed": True,
 
         # Offer Sizing (capital-derived — requires reserve params from frontend step 1)
         "max_active_buy": _smart_max_buy,
@@ -9184,6 +9194,16 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
         "splash_enabled": cfg.SPLASH_ENABLED,
         "enable_coin_prep": cfg.ENABLE_COIN_PREP,
         "enable_runtime_coin_health": cfg.ENABLE_RUNTIME_COIN_HEALTH,
+
+        # F78: expose the risk-profile multipliers that shaped this
+        # response. Lets the operator see exactly what `conservative` /
+        # `balanced` / `aggressive` actually changed vs each other,
+        # rather than guessing from output diffs. Filled below the result
+        # construction so it captures any mid-flight overrides.
+        "_risk_profile_meta": {
+            "name": _risk_profile_name,
+            "multipliers": dict(_rp),
+        },
 
         # V2 Metadata for toast + GUI
         "_data_sources": {
