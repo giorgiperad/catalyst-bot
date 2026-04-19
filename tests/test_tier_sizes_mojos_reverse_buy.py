@@ -1,21 +1,26 @@
-"""Regression test for F80: get_tier_sizes_mojos_from_cfg must return
-SIZE-indexed sizes for the buy side under reverse-buy so the F70 SSOT
-misfit-rejection path (which compares classify_coin's output against a
-SIZE-indexed preferred_tier from coin_size_tier_for_slot_position) works.
+"""Regression test for ``get_tier_sizes_mojos_from_cfg`` under BUY_LADDER_REVERSED.
+
+The returned dict must be COIN-SIZE-BUCKET indexed so the F70 SSOT misfit
+rejection path (in ``offer_manager._select_coin_for_offer``) can compare
+``preferred_tier`` (from ``coin_size_tier_for_slot_position`` — which IS
+bucket-indexed under reverse-buy) against the classifier's output.
 
 Bug history
 -----------
-F79 made get_buy_tier_size_xch POSITION-semantic. That broke
-get_tier_sizes_mojos_from_cfg, which had been calling it directly,
-producing a POSITION-indexed tier_sizes dict. F70's classifier then
-labeled a 0.29 XCH coin as "inner" (POSITION tier, since 0.29 is the
-inner-POSITION size under reverse-buy), but the selector wanted "extreme"
-(the SIZE tier returned by coin_size_tier_for_slot_position). All buy-side
-coins got rejected as misfits, slots suspended, requote produced 0 offers.
+Buy storage is POSITION-indexed: Smart Defaults writes ``BUY_INNER_SIZE_XCH``
+as the size for the inner POSITION (small near mid under reverse-buy). But
+coin-size buckets follow ``_BUY_REVERSED_POSITION_TO_COIN_SIZE`` which maps
+position-inner → bucket-extreme (smallest bucket). So the tier_sizes_mojos
+dict needs a flip to re-key from position to bucket.
 
-F80 fix: read BUY_*_SIZE_XCH fields directly under reverse-buy so the
-dict stays SIZE-indexed (matches the DB designation scheme and the
-SIZE-indexed preferred_tier).
+Pre-fix history on 2026-04-18:
+  * F79 added a flip in ``get_buy_tier_size_xch`` that made it size-indexed.
+  * F80 worked around F79 by reading env fields directly — but that reverted
+    to position-indexed output, which was still wrong for F70.
+
+After the 2026-04-19 fix: storage stays position-indexed (matches Smart
+Defaults' write), ``get_buy_tier_size_xch`` returns position directly, and
+``get_tier_sizes_mojos_from_cfg`` applies the position→bucket flip itself.
 """
 import os
 import sys
@@ -29,14 +34,20 @@ class _StubCfg:
     def __init__(self, *, reversed_buy: bool):
         self.TIER_ENABLED = True
         self.BUY_LADDER_REVERSED = reversed_buy
-        # Position-indexed env values — Smart Defaults wrote these the way
-        # we'd see them in production with BUY_LADDER_REVERSED toggled on.
-        # Convention: BUY_INNER_SIZE_XCH stores the SIZE for the inner SIZE
-        # bucket (largest XCH coin = 2.0876).
-        self.BUY_INNER_SIZE_XCH = Decimal("2.0876")
-        self.BUY_MID_SIZE_XCH = Decimal("1.1598")
-        self.BUY_OUTER_SIZE_XCH = Decimal("0.6379")
-        self.BUY_EXTREME_SIZE_XCH = Decimal("0.29")
+        # POSITION-indexed storage. Under reverse-buy: inner position offers
+        # the smallest amount (close to mid), extreme position offers the
+        # largest (far from mid). Smart Defaults + handleReverseLadderToggle
+        # both write storage this way.
+        if reversed_buy:
+            self.BUY_INNER_SIZE_XCH = Decimal("0.29")     # inner pos = small
+            self.BUY_MID_SIZE_XCH = Decimal("0.6379")
+            self.BUY_OUTER_SIZE_XCH = Decimal("1.1598")
+            self.BUY_EXTREME_SIZE_XCH = Decimal("2.0876") # extreme pos = large
+        else:
+            self.BUY_INNER_SIZE_XCH = Decimal("2.0876")   # inner pos = large (normal)
+            self.BUY_MID_SIZE_XCH = Decimal("1.1598")
+            self.BUY_OUTER_SIZE_XCH = Decimal("0.6379")
+            self.BUY_EXTREME_SIZE_XCH = Decimal("0.29")
         self.SELL_INNER_SIZE_XCH = Decimal("2.0111")
         self.SELL_MID_SIZE_XCH = Decimal("1.1173")
         self.SELL_OUTER_SIZE_XCH = Decimal("0.6145")
@@ -87,8 +98,10 @@ _ensure_stubs()
 
 
 class TierSizesReverseBuyTests(unittest.TestCase):
-    """Verify the dict returned for the BUY side stays SIZE-indexed
-    regardless of reverse-buy mode, so F70 classifier comparisons hold."""
+    """The dict returned for the BUY side must be COIN-SIZE-BUCKET indexed
+    (inner bucket = biggest coin, extreme bucket = smallest) regardless of
+    reverse-buy mode, because that's the naming convention the selector,
+    coin_prep_worker, and coin_classifier all agree on."""
 
     @classmethod
     def setUpClass(cls):
@@ -112,9 +125,8 @@ class TierSizesReverseBuyTests(unittest.TestCase):
         config.cfg = stub
         coin_manager.cfg = stub
 
-    def test_non_reverse_returns_size_indexed(self):
-        """Baseline: non-reverse should still return SIZE-indexed sizes
-        (which equals position-indexed for non-reverse — they're the same)."""
+    def test_non_reverse_returns_position_equals_size_indexed(self):
+        """Non-reverse: position and size are the same thing (inner=biggest)."""
         from coin_manager import get_tier_sizes_mojos_from_cfg
         self._patch_cfg(_StubCfg(reversed_buy=False))
         sizes = get_tier_sizes_mojos_from_cfg(is_cat=False)
@@ -124,30 +136,27 @@ class TierSizesReverseBuyTests(unittest.TestCase):
         self.assertEqual(sizes["outer"], int(Decimal("0.6379") * 10**12))
         self.assertEqual(sizes["extreme"], int(Decimal("0.29") * 10**12))
 
-    def test_reverse_buy_returns_size_indexed_not_position_indexed(self):
-        """The CRITICAL F80 regression case. Pre-F80 (post-F79):
-        get_buy_tier_size_xch flipped position→size, so the dict ended
-        up POSITION-indexed (inner=0.29, extreme=2.09). F70 then labeled
-        a 0.29 coin as "inner" but selector wanted "extreme" → reject all,
-        buy requote returned 0 offers, slots suspended.
+    def test_reverse_buy_remaps_position_to_coin_size_bucket(self):
+        """Under reverse-buy, position-indexed storage gets re-keyed so the
+        dict is coin-size-bucket indexed (inner bucket = biggest).
 
-        Post-F80: env fields are read directly so the dict is SIZE-indexed
-        (inner=2.09 = the inner-SIZE bucket value, extreme=0.29 = the
-        smallest-SIZE bucket). Classifier labels match selector preference.
+        Storage (position-indexed): inner=0.29 (small inner-position offer),
+        extreme=2.0876 (big extreme-position offer).
+        Output (bucket-indexed): inner=2.0876 (biggest bucket), extreme=0.29
+        (smallest bucket). Matches coin_size_tier_for_slot_position semantics.
         """
         from coin_manager import get_tier_sizes_mojos_from_cfg
         self._patch_cfg(_StubCfg(reversed_buy=True))
         sizes = get_tier_sizes_mojos_from_cfg(is_cat=False)
-        # MUST be SIZE-indexed: inner key = largest XCH coin = 2.0876
         self.assertEqual(
             sizes["inner"], int(Decimal("2.0876") * 10**12),
-            "Inner key must hold the LARGEST size (size-indexed), not the "
-            "small position-inner size. Otherwise F70 misfit rejection "
-            "labels coins by POSITION and rejects all buy-side coins.",
+            "Inner bucket key must hold the LARGEST size (= pos-extreme size "
+            "under reverse-buy). Otherwise F70 labels coins incorrectly.",
         )
         self.assertEqual(
             sizes["extreme"], int(Decimal("0.29") * 10**12),
-            "Extreme key must hold the SMALLEST size (size-indexed)."
+            "Extreme bucket key must hold the SMALLEST size (= pos-inner "
+            "size under reverse-buy).",
         )
         self.assertEqual(sizes["mid"], int(Decimal("1.1598") * 10**12))
         self.assertEqual(sizes["outer"], int(Decimal("0.6379") * 10**12))

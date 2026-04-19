@@ -17927,55 +17927,18 @@
                     configuredTierCountsSell, configuredTierSparesSell
                 );
 
-                // ── REVERSE-BUY FLIP (mirror coin_manager.flip_position_tiers_to_coin_size_tiers) ──
                 // The XCH inputs (and buyWeightedCounts) are SLOT-position
-                // indexed: BUY_INNER_TIER_COUNT = "offers at slot inner". The
-                // launcher converts slot→coin-size before requesting coins:
-                // under reverse-buy, slot inner uses an EXTREME-size coin,
-                // slot extreme uses an INNER-size coin, etc. The Coin Prep
-                // Summary must reflect the SIZE bucket counts so the totals
-                // match what the worker will actually prepare.
-                //
-                // BUG FIX (2026-04-19): this flip was previously a no-op
-                // with a "Swap-based design: size fields are already in the
-                // correct orientation" comment. That was wrong. The SIZE
-                // fields are size-indexed (inner-size = smallest coin,
-                // extreme-size = biggest), but the COUNT fields are still
-                // position-indexed (inner-count = offers at inner slot).
-                // Under reverse-buy, inner SLOT uses extreme-SIZE coins, so
-                // count[inner] should pair with size[extreme]. Skipping the
-                // flip here makes the Coin Prep Summary total *understate*
-                // the real XCH needed: the UI said 127.8 XCH fits the 128
-                // balance, but the backend (which DOES flip) then launched
-                // a 212 XCH plan that overshoots and coin prep fails with
-                // "Coin prep pool exceeds available wallet".
-                const _reverseBuyOn = !!(
-                    document.getElementById('configBuyLadderReversed')?.checked
-                );
-                const _BASE_TIERS = ['inner', 'mid', 'outer', 'extreme'];
-                const _REV_POS_TO_SIZE = {
-                    inner: 'extreme', mid: 'outer',
-                    outer: 'mid',     extreme: 'inner',
-                };
-                const _flipSlotToSize = (slotCounts) => {
-                    const out = {};
-                    if (_reverseBuyOn) {
-                        for (const t of _BASE_TIERS) out[t] = 0;
-                        for (const pos of _BASE_TIERS) {
-                            const size = _REV_POS_TO_SIZE[pos];
-                            out[size] += Number(slotCounts[pos] || 0);
-                        }
-                    } else {
-                        for (const t of _BASE_TIERS) {
-                            out[t] = Number(slotCounts[t] || 0);
-                        }
-                    }
-                    // Preserve non-positional tiers (sniper / fees / topup).
-                    for (const [k, v] of Object.entries(slotCounts || {})) {
-                        if (!_BASE_TIERS.includes(k)) out[k] = v;
-                    }
-                    return out;
-                };
+                // indexed: BUY_INNER_TIER_COUNT = "offers at slot inner".
+                // Under reverse-buy, Smart Defaults writes the SIZE values
+                // in the same orientation (BUY_INNER_SIZE_XCH = small when
+                // inner position offers small near mid), so counts and
+                // sizes already pair index-by-index — no flip needed here.
+                // The backend's coin_manager applies a flip later to rename
+                // the pools into coin-size-bucket naming for the prep
+                // worker, but that's a pure rename: it doesn't change the
+                // total XCH consumed, so the Coin Prep Summary total stays
+                // correct without mirroring the rename.
+                const _flipSlotToSize = (slotCounts) => { return { ...slotCounts }; };
                 const buySizeCounts = _flipSlotToSize(buyWeightedCounts);
                 const buySizeDist   = _flipSlotToSize(buyDist);
 

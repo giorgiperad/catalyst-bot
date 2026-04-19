@@ -1,21 +1,26 @@
-"""Regression tests for F79 reverse-buy tier-size flip.
+"""Regression tests for ``get_buy_tier_size_xch`` — POSITION-semantic reads.
 
 Bug history
 -----------
-`get_buy_tier_size_xch(tier)` is documented as POSITION-semantic — caller
-asks "what size is the inner-position buy slot?" Under
-`BUY_LADDER_REVERSED=True` the inner POSITION uses extreme-SIZE coins
-(small near mid). Pre-F79, the function only applied the position→size
-flip on the legacy fallback path (when `BUY_*_SIZE_XCH` was unset). When
-Smart Defaults populated `BUY_*_SIZE_XCH` the flip was bypassed and the
-function returned size-indexed values: `get_buy_tier_size_xch("inner")`
-returned `BUY_INNER_SIZE_XCH` (the LARGE size used for size-inner coins)
-even though the caller asked for the inner POSITION size, which under
-reverse-buy should be SMALL.
+``BUY_*_SIZE_XCH`` is stored POSITION-indexed: ``BUY_INNER_SIZE_XCH`` holds the
+size for the inner POSITION (slot closest to mid). Smart Defaults writes it
+that way, and the UI swap in ``handleReverseLadderToggle`` preserves that
+convention: toggling reverse-buy ON swaps the stored values so
+``BUY_INNER_SIZE_XCH`` ends up SMALL (inner-position offers a small amount
+close to mid under reverse-buy) and ``BUY_EXTREME_SIZE_XCH`` ends up LARGE.
 
-Result: the buy ladder came out non-reversed (large near mid) despite
-`BUY_LADDER_REVERSED=True`, exactly mirroring the sell side instead of
-mirroring it.
+F79 (2026-04-18) briefly added a flip inside ``get_buy_tier_size_xch`` that
+interpreted storage as SIZE-indexed and applied a position→size map before
+the field read — returning ``BUY_EXTREME_SIZE_XCH`` when asked about the
+inner POSITION under reverse-buy. That inverted Smart Defaults' write
+convention and caused coin_prep_worker to request ~2× the XCH actually
+intended (e.g. the user saw "fits 128 XCH wallet" in Smart Settings then
+got "pool exceeds available wallet" from the F62 pre-flight). F79 was
+reverted on 2026-04-19; storage is position-indexed end-to-end.
+
+Legacy fallback (pre-F62 configs without ``BUY_*_SIZE_XCH``) still applies
+the reverse-buy flip against the shared ``<TIER>_SIZE_XCH`` fields because
+those legacy values had an inner=biggest convention.
 """
 import os
 import sys
@@ -45,19 +50,17 @@ class _StubCfg:
         self.EXTREME_SIZE_XCH = Decimal(extreme) if extreme is not None else Decimal("0")
 
 
-class GetBuyTierSizeReverseBuyTests(unittest.TestCase):
-    """Position-semantic contract: the function returns the size for the
-    POSITION the caller asked about, applying the reverse-buy flip."""
+class GetBuyTierSizePositionIndexedTests(unittest.TestCase):
+    """Storage is POSITION-indexed; the getter returns the stored value
+    for the asked-about position directly."""
 
     @classmethod
     def setUpClass(cls):
-        # Ensure config module is importable
         os.chdir(r"C:\chia_liquidity_bot_v2_v4_tauri")
         if os.getcwd() not in sys.path:
             sys.path.insert(0, os.getcwd())
 
     def setUp(self):
-        # Save and restore the live cfg so other tests aren't affected
         import config
         self._real_cfg = config.cfg
 
@@ -69,10 +72,11 @@ class GetBuyTierSizeReverseBuyTests(unittest.TestCase):
         import config
         config.cfg = stub
 
-    # ── Non-reverse: position == size (identity) ──────────────────────
+    # ── Non-reverse: inner POSITION has the biggest size ──────────────
 
-    def test_non_reversed_returns_position_indexed_value(self):
+    def test_non_reversed_returns_field_directly(self):
         from config import get_buy_tier_size_xch
+        # Normal ladder: inner (near mid) = biggest, extreme (far) = smallest
         self._patch_cfg(_StubCfg(
             reversed_buy=False,
             buy_inner="2.0876", buy_mid="1.1598",
@@ -83,61 +87,71 @@ class GetBuyTierSizeReverseBuyTests(unittest.TestCase):
         self.assertEqual(get_buy_tier_size_xch("outer"),   Decimal("0.6379"))
         self.assertEqual(get_buy_tier_size_xch("extreme"), Decimal("0.29"))
 
-    # ── Reverse-buy: position inner uses extreme size, etc. ───────────
+    # ── Reverse-buy: Smart Defaults stores SMALL in BUY_INNER_SIZE_XCH ─
 
-    def test_reversed_inner_position_returns_extreme_size(self):
-        """Position inner (best bid) uses the extreme-SIZE coin (small).
+    def test_reversed_inner_position_returns_small_stored_value(self):
+        """Under reverse-buy, inner position offers a SMALL amount close to
+        mid. Smart Defaults writes that small value directly into
+        ``BUY_INNER_SIZE_XCH`` (the UI's handleReverseLadderToggle swap
+        keeps the stored convention position-indexed).
 
-        This is the regression case — pre-F79 returned BUY_INNER_SIZE_XCH
-        (2.0876, the large size) even with reverse-buy enabled, producing
-        a buy ladder that wasn't actually reversed.
+        The getter returns the field verbatim — no flip — so downstream
+        callers that ask "what size is the inner POSITION slot?" get the
+        correct small value.
         """
         from config import get_buy_tier_size_xch
         self._patch_cfg(_StubCfg(
             reversed_buy=True,
-            buy_inner="2.0876", buy_mid="1.1598",
-            buy_outer="0.6379", buy_extreme="0.29",
+            # Reverse convention (swap applied at storage): inner=small, extreme=big
+            buy_inner="0.29", buy_mid="0.6379",
+            buy_outer="1.1598", buy_extreme="2.0876",
         ))
         self.assertEqual(
             get_buy_tier_size_xch("inner"), Decimal("0.29"),
-            "Under reverse-buy, position INNER (best bid) must return the "
-            "extreme-size value (small), not the inner-size value.",
+            "Under reverse-buy, BUY_INNER_SIZE_XCH stores the (small) inner-"
+            "position offer size; the getter must return it as-is.",
         )
+        self.assertEqual(get_buy_tier_size_xch("extreme"), Decimal("2.0876"))
 
-    def test_reversed_extreme_position_returns_inner_size(self):
+    def test_reversed_extreme_position_returns_large_stored_value(self):
+        """Under reverse-buy, extreme position offers a LARGE amount far
+        from mid. Smart Defaults writes that large value into
+        ``BUY_EXTREME_SIZE_XCH`` directly."""
         from config import get_buy_tier_size_xch
         self._patch_cfg(_StubCfg(
             reversed_buy=True,
-            buy_inner="2.0876", buy_extreme="0.29",
-            buy_mid="1.1598", buy_outer="0.6379",
+            buy_inner="0.29", buy_mid="0.6379",
+            buy_outer="1.1598", buy_extreme="2.0876",
         ))
         self.assertEqual(
             get_buy_tier_size_xch("extreme"), Decimal("2.0876"),
-            "Under reverse-buy, position EXTREME (worst bid) must return "
-            "the inner-size value (large).",
+            "Under reverse-buy, BUY_EXTREME_SIZE_XCH stores the (large) "
+            "extreme-position offer size; the getter must return it as-is.",
         )
 
-    def test_reversed_mid_outer_swap(self):
+    def test_reversed_mid_outer_return_stored_values(self):
         from config import get_buy_tier_size_xch
         self._patch_cfg(_StubCfg(
             reversed_buy=True,
-            buy_inner="2.0876", buy_mid="1.1598",
-            buy_outer="0.6379", buy_extreme="0.29",
+            buy_inner="0.29", buy_mid="0.6379",
+            buy_outer="1.1598", buy_extreme="2.0876",
         ))
-        self.assertEqual(get_buy_tier_size_xch("mid"),   Decimal("0.6379"))  # outer size
-        self.assertEqual(get_buy_tier_size_xch("outer"), Decimal("1.1598"))  # mid size
+        self.assertEqual(get_buy_tier_size_xch("mid"),   Decimal("0.6379"))
+        self.assertEqual(get_buy_tier_size_xch("outer"), Decimal("1.1598"))
 
-    # ── Legacy fallback path still works ──────────────────────────────
+    # ── Legacy fallback path (pre-F62 configs) still flips ───────────
 
     def test_legacy_fallback_under_reverse(self):
-        """When BUY_*_SIZE_XCH is unset, fall back to legacy INNER_SIZE_XCH
-        with the reverse-buy flip applied."""
+        """When BUY_*_SIZE_XCH is unset, fall back to legacy
+        ``<TIER>_SIZE_XCH`` with the reverse-buy flip applied — legacy
+        storage only ever held inner=biggest values, so the flip is needed
+        to get the reversed shape."""
         from config import get_buy_tier_size_xch
         self._patch_cfg(_StubCfg(
             reversed_buy=True,
             inner="2.0", mid="1.0", outer="0.5", extreme="0.25",
         ))
-        # Position inner under reverse → extreme size in legacy field
+        # Position inner under reverse → legacy extreme size (small)
         self.assertEqual(get_buy_tier_size_xch("inner"),   Decimal("0.25"))
         self.assertEqual(get_buy_tier_size_xch("extreme"), Decimal("2.0"))
 

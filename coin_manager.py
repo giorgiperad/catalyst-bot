@@ -436,15 +436,15 @@ def get_tier_sizes_mojos_from_cfg(is_cat: bool = False) -> Dict[str, int]:
     ``preferred_tier`` from ``coin_size_tier_for_slot_position``, so both
     sides of the comparison must use the same indexing scheme.
 
-    F80 (2026-04-18): under BUY_LADDER_REVERSED=True the per-side helper
-    ``get_buy_tier_size_xch`` is POSITION-semantic (returns the size for
-    the inner POSITION = small under reverse-buy). Reading sizes through
-    that helper produced a POSITION-indexed tier_sizes dict, which broke
-    F70 — the classifier saw a 0.29 XCH coin under {inner: 0.29, ...}
-    and labeled it "inner" (POSITION), but the selector wanted "extreme"
-    (SIZE). Every coin got rejected and buy slots suspended. The fix
-    reads the env fields directly under reverse-buy so the dict is
-    SIZE-indexed (matches the DB designation scheme).
+    Under BUY_LADDER_REVERSED=True the buy storage is POSITION-indexed
+    (Smart Defaults writes BUY_INNER_SIZE_XCH = small inner-position offer),
+    but coin-size buckets follow ``_BUY_REVERSED_POSITION_TO_COIN_SIZE``
+    where position-inner maps to bucket-extreme (smallest coin bucket).
+    We apply that flip so the returned dict is coin-size-bucket-indexed
+    and matches the ``preferred_tier`` produced by
+    ``coin_size_tier_for_slot_position``. Without the flip, a 0.29 XCH
+    coin would be labeled "inner" against a position-indexed dict while
+    the selector asks for "extreme", rejecting every eligible coin.
 
     For CAT we derive sizes as ``(xch_tier_size / mid_price) * prep_headroom``
     scaled to CAT mojos. When mid_price is unknown, falls back to the
@@ -460,18 +460,21 @@ def get_tier_sizes_mojos_from_cfg(is_cat: bool = False) -> Dict[str, int]:
     result_xch: Dict[str, Decimal] = {}
 
     if not is_cat and bool(getattr(cfg, "BUY_LADDER_REVERSED", False)):
-        # F80: read SIZE-indexed env fields directly so the dict matches
-        # the SIZE-indexed preferred_tier passed to the F70 misfit check.
-        # Going through get_buy_tier_size_xch would apply the position→size
-        # flip and produce a POSITION-indexed dict that fails the comparison.
-        for tier in ("inner", "mid", "outer", "extreme"):
-            attr = f"BUY_{tier.upper()}_SIZE_XCH"
+        # Buy storage is POSITION-indexed; map each coin-size bucket back
+        # to the POSITION whose offer size lives in that bucket, so the
+        # returned dict is SIZE-bucket-indexed (matches the selector and
+        # the coin_prep_worker CLI naming).
+        for coin_tier in ("inner", "mid", "outer", "extreme"):
+            pos_tier = _BUY_REVERSED_POSITION_TO_COIN_SIZE_INVERSE[coin_tier]
+            attr = f"BUY_{pos_tier.upper()}_SIZE_XCH"
             val = Decimal(str(getattr(cfg, attr, 0) or 0))
             if val <= 0:
-                # Legacy fallback (no per-side fields set) — shared key
-                val = Decimal(str(getattr(cfg, f"{tier.upper()}_SIZE_XCH", 0) or 0))
+                # Legacy fallback (no per-side fields set). Legacy storage is
+                # sell-shaped (inner=biggest), so the flip back to size-bucket
+                # naming is just identity on the position we mapped to.
+                val = Decimal(str(getattr(cfg, f"{pos_tier.upper()}_SIZE_XCH", 0) or 0))
             if val > 0:
-                result_xch[tier] = val
+                result_xch[coin_tier] = val
     else:
         get = get_sell_tier_size_xch if side == "sell" else get_buy_tier_size_xch
         for tier in ("inner", "mid", "outer", "extreme"):
@@ -588,6 +591,12 @@ _BUY_REVERSED_POSITION_TO_COIN_SIZE = {
     "mid":     "outer",
     "outer":   "mid",
     "extreme": "inner",
+}
+# Inverse: coin-size bucket → position whose offer size lives in that bucket.
+# The map is its own inverse (inner↔extreme, mid↔outer are involutions), but
+# naming the constant makes the intent clear at each call site.
+_BUY_REVERSED_POSITION_TO_COIN_SIZE_INVERSE = {
+    v: k for k, v in _BUY_REVERSED_POSITION_TO_COIN_SIZE.items()
 }
 
 

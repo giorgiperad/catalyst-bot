@@ -1053,34 +1053,41 @@ def _legacy_tier_size(tier_name: str) -> Decimal:
 def get_buy_tier_size_xch(tier_name: str) -> Decimal:
     """Return the XCH committed per buy offer at the given POSITION tier.
 
-    The function is POSITION-semantic — caller asks "what size is the
-    inner-position buy slot?" Under BUY_LADDER_REVERSED, the inner POSITION
-    uses extreme-SIZE coins (small near mid), so the position is mapped to
-    the corresponding coin SIZE before reading the configured value.
+    POSITION-semantic. ``BUY_INNER_SIZE_XCH`` stores the size for the
+    inner POSITION (the slot closest to mid). Under BUY_LADDER_REVERSED,
+    Smart Defaults writes a SMALL value to ``BUY_INNER_SIZE_XCH`` because
+    the inner position offers a small amount close to mid; the UI swap
+    in ``handleReverseLadderToggle`` keeps that convention consistent.
 
-    F79 (2026-04-18): the position→size mapping was previously only applied
-    on the legacy fallback path. When BUY_*_SIZE_XCH fields were populated
-    (which Smart Defaults always does) the flip was bypassed and the buy
-    ladder came out non-reversed despite BUY_LADDER_REVERSED=True. Now the
-    flip happens BEFORE the field lookup so the result is always the right
-    size for the asked-about position.
+    F79 (2026-04-18) added a flip that read ``BUY_EXTREME_SIZE_XCH`` when
+    asked about the inner POSITION under reverse-buy, inverting Smart
+    Defaults' write convention. That produced a ~2× inflation of the
+    computed buy-side prep budget: 10 inner POSITION slots got paired
+    with the EXTREME size (6.49 XCH) instead of the INNER size
+    (0.902 XCH), which is why coin_prep_worker then rejected plans that
+    Smart Defaults said fit the wallet. Revert the flip — storage is
+    position-indexed end-to-end, so a direct field read is correct.
 
-    Prefers BUY_<size>_SIZE_XCH; falls back to the shared legacy size.
+    Legacy fallback: when ``BUY_*_SIZE_XCH`` is unset (pre-F62 configs),
+    fall back to the shared legacy ``<TIER>_SIZE_XCH`` field with the
+    reverse-buy flip applied. Legacy config only stored sell-side-like
+    (inner=biggest) values, so under reverse-buy the buy ladder needs
+    the flip to get the inverted shape.
     """
     tier = (tier_name or "").strip().lower()
     if tier not in _TIER_NAMES:
         return Decimal("0")
-    # Position → coin-size mapping (identity unless reverse-buy is on).
-    # Under reverse-buy: position inner uses extreme size, etc.
-    if getattr(cfg, "BUY_LADDER_REVERSED", False):
-        size_tier = _REVERSE_BUY_MAP[tier]
-    else:
-        size_tier = tier
-    attr = f"BUY_{size_tier.upper()}_SIZE_XCH"
+    # Modern configs: BUY_*_SIZE_XCH is position-indexed — return directly.
+    attr = f"BUY_{tier.upper()}_SIZE_XCH"
     val = Decimal(str(getattr(cfg, attr, 0) or 0))
     if val > 0:
         return val
-    return _legacy_tier_size(size_tier)
+    # Legacy fallback: shared tier field with the reverse-buy flip.
+    if getattr(cfg, "BUY_LADDER_REVERSED", False):
+        legacy_tier = _REVERSE_BUY_MAP[tier]
+    else:
+        legacy_tier = tier
+    return _legacy_tier_size(legacy_tier)
 
 
 def get_sell_tier_size_xch(tier_name: str) -> Decimal:
