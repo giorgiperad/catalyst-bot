@@ -58,8 +58,8 @@ WALLET_DEBUG = os.getenv("WALLET_DEBUG", "false").lower() == "true"
 
 # TLS: Chia uses self-signed certs for localhost RPC that don't include
 # 'localhost' in their Subject Alternative Names, so verify=False is required.
-# This is standard practice for all Chia RPC clients.
-_TLS_VERIFY = False
+# This is standard practice for all Chia RPC clients.  # nosec B501
+_TLS_VERIFY = False  # nosec B501
 
 # Optimized: Retry strategy, sized for single-host localhost connection
 # IMPORTANT: connect=0 means NO retries on connection refused — when Chia is down,

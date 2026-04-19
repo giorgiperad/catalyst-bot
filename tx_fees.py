@@ -112,6 +112,22 @@ def _get_full_node_cert_paths() -> Optional[tuple[str, str]]:
     return full_node_cert, full_node_key
 
 
+def _get_chia_ca_cert() -> Optional[str]:
+    """Return Chia private CA cert path for TLS server verification, or None.
+
+    Chia signs all component certs with a per-installation private CA stored at
+    ssl/ca/private_ca.crt.  Passing this as verify= lets requests validate the
+    full-node's self-signed cert without disabling TLS verification entirely.
+    Falls back to None (caller must use verify=False) if the CA cert isn't found.
+    """
+    wallet_cert = str(getattr(cfg, "CHIA_WALLET_CERT", "") or "").strip()
+    if not wallet_cert:
+        return None
+    ssl_root = os.path.dirname(os.path.dirname(wallet_cert))
+    ca_cert = os.path.join(ssl_root, "ca", "private_ca.crt")
+    return ca_cert if os.path.exists(ca_cert) else None
+
+
 def _full_node_rpc(endpoint: str, payload: dict, timeout: int = 5) -> Optional[Dict]:
     cert_pair = _get_full_node_cert_paths()
     if not cert_pair:
@@ -123,12 +139,18 @@ def _full_node_rpc(endpoint: str, payload: dict, timeout: int = 5) -> Optional[D
         base_url = str(getattr(cfg, "CHIA_FULL_NODE_RPC_URL", "https://localhost:8555") or "").rstrip("/")
         if not base_url:
             return None
+        # Use the Chia CA cert when available so TLS server identity is verified.
+        # Fall back to verify=False only when the CA cert is missing (older Chia
+        # installs that don't expose the private_ca.crt at the expected path).
+        # Chia RPC uses self-signed certs on localhost — MITM risk is minimal but
+        # proper verification is preferred.  # nosec B501
+        _tls_verify = _get_chia_ca_cert() or False
         response = requests.post(
             f"{base_url}/{endpoint}",
             json=payload,
             cert=cert_pair,
             headers={"Content-Type": "application/json"},
-            verify=False,
+            verify=_tls_verify,
             timeout=(3, timeout),
         )
         response.raise_for_status()

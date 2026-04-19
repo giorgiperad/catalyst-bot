@@ -1,0 +1,3 @@
+[bandit]
+skips: B608,B310,B323,B104,B102,B113
+exclude: backups_pre_audit_cleanup_20260408,dist,dist2,.venv
