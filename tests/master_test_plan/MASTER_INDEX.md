@@ -107,6 +107,8 @@ executing. Cheap, broad, catches the "how did that even compile" class.
 | 2026-04-19 | 07-07 | `[x]` | fd0483c | disk full: 7 tests — record_fill/record_price/log_event return -1/False; all rollback to release write lock; consecutive failures don't cascade |
 | 2026-04-19 | 07-01/02 | `[x]` | 9b50515 | Sage RPC disconnect + node sync loss: 20 tests — rpc() error dict/None, _rpc_succeeded, ensure_initialized port-unreachable, sync status offline/syncing/unknown, get_chia_health healthy flag |
 | 2026-04-19 | 07-05 | `[x]` | b317e27 | coin_prep_worker crash: 15 tests — check_coin_prep_status (no proc/running/crash/success/IOError), status endpoint crash detection (error phase, exit code, clean exit guard), trigger resets error state |
+| 2026-04-19 | 03-15 | `[x]` | 6c4d0e9 | splash receive path: 14 tests — real SQLite, DB write/retrieval, source_ip, status=new, fingerprint dedup, multi-offer, stats, SSE emit (bot present / absent / duplicate) |
+| 2026-04-19 | 03-13 | `[x]` | b509f05 | shutdown+resume: 14 tests — real SQLite; check-resume wallet→can_resume, fresh_start flag guard; resume-chosen preserves fills; fresh-start clears fills+sets flag; regression fix restores session_start_time in tearDown |
 
 ## Layer 2 — Unit test expansion (32 slices)
 
@@ -204,9 +206,9 @@ Confirms that modules wire together correctly. Slower than unit tests.
 | 03-10 | sniper arb cycle — both-sided probe + clean-up | `[x]` | commit da6ac5b |
 | 03-11 | circuit breaker trip + recover | `[x]` | commit 2fb8831 |
 | 03-12 | cancel-all-flow — stop button → full cancel | `[x]` | commit 6e54a5a |
-| 03-13 | shutdown + resume — state correct on restart | `[ ]` | |
+| 03-13 | shutdown + resume — state correct on restart | `[x]` | commit b509f05 |
 | 03-14 | config reload (live vs stop-required split) | `[x]` | commit d1ac1ac |
-| 03-15 | splash offer receive path | `[ ]` | |
+| 03-15 | splash offer receive path | `[x]` | commit 6c4d0e9 |
 | 03-16 | liquidity-mode switch cycle (two→buy→sell→two) | `[x]` | commit d29b46b |
 | 03-17 | topup worker — reserve draws into tiers correctly | `[x]` | commit 0b72934 |
 | 03-18 | orphan coin cleanup | `[x]` | commit a43522e |
