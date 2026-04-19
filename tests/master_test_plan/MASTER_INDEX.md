@@ -101,8 +101,8 @@ executing. Cheap, broad, catches the "how did that even compile" class.
 | 2026-04-19 | 04-14 | `[x]` | f95d5fd | dashboard: 8 tests — aggregated shape (settings/market_health/wallet/coins/links all verified) |
 | 2026-04-19 | 04-15 | `[x]` | bd61f1e | inventory+risk: 8 tests — /api/inventory (bot=None→500, net_position/CB keys), /api/risk/spreads (buy+sell) |
 | 2026-04-19 | 04-16-20 | `[x]` | bd61f1e | market-intel/spacescan/fees/sniper/CB: 16 tests — splash mock pattern, spacescan skip/clear, fees success |
-| 2026-04-19 | 04-21 | `[x]` | pending | SSE events: 14 tests — auth guard, headers, subscribe/unsubscribe lifecycle, bot=None vs bot initial state, message format, finite-queue termination pattern |
-| 2026-04-19 | 04-22 | `[x]` | pending | splash+settings: 39 tests — splash stats/receive/node/node-start/incoming webhook (403/400/413/429/200), settings defaults/validate, config export-env |
+| 2026-04-19 | 04-21 | `[x]` | 630a1eb | SSE events: 14 tests — auth guard, headers, subscribe/unsubscribe lifecycle, bot=None vs bot initial state, message format, finite-queue termination pattern |
+| 2026-04-19 | 04-22 | `[x]` | 630a1eb | splash+settings: 39 tests — splash stats/receive/node/node-start/incoming webhook (403/400/413/429/200), settings defaults/validate, config export-env |
 
 ## Layer 2 — Unit test expansion (32 slices)
 
@@ -234,8 +234,8 @@ idempotency, response-shape validation.
 | 04-18 | fees endpoints — status, refresh | `[x]` | commit bd61f1e |
 | 04-19 | sniper endpoints — stats, recent | `[x]` | commit bd61f1e |
 | 04-20 | risk / circuit-breaker endpoints | `[x]` | commit bd61f1e |
-| 04-21 | SSE events stream — /api/events | `[x]` | commit pending |
-| 04-22 | splash endpoints + settings export/import | `[x]` | commit pending |
+| 04-21 | SSE events stream — /api/events | `[x]` | commit 630a1eb |
+| 04-22 | splash endpoints + settings export/import | `[x]` | commit 630a1eb |
 
 ## Layer 5 — UI smoke (26 slices)
 
