@@ -109,6 +109,8 @@ executing. Cheap, broad, catches the "how did that even compile" class.
 | 2026-04-19 | 07-05 | `[x]` | b317e27 | coin_prep_worker crash: 15 tests — check_coin_prep_status (no proc/running/crash/success/IOError), status endpoint crash detection (error phase, exit code, clean exit guard), trigger resets error state |
 | 2026-04-19 | 03-15 | `[x]` | 6c4d0e9 | splash receive path: 14 tests — real SQLite, DB write/retrieval, source_ip, status=new, fingerprint dedup, multi-offer, stats, SSE emit (bot present / absent / duplicate) |
 | 2026-04-19 | 03-13 | `[x]` | b509f05 | shutdown+resume: 14 tests — real SQLite; check-resume wallet→can_resume, fresh_start flag guard; resume-chosen preserves fills; fresh-start clears fills+sets flag; regression fix restores session_start_time in tearDown |
+| 2026-04-19 | 03-02 | `[x]` | 0021a80 | bot start/stop: 17 tests — start validation gates, DB fills survive full start→stop cycle, already-running guard, events.emit contracts |
+| 2026-04-19 | 03-03 | `[x]` | 0021a80 | pair-switch: 17 tests — blocked while running (409), _active_cat updated, risk_manager.reset_session() called, DB fills preserved across all switches |
 
 ## Layer 2 — Unit test expansion (32 slices)
 
@@ -195,8 +197,8 @@ Confirms that modules wire together correctly. Slower than unit tests.
 | Slice | Title | Status | Note |
 |-------|-------|--------|------|
 | 03-01 | startup-flow — fresh app → risk → Sage → dashboard | `[ ]` | |
-| 03-02 | bot start/stop cycle — state persists across | `[ ]` | |
-| 03-03 | pair-switch — mid-session pair change, DB/state cleanup | `[ ]` | |
+| 03-02 | bot start/stop cycle — state persists across | `[x]` | commit 0021a80 |
+| 03-03 | pair-switch — mid-session pair change, DB/state cleanup | `[x]` | commit 0021a80 |
 | 03-04 | coin-prep full cycle — consolidate → split → verify | `[ ]` | |
 | 03-05 | coin-prep retry (soft reset, preserve fills) | `[ ]` | |
 | 03-06 | coin-prep full reset (fresh-start path) | `[ ]` | |
@@ -206,6 +208,8 @@ Confirms that modules wire together correctly. Slower than unit tests.
 | 03-10 | sniper arb cycle — both-sided probe + clean-up | `[x]` | commit da6ac5b |
 | 03-11 | circuit breaker trip + recover | `[x]` | commit 2fb8831 |
 | 03-12 | cancel-all-flow — stop button → full cancel | `[x]` | commit 6e54a5a |
+| 03-02 | bot start/stop cycle — state persists across | `[x]` | commit 0021a80 |
+| 03-03 | pair-switch — mid-session pair change, DB/state cleanup | `[x]` | commit 0021a80 |
 | 03-13 | shutdown + resume — state correct on restart | `[x]` | commit b509f05 |
 | 03-14 | config reload (live vs stop-required split) | `[x]` | commit d1ac1ac |
 | 03-15 | splash offer receive path | `[x]` | commit 6c4d0e9 |
