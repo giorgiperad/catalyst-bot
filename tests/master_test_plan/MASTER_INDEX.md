@@ -51,7 +51,8 @@ executing. Cheap, broad, catches the "how did that even compile" class.
 | 2026-04-19 | 02-23 | `[x]` | 7a9983b | risk_manager: 40 tests — CB trip/clear/hysteresis, position limits, spreads |
 | 2026-04-19 | 02-30 | `[x]` | 68ea170 | database: 40 tests — all public functions, temp-DB isolation |
 | 2026-04-19 | 02-06 | `[x]` | e21dd96 | dexie_manager: 37 tests — queue ops, stats, prune, metrics |
-| 2026-04-19 | 02-29 | `[x]` | (pending) | config+validator: 60 tests — helpers, methods, validate_config |
+| 2026-04-19 | 02-29 | `[x]` | 6921d0a | config+validator: 60 tests — helpers, methods, validate_config |
+| 2026-04-19 | 02-31 | `[x]` | (pending) | super_log: 29 tests — ring buffer, levels, cycle stats, db helpers |
 
 ## Layer 2 — Unit test expansion (32 slices)
 
@@ -121,13 +122,13 @@ Target ~3× current coverage. Integration-style side-effects go in Layer 3.
 ### Config + storage (2)
 | Slice | Title | Status | Note |
 |-------|-------|--------|------|
-| 02-29 | config.py + config_live.py + config_validator.py | `[x]` | (pending commit) |
+| 02-29 | config.py + config_live.py + config_validator.py | `[x]` | commit 6921d0a |
 | 02-30 | database.py — every public function | `[x]` | (pending commit) |
 
 ### Utilities (2)
 | Slice | Title | Status | Note |
 |-------|-------|--------|------|
-| 02-31 | super_log.py + super_log_hooks.py — logging layer | `[ ]` | |
+| 02-31 | super_log.py + super_log_hooks.py — logging layer | `[x]` | (pending commit) |
 | 02-32 | tx_fees.py, event_taxonomy.py, notification_manager.py | `[ ]` | |
 
 ## Layer 3 — Integration tests (18 slices)
