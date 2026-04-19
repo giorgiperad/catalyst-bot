@@ -97,6 +97,8 @@ executing. Cheap, broad, catches the "how did that even compile" class.
 | 2026-04-19 | 04-10 | `[x]` | a2de3a5 | smart-defaults: 8 tests — mode routing, fallback, risk_profile fwd, reserve params, exception→500 |
 | 2026-04-19 | 04-11 | `[x]` | a2de3a5 | trading-pair: 18 tests — cats list, cat/select validation (64-hex, lengths, decimals, bot-running→409), cat/refresh |
 | 2026-04-19 | 04-12 | `[x]` | 4741a4b | fills: 11 tests — /api/fills (bot=None→500, limit param), /api/fills/classified (pagination, type/side filters) |
+| 2026-04-19 | 04-13 | `[x]` | f95d5fd | logs: 10 tests — GET/clear/download; clear sets _logs_cleared_at; download returns zip |
+| 2026-04-19 | 04-14 | `[x]` | f95d5fd | dashboard: 8 tests — aggregated shape (settings/market_health/wallet/coins/links all verified) |
 
 ## Layer 2 — Unit test expansion (32 slices)
 
@@ -220,8 +222,8 @@ idempotency, response-shape validation.
 | 04-10 | smart-defaults endpoint — per-mode branching | `[x]` | commit a2de3a5 |
 | 04-11 | trading-pair endpoints — list, select, refresh | `[x]` | commit a2de3a5 |
 | 04-12 | fills endpoints — list, purge, classify | `[x]` | commit 4741a4b |
-| 04-13 | logs endpoints — list, filter, export | `[ ]` | |
-| 04-14 | dashboard endpoint — aggregated payload | `[ ]` | |
+| 04-13 | logs endpoints — list, filter, export | `[x]` | commit f95d5fd |
+| 04-14 | dashboard endpoint — aggregated payload | `[x]` | commit f95d5fd |
 | 04-15 | inventory endpoints — snapshots, current | `[ ]` | |
 | 04-16 | market-intel endpoints — regime, stats | `[ ]` | |
 | 04-17 | spacescan proxy endpoints | `[ ]` | |
