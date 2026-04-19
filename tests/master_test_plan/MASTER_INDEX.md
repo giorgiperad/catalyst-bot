@@ -56,6 +56,7 @@ executing. Cheap, broad, catches the "how did that even compile" class.
 | 2026-04-19 | 02-32 | `[x]` | bf24cf8 | tx_fees+event_taxonomy+notif_mgr: 46 tests |
 | 2026-04-19 | 02-16 | `[x]` | b92d92a | coin_classifier: 29 tests — dust/reserve/exact/oversize/misfit |
 | 2026-04-19 | 02-19 | `[x]` | (pending) | fill_tracker+classifier: 37 tests — arb detection, mass disappearance |
+| 2026-04-19 | 02-09 | `[x]` | (pending) | market_intel: 43 tests — _bps_to_pct, parse_offer, analyse_orderbook, state queries, spread reco, DBX eligibility |
 
 ## Layer 2 — Unit test expansion (32 slices)
 
@@ -77,7 +78,7 @@ Target ~3× current coverage. Integration-style side-effects go in Layer 3.
 | 02-06 | dexie_manager.py — post, delist, queue, rate-limit | `[x]` | commit e21dd96 |
 | 02-07 | spacescan.py — activity + tier lookups | `[ ]` | |
 | 02-08 | market_data_collector.py — 30-day gather pipeline | `[ ]` | |
-| 02-09 | market_intel.py — regime detection, stats | `[ ]` | |
+| 02-09 | market_intel.py — regime detection, stats | `[x]` | (pending commit) |
 | 02-10 | coinset_client.py — mempool + block record calls | `[ ]` | |
 
 ### Offers (3)
