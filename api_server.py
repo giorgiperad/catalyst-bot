@@ -9760,6 +9760,7 @@ def api_token_overview():
     if not dexie_asset_id:
         return jsonify({"success": False, "description": "", "website": ""})
     try:
+        import requests as _req  # F821: not in module scope here
         dexie_base = getattr(cfg, "DEXIE_API_BASE", "https://api.dexie.space")
         for page in range(1, 4):
             resp = _req.get(

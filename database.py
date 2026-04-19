@@ -3523,24 +3523,6 @@ def get_events_since(since: str, limit: int = 100,
 # Config History — track setting changes
 # ---------------------------------------------------------------------------
 
-def record_config_change(key: str, old_value: str, new_value: str) -> bool:
-    """Record a configuration change for audit trail."""
-    try:
-        conn = get_connection()
-        conn.execute(
-            "INSERT INTO config_history (timestamp, key, old_value, new_value) VALUES (?, ?, ?, ?)",
-            (_now(), key, old_value, new_value)
-        )
-        conn.commit()
-        return True
-    except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        return False
-
-
 # ---------------------------------------------------------------------------
 # Utility — stats, cleanup, backup
 # ---------------------------------------------------------------------------

@@ -5697,7 +5697,7 @@ class CoinManager:
             split_tx_ids = []
             # Chia CLI split — needs display units
             if is_cat:
-                cli_coin_size = Decimal(str(cat_token_amount or int(self.get_target_cat_coin_size())))
+                cli_coin_size = Decimal(str(int(self.get_target_cat_coin_size())))
             else:
                 cli_coin_size = Decimal(trading_size_mojos) / Decimal("1000000000000")
 

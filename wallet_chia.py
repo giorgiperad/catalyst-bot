@@ -383,31 +383,6 @@ def get_spendable_coins(wallet_id: int, min_amount_mojos: int = 0,
     return rpc("get_spendable_coins", payload, timeout=15)
 
 
-def count_suitable_coins(wallet_id: int, target_amount_mojos: int, 
-                        tolerance: float = 0.25) -> int:
-    """
-    Count how many coins are suitable for a specific offer size
-    
-    Args:
-        wallet_id: Wallet to check
-        target_amount_mojos: Target coin size (e.g., 0.2 XCH in mojos)
-        tolerance: How much variation is acceptable (0.25 = ±25%)
-    
-    Returns:
-        Number of suitable coins found
-    """
-    min_mojos = int(target_amount_mojos * (1 - tolerance))
-    max_mojos = int(target_amount_mojos * (1 + tolerance))
-    
-    result = get_spendable_coins(wallet_id, min_mojos, max_mojos)
-    
-    if not result or not result.get("success"):
-        return 0
-    
-    records = result.get("records", [])
-    return len(records)
-
-
 def get_spendable_coins_rpc(wallet_id: int) -> Optional[Dict]:
     """
     Get spendable coins for a wallet using RPC
@@ -722,7 +697,7 @@ def wait_for_coin_confirmations(wallet_id: int, target_coin_size_mojos: int,
     start_time = time.time()
     
     while (time.time() - start_time) < max_wait_seconds:
-        confirmed = count_suitable_coins(wallet_id, target_coin_size_mojos, tolerance)
+        confirmed = count_suitable_coins(wallet_id, target_coin_size_mojos, tolerance=tolerance)
         
         if progress_callback:
             progress_callback(confirmed, target_count)

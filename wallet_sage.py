@@ -3665,6 +3665,7 @@ def get_wallet_puzzle_hashes(force: bool = False, max_derivations: int = 5000) -
     Returns an empty set on any failure. Callers must handle that case
     (typically by falling back to the legacy verification path).
     """
+    from database import log_event  # F821: not imported at module level in wallet_sage
     global _puzzle_hash_cache, _puzzle_hash_cache_at
 
     now = time.time()
