@@ -6,6 +6,7 @@ amm_monitor: AMMMonitor.get_drift_bps, get_arb_pressure_label,
              into the instance (no network I/O or background thread started).
 """
 
+import sys
 import unittest
 from decimal import Decimal
 from types import SimpleNamespace
@@ -224,12 +225,16 @@ class TestCheckAmmBuffer(unittest.TestCase):
     def setUp(self):
         self.mon = _make_monitor()
         self._orig_cfg = _config_module.cfg
+        # Ensure our module stays in sys.modules even if a prior tearDown removed it
+        sys.modules["config"] = _config_module
 
     def tearDown(self):
         _config_module.cfg = self._orig_cfg
+        sys.modules["config"] = _config_module
 
     def _set_cfg(self, enable=True, bps="30"):
         _config_module.cfg = _fake_cfg(enable_buffer=enable, buffer_bps=bps)
+        sys.modules["config"] = _config_module
 
     def test_buffer_disabled_always_returns_true(self):
         self._set_cfg(enable=False)
