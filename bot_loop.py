@@ -5199,8 +5199,6 @@ class BotLoop:
             arb_gap=arb_gap,
             skip_buy=_skip_buy,
             skip_sell=_skip_sell,
-            zombie_buy_count=_zombie_buys,
-            zombie_sell_count=_zombie_sells,
         )
 
         # ---- Step 11: Direct post to Dexie first ----
@@ -5783,8 +5781,7 @@ class BotLoop:
                                   arb_gap: Decimal = Decimal("0"),
                                   skip_buy: bool = False,
                                   skip_sell: bool = False,
-                                  zombie_buy_count: int = 0,
-                                  zombie_sell_count: int = 0):
+):
         """Create new offers if we're below target count."""
         recovery_active = self._recovery_is_active()
 

@@ -1555,7 +1555,6 @@ class CoinPrepWorker:
         #    -Wallet ID:             5
 
         lines = output.split('\n')
-        in_wallet_section = False
         current_balance = None
 
         for line in lines:
@@ -1572,7 +1571,6 @@ class CoinPrepWorker:
                 except (ValueError, IndexError, AttributeError):
                     pass
                 # Reset for next wallet
-                in_wallet_section = False
                 current_balance = None
 
             # Look for Total Balance in any section

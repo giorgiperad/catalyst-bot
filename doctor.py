@@ -51,7 +51,6 @@ class DoctorReport:
         fails = sum(1 for c in self.checks if c.status == "fail")
         warns = sum(1 for c in self.checks if c.status == "warn")
         passes = sum(1 for c in self.checks if c.status == "pass")
-        skips = sum(1 for c in self.checks if c.status == "skip")
         if fails:
             return f"BLOCKED: {fails} failure(s), {warns} warning(s), {passes} passed"
         if warns:

@@ -2916,9 +2916,8 @@ class CoinManager:
                     if cid:
                         coin_tier_map[cid] = tier_name
 
-            # Upsert all current coins — track new vs existing for summary
+            # Upsert all current coins
             seen_ids = set()
-            new_count = 0
             for rec in records:
                 cid = _coin_id_from_record(rec)
                 if not cid:
@@ -2970,7 +2969,6 @@ class CoinManager:
 
             # Log sync summary with structured data
             # (individual coin events already logged by database.py)
-            reappeared_count = 0  # counted by upsert_coin in database.py
             summary_msg = (f"{wallet_type.upper()} sync: {len(seen_ids)} in wallet, "
                           f"{gone_count} gone, {len(db_free)} were free in DB")
             if sage_hidden_count > 0:
@@ -4147,12 +4145,6 @@ class CoinManager:
                 # V3 Adaptive threshold: spare buffer % based on trading pace
                 multiplier = getattr(cfg, "COIN_PREP_MULTIPLIER", Decimal("1.0"))
                 pace = self.get_trading_pace()
-                if pace == 'busy':
-                    spare_keep_pct = getattr(cfg, "TOPUP_BUSY_PCT", 50) / 100.0
-                elif pace == 'slow':
-                    spare_keep_pct = getattr(cfg, "TOPUP_SLOW_PCT", 20) / 100.0
-                else:
-                    spare_keep_pct = getattr(cfg, "TOPUP_NORMAL_PCT", 30) / 100.0
 
                 # Per-tier action thresholds that mirror the trigger's TIER_TRIGGER_PCT_*
                 # config, including reversed-buy slot-position translation.
@@ -4190,7 +4182,6 @@ class CoinManager:
                     return max(0.05, min(0.95, (float(_base) / 100.0) * _topup_pace_scale))
 
                 xch_scale = Decimal("1000000000000")
-                cat_scale_dec = Decimal(10) ** Decimal(cfg.CAT_DECIMALS)
                 # F62 (2026-04-09): topup worker needs to know each side's
                 # own tier sizes so it can split to the right target. The
                 # XCH wallet replenishes coins at BUY sizes; the CAT wallet
@@ -4321,23 +4312,10 @@ class CoinManager:
                                       f"CAT {tier_name} tier low: {cat_have}/{cat_topup_threshold} threshold "
                                       f"(target {target_full}) — "
                                       f"need {deficit} at {cat_size_display} each")
-                            # For CAT, use token amount (not mojos) for split.
-                            # F62: CAT side uses SELL tier sizes, not buy.
-                            xch_tier_size_dec = sell_tier_sizes_xch.get(tier_name, cfg.MID_SIZE_XCH)
-                            price = self._get_current_price()
-                            if price and price > 0:
-                                cat_token_size = int((
-                                    xch_tier_size_dec
-                                    / price
-                                    * self._get_coin_prep_headroom_multiplier()
-                                ).quantize(Decimal("1")))
-                            else:
-                                cat_token_size = int(cfg.CAT_COIN_SIZE)
-
                             result = self._smart_topup_wallet(
                                 f"CAT-{tier_name}", cfg.CAT_WALLET_ID,
                                 cat_inv, cat_tier_mojos_val, deficit,
-                                is_cat=True, cat_token_amount=cat_token_size,
+                                is_cat=True,
                                 tier_is_empty=(cat_have == 0),
                             )
                             if result:
@@ -4390,20 +4368,10 @@ class CoinManager:
                             log_event("info", "topup_cat_sniper",
                                       f"CAT sniper pool low: {sniper_cat_have}/{sniper_threshold} threshold "
                                       f"(target {sniper_target}) — need {deficit} at {sniper_cat_display} each")
-                            price = self._get_current_price()
-                            if price and price > 0 and sniper_xch_size_dec > 0:
-                                cat_token_size = int((
-                                    sniper_xch_size_dec
-                                    / price
-                                    * self._get_coin_prep_headroom_multiplier()
-                                ).quantize(Decimal("1")))
-                            else:
-                                cat_token_size = int(cfg.CAT_COIN_SIZE)
-
                             result = self._smart_topup_wallet(
                                 "CAT-sniper", cfg.CAT_WALLET_ID,
                                 cat_inv, sniper_cat_mojos_val, deficit,
-                                is_cat=True, cat_token_amount=cat_token_size
+                                is_cat=True,
                             )
                             if result:
                                 did_anything = True
@@ -4630,7 +4598,6 @@ class CoinManager:
                              inventory: Dict[str, list],
                              trading_size_mojos: int, needed: int,
                              is_cat: bool = False,
-                             cat_token_amount: int = None,
                              tier_is_empty: bool = False) -> bool:
         """Smart topup for one wallet. Returns True if an action was taken.
 
@@ -4642,11 +4609,6 @@ class CoinManager:
         Fallback strategies:
           Strategy 1: Use a reserve coin as the funding source
           Strategy 2: Consolidate small coins first
-
-        Args:
-            cat_token_amount: When tier-aware CAT topup, the token-unit size
-                              (not mojos) for this specific tier. If None, uses
-                              get_target_cat_coin_size() as before.
         """
         reserve_coins = inventory["reserve"]
         small_coins = inventory["small"]
@@ -6201,13 +6163,7 @@ class CoinManager:
                 )
             )
             if sage_submitted:
-                # Optional: note if Sage used different coins than we requested
-                spent_ids = {
-                    cs.get("coin", {}).get("parent_coin_info", "").lstrip("0x")
-                    for cs in (result.get("coin_spends") or [])
-                }
-                # coin_id in our context = coin_id field, not parent_coin_info,
-                # so just log how many coin_spends Sage included for transparency
+                # Log how many coin_spends Sage included for transparency
                 n_spends = len(result.get("coin_spends") or [])
                 extra = (f" (Sage used {n_spends} input coin(s) in the spend)"
                          if n_spends else "")

@@ -522,7 +522,6 @@ def _get_spacescan_market_context(asset_id: str = "", ticker_id: str = "",
             context["regime_hint"] = "balanced"
 
         holders = context["holder_count"]
-        activities = context["activity_count"]
         msg = f"{holders} holders, {activity} activity, {risk} risk"
         if context["price_gap_bps"] > 0:
             msg += f", explorer gap {context['price_gap_bps'] / 100:.1f}%"
@@ -2366,7 +2365,6 @@ def api_status():
 
         # --- Balances ---
         coins_data = raw.get("coins") or {}
-        risk_data = raw.get("risk") or {}
         xch_bal = coins_data.get("xch_balance") or {}
         cat_bal = coins_data.get("cat_balance") or {}
         balances_out = {
@@ -7185,8 +7183,6 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
     # ---- 5. Read user inputs (trade size, max offers) ----
     from flask import request as flask_request
     trade_size = _safe_float(flask_request.args.get("trade_size", 0))
-    max_buy = int(_safe_float(flask_request.args.get("max_buy", 0)))
-    max_sell = int(_safe_float(flask_request.args.get("max_sell", 0)))
 
     # ══════════════════════════════════════════════════════════════
     # V2 CALCULATION PHASE — data-driven from 30 days of history

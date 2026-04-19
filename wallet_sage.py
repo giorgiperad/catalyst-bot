@@ -3115,7 +3115,6 @@ def cancel_offers_batch(trade_ids: list, secure: bool = True, max_workers: int =
 
     start_time = time.time()
     confirmed = False
-    last_count = pre_coins
 
     while (time.time() - start_time) < max_wait:
         time.sleep(poll_interval)
@@ -3165,8 +3164,6 @@ def cancel_offers_batch(trade_ids: list, secure: bool = True, max_workers: int =
                 for tid in trade_ids:
                     results[tid] = {"success": True, "method": "confirmed_by_coin_delta"}
                 break
-
-            last_count = current_coins
 
         except Exception as e:
             print(f"   ⚠️ [{elapsed}s] Poll error: {e}")

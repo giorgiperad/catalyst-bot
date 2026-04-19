@@ -2323,7 +2323,6 @@ def link_offers_to_locked_coins(active_offers: list, cat_asset_id: str) -> dict:
             # Parse offer summary
             summary = offer.get("summary") or {}
             offered = summary.get("offered") or {}
-            requested = summary.get("requested") or {}
 
             # Extract amounts for each side
             offered_xch = int(offered.get("xch", 0) or 0)
@@ -2331,13 +2330,6 @@ def link_offers_to_locked_coins(active_offers: list, cat_asset_id: str) -> dict:
             for key, val in offered.items():
                 if key != "xch" and key != "unknown" and val:
                     offered_cat = int(val)
-                    break
-
-            requested_xch = int(requested.get("xch", 0) or 0)
-            requested_cat = 0
-            for key, val in requested.items():
-                if key != "xch" and key != "unknown" and val:
-                    requested_cat = int(val)
                     break
 
             # Link the offered-side coin (only if not already linked)
@@ -2899,7 +2891,6 @@ def record_fill(trade_id: str, side: str, price_xch: Decimal, size_xch: Decimal,
             try:
                 existing_side = existing["side"]
                 existing_price = Decimal(str(existing["price_xch"] or 0))
-                existing_size_xch = Decimal(str(existing["size_xch"] or 0))
                 if existing_side != side or abs(existing_price - price_xch) > Decimal("0.00000001"):
                     log_event("warning", "record_fill_mismatch",
                               f"Fill {trade_id[:16]}... already recorded but parameters differ: "

@@ -303,7 +303,7 @@ class SplashManager:
         try:
             # Just try connecting — Splash may not have a health endpoint,
             # so we just check if the port is open with a short timeout
-            r = requests.get(submit_url, timeout=3)
+            requests.get(submit_url, timeout=3)
             return {"healthy": True, "url": submit_url, "error": None}
         except requests.ConnectionError:
             return {"healthy": False, "url": submit_url,

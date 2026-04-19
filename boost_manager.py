@@ -338,10 +338,6 @@ class BoostManager:
             return
 
         proven_spread_bps = self._arb_floor_bps
-        half_spread = Decimal(str(proven_spread_bps)) / Decimal("20000")
-        buy_price = mid_price * (Decimal("1") - half_spread)
-        sell_price = mid_price * (Decimal("1") + half_spread)
-
         handoff_count = 0
 
         for side in ("buy", "sell"):
@@ -349,8 +345,6 @@ class BoostManager:
                 continue
             if side == "sell" and not cfg.ENABLE_SELL:
                 continue
-
-            target_price = buy_price if side == "buy" else sell_price
 
             # --- Step 1: Find the furthest inner-tier offer to swap out ---
             try:
@@ -555,7 +549,7 @@ class BoostManager:
         time.sleep(0.5)
 
         # Recreate at new tighter spread
-        created = self._create_gap_closer_pair(self._boost_mid_price)
+        self._create_gap_closer_pair(self._boost_mid_price)
 
         # Reset stability timer for the new spread
         self._stable_since = time.time()
