@@ -112,6 +112,7 @@ executing. Cheap, broad, catches the "how did that even compile" class.
 | 2026-04-19 | 03-02 | `[x]` | 0021a80 | bot start/stop: 17 tests — start validation gates, DB fills survive full start→stop cycle, already-running guard, events.emit contracts |
 | 2026-04-19 | 03-03 | `[x]` | 0021a80 | pair-switch: 17 tests — blocked while running (409), _active_cat updated, risk_manager.reset_session() called, DB fills preserved across all switches |
 | 2026-04-19 | 03-04/05/06 | `[x]` | f51a2d3 | coin prep lifecycle: 25 tests — trigger state (running/run_id/started_at/bot.stop), default preserves fills, soft reset clears running without touching DB, full_reset=True clears fills |
+| 2026-04-19 | 03-01 | `[x]` | 6697e0d | startup flow: 26 tests — check-resume (fresh/offers/running bot), session mode, Sage probe, CAT select, dashboard 200+keys, pre-start validation (CAT missing→400, valid→200) |
 
 ## Layer 2 — Unit test expansion (32 slices)
 
@@ -197,7 +198,7 @@ Confirms that modules wire together correctly. Slower than unit tests.
 
 | Slice | Title | Status | Note |
 |-------|-------|--------|------|
-| 03-01 | startup-flow — fresh app → risk → Sage → dashboard | `[ ]` | |
+| 03-01 | startup-flow — fresh app → risk → Sage → dashboard | `[x]` | commit 6697e0d |
 | 03-02 | bot start/stop cycle — state persists across | `[x]` | commit 0021a80 |
 | 03-03 | pair-switch — mid-session pair change, DB/state cleanup | `[x]` | commit 0021a80 |
 | 03-04 | coin-prep full cycle — consolidate → split → verify | `[x]` | commit f51a2d3 |
