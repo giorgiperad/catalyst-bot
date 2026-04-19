@@ -42,7 +42,8 @@ executing. Cheap, broad, catches the "how did that even compile" class.
 | 01-05 | type annotation audit — mypy on public APIs of core modules | `[x]` | commit b560cc7 |
 | 01-06 | complexity audit — radon CC, flag functions >10 | `[x]` | commit 89d0e3e |
 | 01-07 | circular import detection — pydeps / manual | `[x]` | commit fdf9502 |
-| 01-08 | hardcoded paths + secrets sweep — regex grep | `[x]` | (pending commit) |
+| 01-08 | hardcoded paths + secrets sweep — regex grep | `[x]` | commit ec3b099 |
+| 2026-04-19 | 02-01 | `[x]` | (pending) | bot_loop pure helpers: 45 new tests covering gates/timers/probes |
 
 ## Layer 2 — Unit test expansion (32 slices)
 
@@ -52,7 +53,7 @@ Target ~3× current coverage. Integration-style side-effects go in Layer 3.
 ### Core runtime (4)
 | Slice | Title | Status | Note |
 |-------|-------|--------|------|
-| 02-01 | bot_loop.py — cycle orchestrator, gates, timers | `[ ]` | |
+| 02-01 | bot_loop.py — cycle orchestrator, gates, timers | `[x]` | (pending commit) |
 | 02-02 | api_server.py (core) — status/config/bot lifecycle endpoints | `[ ]` | |
 | 02-03 | app_bridge.py — PyWebView API surface methods | `[ ]` | |
 | 02-04 | desktop_app.py — flag parsing, mode routing | `[ ]` | |
