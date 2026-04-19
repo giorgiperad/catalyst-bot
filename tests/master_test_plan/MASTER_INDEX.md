@@ -54,7 +54,8 @@ executing. Cheap, broad, catches the "how did that even compile" class.
 | 2026-04-19 | 02-29 | `[x]` | 6921d0a | config+validator: 60 tests — helpers, methods, validate_config |
 | 2026-04-19 | 02-31 | `[x]` | ea05830 | super_log: 29 tests — ring buffer, levels, cycle stats, db helpers |
 | 2026-04-19 | 02-32 | `[x]` | bf24cf8 | tx_fees+event_taxonomy+notif_mgr: 46 tests |
-| 2026-04-19 | 02-16 | `[x]` | (pending) | coin_classifier: 29 tests — dust/reserve/exact/oversize/misfit |
+| 2026-04-19 | 02-16 | `[x]` | b92d92a | coin_classifier: 29 tests — dust/reserve/exact/oversize/misfit |
+| 2026-04-19 | 02-19 | `[x]` | (pending) | fill_tracker+classifier: 37 tests — arb detection, mass disappearance |
 
 ## Layer 2 — Unit test expansion (32 slices)
 
@@ -91,14 +92,14 @@ Target ~3× current coverage. Integration-style side-effects go in Layer 3.
 |-------|-------|--------|------|
 | 02-14 | coin_manager.py — inventory, counts, tier sizing | `[ ]` | |
 | 02-15 | coin_prep_worker.py + coin_prep_utils.py — split logic | `[ ]` | |
-| 02-16 | coin_classifier.py — classify_coin, is_misfit_coin | `[x]` | (pending commit) |
+| 02-16 | coin_classifier.py — classify_coin, is_misfit_coin | `[x]` | commit b92d92a |
 | 02-17 | coin_fsm.py + coin_reservations.py + reservation_manager.py | `[ ]` | |
 | 02-18 | shape_fix_orchestrator.py + sweep_coordinator.py | `[ ]` | |
 
 ### Fills (1)
 | Slice | Title | Status | Note |
 |-------|-------|--------|------|
-| 02-19 | fill_tracker.py + fill_classifier.py — detection + classification | `[ ]` | |
+| 02-19 | fill_tracker.py + fill_classifier.py — detection + classification | `[x]` | (pending commit) |
 
 ### Wallet adapters (3)
 | Slice | Title | Status | Note |
