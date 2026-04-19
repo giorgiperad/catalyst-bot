@@ -23,7 +23,8 @@ Slice ID format: `NN-MM-description` where `NN` is the layer (01-05),
 | 2026-04-19 | 01-04 | `[x]` | b5b3fc2 | 1 TODO (real future work) → docs/tech_debt.md TD-001 |
 | 2026-04-19 | 01-05 | `[x]` | b560cc7 | 2 real bugs: missing wallet export + db missing return; 8 tests |
 | 2026-04-19 | 01-06 | `[x]` | 89d0e3e | complexity audit: 129 F-grade functions; 5 TD entries; no bugs |
-| 2026-04-19 | 01-07 | `[x]` | (pending) | circular imports: 0 module-level cycles; 241 deferred (all safe) |
+| 2026-04-19 | 01-07 | `[x]` | fdf9502 | circular imports: 0 module-level cycles; 241 deferred (all safe) |
+| 2026-04-19 | 01-08 | `[x]` | (pending) | hardcoded paths/secrets: 0 issues; 2 minor config inconsistencies → spawn queue |
 
 ---
 
@@ -38,10 +39,10 @@ executing. Cheap, broad, catches the "how did that even compile" class.
 | 01-02 | bandit security scan — secrets, injection, paths | `[x]` | commit 2968308 |
 | 01-03 | dead code — vulture + manual unused-function check | `[x]` | 2e536f0 |
 | 01-04 | TODO/FIXME/XXX sweep — triage + file as issues or fix | `[x]` | commit b5b3fc2 |
-| 01-05 | type annotation audit — mypy on public APIs of core modules | `[x]` | (pending commit) |
+| 01-05 | type annotation audit — mypy on public APIs of core modules | `[x]` | commit b560cc7 |
 | 01-06 | complexity audit — radon CC, flag functions >10 | `[x]` | commit 89d0e3e |
-| 01-07 | circular import detection — pydeps / manual | `[x]` | (pending commit) |
-| 01-08 | hardcoded paths + secrets sweep — regex grep | `[ ]` | |
+| 01-07 | circular import detection — pydeps / manual | `[x]` | commit fdf9502 |
+| 01-08 | hardcoded paths + secrets sweep — regex grep | `[x]` | (pending commit) |
 
 ## Layer 2 — Unit test expansion (32 slices)
 
