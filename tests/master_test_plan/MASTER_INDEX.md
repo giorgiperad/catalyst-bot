@@ -20,7 +20,8 @@ Slice ID format: `NN-MM-description` where `NN` is the layer (01-05),
 | 2026-04-19 | 01-01 | `[x]` | 5b16ab1 | ruff auto-fix + 5 F821/F811 bugs fixed, 10 regression tests |
 | 2026-04-19 | 01-02 | `[x]` | 2968308 | 1 real B501 fixed (CA-cert TLS), 77 MEDIUM FPs documented, .bandit config |
 | 2026-04-19 | 01-03 | `[x]` | 2e536f0 | 2 dead params, 18 F841 fixed, vulture_whitelist.py, 19 tests |
-| 2026-04-19 | 01-04 | `[x]` | (pending) | 1 TODO (real future work) → docs/tech_debt.md TD-001 |
+| 2026-04-19 | 01-04 | `[x]` | b5b3fc2 | 1 TODO (real future work) → docs/tech_debt.md TD-001 |
+| 2026-04-19 | 01-05 | `[x]` | (pending) | 2 real bugs: missing wallet export + db missing return; 8 tests |
 
 ---
 
@@ -34,8 +35,8 @@ executing. Cheap, broad, catches the "how did that even compile" class.
 | 01-01 | ruff lint sweep — top findings + auto-fix | `[x]` | commit 5b16ab1 |
 | 01-02 | bandit security scan — secrets, injection, paths | `[x]` | commit 2968308 |
 | 01-03 | dead code — vulture + manual unused-function check | `[x]` | 2e536f0 |
-| 01-04 | TODO/FIXME/XXX sweep — triage + file as issues or fix | `[x]` | (pending commit) |
-| 01-05 | type annotation audit — mypy on public APIs of core modules | `[ ]` | |
+| 01-04 | TODO/FIXME/XXX sweep — triage + file as issues or fix | `[x]` | commit b5b3fc2 |
+| 01-05 | type annotation audit — mypy on public APIs of core modules | `[x]` | (pending commit) |
 | 01-06 | complexity audit — radon CC, flag functions >10 | `[ ]` | |
 | 01-07 | circular import detection — pydeps / manual | `[ ]` | |
 | 01-08 | hardcoded paths + secrets sweep — regex grep | `[ ]` | |

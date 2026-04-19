@@ -1160,6 +1160,7 @@ def update_offer_status(trade_id: str, status: str) -> bool:
                 pass
             log_event("error", "db_error", f"Failed to update offer {trade_id}: {e}")
         return False
+    return False  # all retries exhausted
 
 
 def mark_cancel_attempted(trade_id: str) -> bool:

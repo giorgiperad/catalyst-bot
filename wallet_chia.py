@@ -397,6 +397,14 @@ def get_spendable_coins_rpc(wallet_id: int) -> Optional[Dict]:
     return rpc("get_spendable_coins", payload, timeout=10)
 
 
+def get_spendable_coin_count(wallet_id: int) -> int:
+    """Return the number of spendable coins for a wallet."""
+    result = get_spendable_coins_rpc(wallet_id)
+    if not result:
+        return 0
+    return len(result.get("confirmed_records", []))
+
+
 def split_coins_rpc(wallet_id: int, target_coin_id: str, num_coins: int,
                     amount_per_coin: int, fee_mojos: int = 0,
                     is_cat: bool = False) -> Optional[Dict]:
