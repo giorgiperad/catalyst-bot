@@ -105,7 +105,8 @@ executing. Cheap, broad, catches the "how did that even compile" class.
 | 2026-04-19 | 04-22 | `[x]` | 630a1eb | splash+settings: 39 tests — splash stats/receive/node/node-start/incoming webhook (403/400/413/429/200), settings defaults/validate, config export-env |
 | 2026-04-19 | 07-03/04/06/08 | `[x]` | 4d8ee80 | degraded-state: 27 tests — Dexie 5xx retry/429/conn-error; TibetSwap 5xx stale cache fallback; fill_tracker None DB graceful; clock-jump negative age |
 | 2026-04-19 | 07-07 | `[x]` | fd0483c | disk full: 7 tests — record_fill/record_price/log_event return -1/False; all rollback to release write lock; consecutive failures don't cascade |
-| 2026-04-19 | 07-01/02 | `[x]` | (pending) | Sage RPC disconnect + node sync loss: 20 tests — rpc() error dict/None, _rpc_succeeded, ensure_initialized port-unreachable, sync status offline/syncing/unknown, get_chia_health healthy flag |
+| 2026-04-19 | 07-01/02 | `[x]` | 9b50515 | Sage RPC disconnect + node sync loss: 20 tests — rpc() error dict/None, _rpc_succeeded, ensure_initialized port-unreachable, sync status offline/syncing/unknown, get_chia_health healthy flag |
+| 2026-04-19 | 07-05 | `[x]` | b317e27 | coin_prep_worker crash: 15 tests — check_coin_prep_status (no proc/running/crash/success/IOError), status endpoint crash detection (error phase, exit code, clean exit guard), trigger resets error state |
 
 ## Layer 2 — Unit test expansion (32 slices)
 
@@ -349,11 +350,11 @@ in a state that needs manual recovery.
 
 | Slice | Title | Status | Note |
 |-------|-------|--------|------|
-| 07-01 | Sage RPC disconnected mid-cycle — recovery + user-visible warning | `[x]` | (pending) |
-| 07-02 | Chia node loses sync — bot pauses non-critical writes | `[x]` | (pending) |
+| 07-01 | Sage RPC disconnected mid-cycle — recovery + user-visible warning | `[x]` | commit 9b50515 |
+| 07-02 | Chia node loses sync — bot pauses non-critical writes | `[x]` | commit 9b50515 |
 | 07-03 | Dexie API returns 5xx intermittently — offer queue retries + rate-limit respected | `[x]` | commit 4d8ee80 |
 | 07-04 | TibetSwap API returns 5xx — price engine falls back to Dexie | `[x]` | commit 4d8ee80 |
-| 07-05 | coin_prep_worker crashed mid-run — orphan lock cleanup + retry | `[ ]` | |
+| 07-05 | coin_prep_worker crashed mid-run — orphan lock cleanup + retry | `[x]` | commit b317e27 |
 | 07-06 | database row inconsistency (fills referencing deleted offer) — reconcile gracefully | `[x]` | commit 4d8ee80 |
 | 07-07 | disk space exhausted — shutdown cleanly rather than silent data loss | `[x]` | commit fd0483c |
 | 07-08 | system clock jumps (simulate) — nothing crashes on negative uptime | `[x]` | commit 4d8ee80 |
