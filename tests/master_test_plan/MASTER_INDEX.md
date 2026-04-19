@@ -88,6 +88,10 @@ executing. Cheap, broad, catches the "how did that even compile" class.
 | 2026-04-19 | 04-01 | `[x]` | dbf5368 | status endpoints: 29 tests — /api/status /api/bot/state /api/bot/price contracts; 401-vs-405 discovery |
 | 2026-04-19 | 04-02 | `[x]` | 68138cc | config endpoints: 27 tests — GET public, POST token+blocked-keys, reload/apply/live contracts |
 | 2026-04-19 | 04-03 | `[x]` | 9728df6 | bot lifecycle: 17 tests — start validation gates (CAT/spread/signing), stop, shutdown contracts |
+| 2026-04-19 | 04-04 | `[x]` | cad3e96 | offers: 21 tests — GET list, cancel single/batch, cancel_all status; running bot→409, bot=None→direct wallet path |
+| 2026-04-19 | 04-05 | `[x]` | 5272e75 | pnl+purge: 21 tests — /api/pnl, reset-preview, reset confirm gate (case-insensitive), fills/purge risk_manager callback |
+| 2026-04-19 | 04-06 | `[x]` | 6552bad | coin-prep: 19 tests — status/verify/trigger/reset; trigger mocks Thread, verifies bot.stop() on running bot |
+| 2026-04-19 | 04-07 | `[x]` | a95f82a | session: 15 tests — fresh-start, resume-chosen, check-resume (4 branches: bot_running/fresh_start/no_offers/can_resume) |
 
 ## Layer 2 — Unit test expansion (32 slices)
 
@@ -202,10 +206,10 @@ idempotency, response-shape validation.
 | 04-01 | status endpoints — /api/status, /api/bot/state, /api/bot/price | `[x]` | commit dbf5368 |
 | 04-02 | config — GET/POST, reload, live | `[x]` | commit 68138cc |
 | 04-03 | bot lifecycle — start, stop, shutdown | `[x]` | commit 9728df6 |
-| 04-04 | offers endpoints — list, cancel (single + batch), post-to-dexie | `[ ]` | |
-| 04-05 | pnl endpoints — pnl, pnl/reset, pnl/reset-preview, fills/purge | `[ ]` | |
-| 04-06 | coin-prep endpoints — trigger, status, reset, verify | `[ ]` | |
-| 04-07 | session endpoints — fresh-start, resume-chosen, check-resume | `[ ]` | |
+| 04-04 | offers endpoints — list, cancel (single + batch), post-to-dexie | `[x]` | commit cad3e96 |
+| 04-05 | pnl endpoints — pnl, pnl/reset, pnl/reset-preview, fills/purge | `[x]` | commit 5272e75 |
+| 04-06 | coin-prep endpoints — trigger, status, reset, verify | `[x]` | commit 6552bad |
+| 04-07 | session endpoints — fresh-start, resume-chosen, check-resume | `[x]` | commit a95f82a |
 | 04-08 | diagnostics endpoints — runtime, api-stats | `[ ]` | |
 | 04-09 | sage/wallet endpoints — begin-startup, detect, begin | `[ ]` | |
 | 04-10 | smart-defaults endpoint — per-mode branching | `[ ]` | |
