@@ -69,7 +69,10 @@ executing. Cheap, broad, catches the "how did that even compile" class.
 | 2026-04-19 | 02-21 | `[x]` | e32fc71 | wallet_sage pure fns: 69 tests — rpc_succeeded, classify, offer expiry, mojos, normalize |
 | 2026-04-19 | 02-22 | `[x]` | cf1efce | wallet_chia+sage_node: 66 tests — mojos, expiry, _is_open_status, classify, version compare |
 | 2026-04-19 | 02-24 | `[x]` | 05a2f00 | amm_monitor+mempool_watcher: 32 tests — encode_amount, coin_id, drift_bps, arb_label, buffer |
-| 2026-04-19 | 02-25 | `[x]` | (pending) | dynamic_amm_buffer+reaction_strategy: 57 tests — RequoteSeverity, CycleBudget, classify_drift, sweep multipliers |
+| 2026-04-19 | 02-25 | `[x]` | 9672e58 | dynamic_amm_buffer+reaction_strategy: 57 tests — RequoteSeverity, CycleBudget, classify_drift, sweep multipliers |
+| 2026-04-19 | 02-26 | `[x]` | (pending) | sniper: 20 tests — bps_to_pct, prune_active_snipes, get_stats, calculate_snipe_size |
+| 2026-04-19 | 02-27 | `[x]` | (pending) | boost_manager: 11 tests — bps_to_pct, _find_stale_offers w/ price cache mock |
+| 2026-04-19 | 02-28 | `[x]` | (pending) | splash_manager+splash_receive: 31 tests — fingerprint, asset_key, normalize, classify |
 
 ## Layer 2 — Unit test expansion (32 slices)
 
@@ -132,9 +135,9 @@ Target ~3× current coverage. Integration-style side-effects go in Layer 3.
 ### Strategies (3)
 | Slice | Title | Status | Note |
 |-------|-------|--------|------|
-| 02-26 | sniper.py — arb probes, single-sided gate | `[ ]` | |
-| 02-27 | boost_manager.py — boost lifecycle | `[ ]` | |
-| 02-28 | splash_manager.py + splash_receive.py | `[ ]` | |
+| 02-26 | sniper.py — arb probes, single-sided gate | `[x]` | (pending commit) |
+| 02-27 | boost_manager.py — boost lifecycle | `[x]` | (pending commit) |
+| 02-28 | splash_manager.py + splash_receive.py | `[x]` | (pending commit) |
 
 ### Config + storage (2)
 | Slice | Title | Status | Note |
