@@ -104,7 +104,7 @@ executing. Cheap, broad, catches the "how did that even compile" class.
 | 2026-04-19 | 04-21 | `[x]` | 630a1eb | SSE events: 14 tests — auth guard, headers, subscribe/unsubscribe lifecycle, bot=None vs bot initial state, message format, finite-queue termination pattern |
 | 2026-04-19 | 04-22 | `[x]` | 630a1eb | splash+settings: 39 tests — splash stats/receive/node/node-start/incoming webhook (403/400/413/429/200), settings defaults/validate, config export-env |
 | 2026-04-19 | 07-03/04/06/08 | `[x]` | 4d8ee80 | degraded-state: 27 tests — Dexie 5xx retry/429/conn-error; TibetSwap 5xx stale cache fallback; fill_tracker None DB graceful; clock-jump negative age |
-| 2026-04-19 | 07-07 | `[x]` | pending | disk full: 7 tests — record_fill/record_price/log_event return -1/False; all rollback to release write lock; consecutive failures don't cascade |
+| 2026-04-19 | 07-07 | `[x]` | fd0483c | disk full: 7 tests — record_fill/record_price/log_event return -1/False; all rollback to release write lock; consecutive failures don't cascade |
 
 ## Layer 2 — Unit test expansion (32 slices)
 
@@ -354,7 +354,7 @@ in a state that needs manual recovery.
 | 07-04 | TibetSwap API returns 5xx — price engine falls back to Dexie | `[x]` | commit 4d8ee80 |
 | 07-05 | coin_prep_worker crashed mid-run — orphan lock cleanup + retry | `[ ]` | |
 | 07-06 | database row inconsistency (fills referencing deleted offer) — reconcile gracefully | `[x]` | commit 4d8ee80 |
-| 07-07 | disk space exhausted — shutdown cleanly rather than silent data loss | `[x]` | commit pending |
+| 07-07 | disk space exhausted — shutdown cleanly rather than silent data loss | `[x]` | commit fd0483c |
 | 07-08 | system clock jumps (simulate) — nothing crashes on negative uptime | `[x]` | commit 4d8ee80 |
 
 ---
