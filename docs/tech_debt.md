@@ -66,3 +66,70 @@ used during early two-step-split development.
 
 **Impact:** none (dead code)
 **Effort:** trivial (delete both copies)
+
+---
+
+## TD-005: `api_server._calculate_smart_defaults` — CC=460 (F grade)
+
+**File:** `api_server.py:6937`
+**Discovered:** 2026-04-19, slice 01-06
+
+Single ~1500-line function computing all Smart Settings output. High cyclomatic
+complexity (460) comes from sequential parallel data transformations, not deep
+nesting. Works correctly but is extremely hard to test or modify in isolation.
+
+**Impact:** maintenance risk, hard to add tests
+**Effort:** large (requires comprehensive test coverage first)
+
+---
+
+## TD-006: `BotLoop._run_one_cycle` — CC=321 (F grade)
+
+**File:** `bot_loop.py:3544`
+**Discovered:** 2026-04-19, slice 01-06
+
+The main 20-step trading cycle orchestrator. High CC from per-step guards,
+error branches, and mode gates. Intentionally flat for readability; decomposing
+would hide the overall flow.
+
+**Impact:** maintenance risk
+**Effort:** large; prerequisite: Layer 2/3 integration tests
+
+---
+
+## TD-007: `BotLoop._startup_sync` — CC=182 (F grade)
+
+**File:** `bot_loop.py:2682`
+**Discovered:** 2026-04-19, slice 01-06
+
+Startup reconciliation: syncs offers, fills, coins, and state from wallet RPC.
+Complex because it handles many partial-start scenarios.
+
+**Impact:** low (called once at startup)
+**Effort:** medium
+
+---
+
+## TD-008: `CoinManager._two_step_split` — CC=132 (F grade)
+
+**File:** `coin_manager.py:5302`
+**Discovered:** 2026-04-19, slice 01-06
+
+Coin splitting with Sage RPC / Chia CLI dispatch, absorb-misfit logic, and
+multiple failure fallback paths. Most extractable of the F-grade methods.
+
+**Impact:** medium (called frequently during coin prep)
+**Effort:** medium
+
+---
+
+## TD-009: `OfferManager.create_ladder` — CC=138 (F grade)
+
+**File:** `offer_manager.py:1311`
+**Discovered:** 2026-04-19, slice 01-06
+
+Builds the tiered price ladder for one side. Complex from tier routing, sniper
+probe logic, coin selection, and dry-run branching.
+
+**Impact:** medium (called every cycle)
+**Effort:** large; prerequisite: slice 02-XX offer_manager unit tests
