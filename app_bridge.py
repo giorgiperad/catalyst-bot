@@ -105,6 +105,21 @@ class AppBridge:
         return self._api
 
     # -----------------------------------------------------------------------
+    # Clipboard (WebView2 blocks execCommand paste — read from Python side)
+    # -----------------------------------------------------------------------
+
+    def read_clipboard(self):
+        try:
+            import tkinter as tk
+            root = tk.Tk()
+            root.withdraw()
+            text = root.clipboard_get()
+            root.destroy()
+            return {"success": True, "text": text}
+        except Exception as e:
+            return {"success": False, "text": "", "error": str(e)}
+
+    # -----------------------------------------------------------------------
     # Bot Control
     # -----------------------------------------------------------------------
 

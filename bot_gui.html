@@ -31471,7 +31471,26 @@ document.addEventListener('DOMContentLoaded', () => {
 
     _menu.appendChild(_item('Cut',   () => { if (_ctxTarget) { _ctxTarget.focus(); document.execCommand('cut'); } }));
     _menu.appendChild(_item('Copy',  () => { if (_ctxTarget) { _ctxTarget.focus(); document.execCommand('copy'); } }));
-    _menu.appendChild(_item('Paste', () => { if (_ctxTarget) { _ctxTarget.focus(); document.execCommand('paste'); } }));
+    _menu.appendChild(_item('Paste', async () => {
+        if (!_ctxTarget) return;
+        _ctxTarget.focus();
+        // execCommand('paste') is blocked by WebView2 — read via Python bridge instead
+        try {
+            const res = await window.pywebview.api.read_clipboard();
+            if (res && res.success && res.text) {
+                const el = _ctxTarget;
+                const start = el.selectionStart ?? el.value.length;
+                const end   = el.selectionEnd   ?? el.value.length;
+                el.value = el.value.slice(0, start) + res.text + el.value.slice(end);
+                const cur = start + res.text.length;
+                el.setSelectionRange(cur, cur);
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+        } catch (_) {
+            // pywebview not available (browser mode) — fall back
+            document.execCommand('paste');
+        }
+    }));
 
     document.addEventListener('contextmenu', (e) => {
         const t = e.target;
