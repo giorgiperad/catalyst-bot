@@ -111,21 +111,29 @@ class AppBridge:
     def read_clipboard(self):
         try:
             import ctypes
-            import ctypes.wintypes
             CF_UNICODETEXT = 13
+            # Must set restype to c_void_p — HANDLE is 64-bit on 64-bit Windows
+            # and ctypes defaults to c_int (32-bit), truncating the pointer
+            GetClipboardData = ctypes.windll.user32.GetClipboardData
+            GetClipboardData.restype = ctypes.c_void_p
+            GlobalLock = ctypes.windll.kernel32.GlobalLock
+            GlobalLock.restype = ctypes.c_void_p
+            GlobalLock.argtypes = [ctypes.c_void_p]
+            GlobalUnlock = ctypes.windll.kernel32.GlobalUnlock
+            GlobalUnlock.argtypes = [ctypes.c_void_p]
             if not ctypes.windll.user32.OpenClipboard(None):
                 return {"success": False, "text": "", "error": "OpenClipboard failed"}
             try:
-                h = ctypes.windll.user32.GetClipboardData(CF_UNICODETEXT)
+                h = GetClipboardData(CF_UNICODETEXT)
                 if not h:
                     return {"success": False, "text": "", "error": "No text in clipboard"}
-                ptr = ctypes.windll.kernel32.GlobalLock(h)
+                ptr = GlobalLock(h)
                 if not ptr:
                     return {"success": False, "text": "", "error": "GlobalLock failed"}
                 try:
                     text = ctypes.wstring_at(ptr)
                 finally:
-                    ctypes.windll.kernel32.GlobalUnlock(h)
+                    GlobalUnlock(h)
             finally:
                 ctypes.windll.user32.CloseClipboard()
             return {"success": True, "text": text}
