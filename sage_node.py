@@ -556,15 +556,40 @@ def start_preload():
                     print(f"[Sage] Launching {exe_path}...", flush=True)
 
                     if _launch_sage_exe(exe_path):
-                        # Wait for RPC to become available after launch
+                        # Wait for RPC to become available after launch.
+                        # Give Sage ~30s to fully open before deciding RPC is
+                        # disabled — after that, if the process is running but
+                        # RPC still isn't responding, show the user instructions
+                        # instead of silently waiting for 3 minutes then failing.
                         print("[Sage] Waiting for RPC to come online...", flush=True)
-                        for attempt in range(36):  # 3 minutes
+                        _RPC_GRACE_ATTEMPTS = 6   # 30s — enough for Sage to open
+                        for attempt in range(36):  # 3 minutes total
                             if _is_sage_rpc_available():
                                 sage_running = True
                                 print("[Sage] RPC came online after launch", flush=True)
                                 log_event("success", "sage_startup",
                                           "Sage launched and RPC available")
                                 break
+                            if attempt >= _RPC_GRACE_ATTEMPTS and _is_sage_process_running():
+                                # Sage is open but RPC never came up — likely disabled
+                                with _phase_lock:
+                                    _sage_startup_phase = "rpc_disabled"
+                                log_event("warning", "sage_startup",
+                                          "Sage launched but RPC did not start — "
+                                          "user needs to enable RPC in Settings → Advanced")
+                                print("[Sage] Sage open but RPC disabled — "
+                                      "showing instructions", flush=True)
+                                while _preload_running and not sage_running:
+                                    if _is_sage_rpc_available():
+                                        sage_running = True
+                                        with _phase_lock:
+                                            _sage_startup_phase = "connecting"
+                                        log_event("success", "sage_startup",
+                                                  "Sage RPC became available — resuming")
+                                        print("[Sage] RPC enabled — resuming", flush=True)
+                                        break
+                                    time.sleep(5)
+                                break  # exit the 36-attempt loop either way
                             time.sleep(5)
 
                         if not sage_running:
