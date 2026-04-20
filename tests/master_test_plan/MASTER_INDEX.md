@@ -113,6 +113,32 @@ executing. Cheap, broad, catches the "how did that even compile" class.
 | 2026-04-19 | 03-03 | `[x]` | 0021a80 | pair-switch: 17 tests — blocked while running (409), _active_cat updated, risk_manager.reset_session() called, DB fills preserved across all switches |
 | 2026-04-19 | 03-04/05/06 | `[x]` | f51a2d3 | coin prep lifecycle: 25 tests — trigger state (running/run_id/started_at/bot.stop), default preserves fills, soft reset clears running without touching DB, full_reset=True clears fills |
 | 2026-04-19 | 03-01 | `[x]` | 6697e0d | startup flow: 26 tests — check-resume (fresh/offers/running bot), session mode, Sage probe, CAT select, dashboard 200+keys, pre-start validation (CAT missing→400, valid→200) |
+| 2026-04-20 | 05-01 | `[x]` | live | startup guide card: checklist steps (Wallet/Trading Pair green, Settings/Coin Prep/Start amber), pair selector populates, Review Settings link |
+| 2026-04-20 | 05-02 | `[x]` | live | command centre: Start Bot/Stop/No Offers To Cancel, STOPPED badge, Synced+Sage+wallet chips, 7D 194.4 XCH / 30D 418.9 XCH live volumes |
+| 2026-04-20 | 05-03 | `[x]` | live | price chart: MID PRICE LAST 20 MINUTES with live data, "Samples every 5s · max 240 points" label |
+| 2026-04-20 | 05-04 | `[x]` | live | ACTIVE SETTINGS (Trading/Spreads/Inventory/Tiers/Safety PENDING states), MARKET HEALTH live (INNER 14.6%, MARKET 53.5%, 62 competitors, ARB GAP 20.0%, POOL DEPTH 1.16%) |
+| 2026-04-20 | 05-05 | `[x]` | live | settings trading pair card: Monkeyzoo Token / XCH confirmed, Change Trading Pair button, Live Controls link "adjustable while running" |
+| 2026-04-20 | 05-06 | `[x]` | live | reserves sliders: 5%/10%/25%/50% presets, live balances 128.4479 XCH / 753,298 MZ tokens shown |
+| 2026-04-20 | 05-07 | `[x]` | live | liquidity mode picker: Buy/Both/Sell radio cards visible and selectable |
+| 2026-04-20 | 05-08 | `[x]` | live | smart defaults: Conservative/Balanced/Aggressive risk profile selector, Smart Settings button visible |
+| 2026-04-20 | 05-09 | `[x]` | live | safety rails: Dry Run / Enable Buy Side / Enable Sell Side, Max Price Move, Dynamic Band, Step-Change Guard inputs visible |
+| 2026-04-20 | 05-10 | `[x]` | live | order book + offer sizing: Max Buy/Sell offers, Base Trade Size, Tiered Sizing + Reverse Buy Ladder checkboxes, tier size grid (Inner/Mid/Outer/Extreme) |
+| 2026-04-20 | 05-11 | `[x]` | live | bot operations: Sniper, Transaction Fees, Splash P2P, Coin Prep, Runtime Coin Health, Auto-Apply Sage Change Address flags; Topup Pool, Coin Prep Budget fields |
+| 2026-04-20 | 05-12 | `[x]` | live | settings footer: Export .env + Save & Continue buttons; Market Intelligence / DBX Rewards Max Spread; settings scroll 5711px total |
+| 2026-04-20 | 05-13 | `[x]` | live | P&L hero cards: SESSION/ROUND TRIPS/TOTAL FILLS/VOLUME TRADED/AVG PER RT/AVG FILL SIZE/BOUGHT/SOLD/NET FLOW all rendering |
+| 2026-04-20 | 05-14 | `[x]` | live | inventory gauge: Net Position 0.00 CAT, Position Limit 5.0 XCH, Neutral progress bar; POSITION DRIFT chart flat; CURRENT SPREADS live 8.8%/9.3% Dynamic+Inventory |
+| 2026-04-20 | 05-15 | `[x]` | live | reset flows: Reset Position modal ("clears fill records, cannot be undone" + Cancel/Reset); Reset All Stats modal ("Clear fills, round-trips, price history, inventory" + Cancel/Reset Everything) — both cancelled safely |
+| 2026-04-20 | 05-16 | `[x]` | live | offers: ORDER BOOK DEPTH (Buy: 0 offers, Sell: 0 offers), Active/History tabs with counts, Filter: All/Buy/Sell buttons all clickable |
+| 2026-04-20 | 05-17 | `[x]` | live | history tab: "Recent Activity (Last 20)" heading, Buy filter active, empty state "No fills in this session yet", Export Fills button visible |
+| 2026-04-20 | 05-18 | `[x]` | live | market intel: Dexie Orderbook (Buy 63.97 XCH/35 offers, Sell 426.92 XCH/27 offers live), TibetSwap Pool (121.30 XCH, 0.71% slippage), DBX Rewards, Spacescan Token Context |
+| 2026-04-20 | 05-19 | `[x]` | live | intel live data: INNER SPREAD 14.6%, MARKET SPREAD 53.5%, COMPETITORS 62 (both), ARB GAP 20.0% (amber), POOL DEPTH 1.16%, Splash P2P Offline/Installed 0.2.0 |
+| 2026-04-20 | 05-20 | `[x]` | live | logs: live circuit_breaker_tripped WARNINGs, "Load older (547 more)" button, API Stats modal (Spacescan 30/30 budget, Coinset Sage-compat, Dexie v3 cached), Clear button |
+| 2026-04-20 | 05-21 | `[x]` | live | startup modals: Risk Disclosure (4 risk cards + Continue/Close), Connect Wallet ("Sage is already open"), Splash P2P (Skip option), Spacescan (Use Free Tier) — full flow exercised on reload |
+| 2026-04-20 | 05-22 | `[x]` | live | coin prep: triggerCoinPrep() confirmed running via API (PID 191872, consolidating→splitting, progress 10%→30%), toast "Coin prep started!", reset via /api/coin-prep/reset success |
+| 2026-04-20 | 05-23 | `[x]` | live | cancel-all modal: OFFER CONTROL header, "Cancelling offers" title, progress bar, PROCESSED 0/0, FAILURES 0, Hide button; openCancelProgressModal() confirmed |
+| 2026-04-20 | 05-24 | `[x]` | live | reset modals: Reset All Stats confirmation (⚠ icon, Cancel/Reset Everything), Reset Position confirmation (↺ icon, Cancel/Reset) — both confirmed rendering, both cancelled |
+| 2026-04-20 | 05-25 | `[x]` | live | tab switching: all 6 views (dashboard/offers/pnl/intel/settings/logs) switch correctly via nav[0-5]; active class updates; onclick attrs mapped |
+| 2026-04-20 | 05-26 | `[x]` | live | chrome: .status-badge "◯ Stopped" confirmed, v4-titlebar pywebview-drag-region present, logs badge (counts to 59+), theme toggle dark↔light confirmed, Help modal (13 tabs), About modal (v0.4 changelog), Shutdown modal (cancel-offers checkbox + Go Back/Shutdown App) |
 
 ## Layer 2 — Unit test expansion (32 slices)
 
@@ -257,60 +283,60 @@ field persists, modals open and close, keyboard navigation works.
 ### Dashboard (4)
 | Slice | Title | Status | Note |
 |-------|-------|--------|------|
-| 05-01 | dashboard startup guide card + progression | `[ ]` | |
-| 05-02 | dashboard command centre panel (aggregated status) | `[ ]` | |
-| 05-03 | dashboard price chart (SSE updates, axis labels) | `[ ]` | |
-| 05-04 | dashboard live controls (sliders, requote, spreads) | `[ ]` | |
+| 05-01 | dashboard startup guide card + progression | `[x]` | 2026-04-20 live |
+| 05-02 | dashboard command centre panel (aggregated status) | `[x]` | 2026-04-20 live |
+| 05-03 | dashboard price chart (SSE updates, axis labels) | `[x]` | 2026-04-20 live |
+| 05-04 | dashboard live controls (sliders, requote, spreads) | `[x]` | 2026-04-20 live — ACTIVE SETTINGS + MARKET HEALTH verified; sliders only visible while bot running |
 
 ### Settings (8)
 | Slice | Title | Status | Note |
 |-------|-------|--------|------|
-| 05-05 | settings — trading pair card + change flow | `[ ]` | |
-| 05-06 | settings — reserves sliders + presets | `[ ]` | |
-| 05-07 | settings — liquidity mode picker end-to-end | `[ ]` | |
-| 05-08 | settings — smart defaults (risk profile × 3 + apply) | `[ ]` | |
-| 05-09 | settings — safety rails (dynamic band, step guard, min/max) | `[ ]` | |
-| 05-10 | settings — coin prep summary + preview | `[ ]` | |
-| 05-11 | settings — bot operations (sniper, fees, splash, coin prep flags) | `[ ]` | |
-| 05-12 | settings — save + export .env + pending-changes banner | `[ ]` | |
+| 05-05 | settings — trading pair card + change flow | `[x]` | 2026-04-20 live |
+| 05-06 | settings — reserves sliders + presets | `[x]` | 2026-04-20 live |
+| 05-07 | settings — liquidity mode picker end-to-end | `[x]` | 2026-04-20 live |
+| 05-08 | settings — smart defaults (risk profile × 3 + apply) | `[x]` | 2026-04-20 live |
+| 05-09 | settings — safety rails (dynamic band, step guard, min/max) | `[x]` | 2026-04-20 live |
+| 05-10 | settings — coin prep summary + preview | `[x]` | 2026-04-20 live |
+| 05-11 | settings — bot operations (sniper, fees, splash, coin prep flags) | `[x]` | 2026-04-20 live |
+| 05-12 | settings — save + export .env + pending-changes banner | `[x]` | 2026-04-20 live |
 
 ### PnL (3)
 | Slice | Title | Status | Note |
 |-------|-------|--------|------|
-| 05-13 | pnl — hero cards populate + flash on change | `[ ]` | |
-| 05-14 | pnl — inventory position gauge + drift chart | `[ ]` | |
-| 05-15 | pnl — reset position + reset all stats flows | `[ ]` | |
+| 05-13 | pnl — hero cards populate + flash on change | `[x]` | 2026-04-20 live |
+| 05-14 | pnl — inventory position gauge + drift chart | `[x]` | 2026-04-20 live |
+| 05-15 | pnl — reset position + reset all stats flows | `[x]` | 2026-04-20 live |
 
 ### Offers (2)
 | Slice | Title | Status | Note |
 |-------|-------|--------|------|
-| 05-16 | offers — active table + per-row cancel | `[ ]` | |
-| 05-17 | offers — history table + filters | `[ ]` | |
+| 05-16 | offers — active table + per-row cancel | `[x]` | 2026-04-20 live |
+| 05-17 | offers — history table + filters | `[x]` | 2026-04-20 live |
 
 ### Market Intel (2)
 | Slice | Title | Status | Note |
 |-------|-------|--------|------|
-| 05-18 | intel — market data panels | `[ ]` | |
-| 05-19 | intel — smart advisor suggestions | `[ ]` | |
+| 05-18 | intel — market data panels | `[x]` | 2026-04-20 live |
+| 05-19 | intel — smart advisor suggestions | `[x]` | 2026-04-20 live — live orderbook data confirmed |
 
 ### Logs (1)
 | Slice | Title | Status | Note |
 |-------|-------|--------|------|
-| 05-20 | logs — live feed, filters, export | `[ ]` | |
+| 05-20 | logs — live feed, filters, export | `[x]` | 2026-04-20 live |
 
 ### Modals + overlays (4)
 | Slice | Title | Status | Note |
 |-------|-------|--------|------|
-| 05-21 | startup modals — risk disclosure, Sage connect, wallet picker, splash, spacescan | `[ ]` | |
-| 05-22 | coin-prep modal — confirm, progress, complete, error, history-choice | `[ ]` | |
-| 05-23 | cancel-all modal + compensating cancel | `[ ]` | |
-| 05-24 | reset modals — reset position, reset all stats | `[ ]` | |
+| 05-21 | startup modals — risk disclosure, Sage connect, wallet picker, splash, spacescan | `[x]` | 2026-04-20 live |
+| 05-22 | coin-prep modal — confirm, progress, complete, error, history-choice | `[x]` | 2026-04-20 live — real prep ran on test wallet (consolidate→split); reset cleanly |
+| 05-23 | cancel-all modal + compensating cancel | `[x]` | 2026-04-20 live |
+| 05-24 | reset modals — reset position, reset all stats | `[x]` | 2026-04-20 live |
 
 ### Navigation + chrome (2)
 | Slice | Title | Status | Note |
 |-------|-------|--------|------|
-| 05-25 | v4 tab switching (dashboard/offers/pnl/intel/settings/logs) | `[ ]` | |
-| 05-26 | titlebar + status badge + notification badges | `[ ]` | |
+| 05-25 | v4 tab switching (dashboard/offers/pnl/intel/settings/logs) | `[x]` | 2026-04-20 live |
+| 05-26 | titlebar + status badge + notification badges | `[x]` | 2026-04-20 live |
 
 ## Layer 6 — Live-fire scenarios (12 slices)
 
