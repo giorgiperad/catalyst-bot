@@ -1192,6 +1192,7 @@ def serve_brand_asset(filename: str):
         "MonkeyZoo_Logo.png",
         "monkeyzoo-logo-1.gif",
         "spacescan-logo-192.webp",
+        "sage_rpc_advanced.png",
     }
     if filename not in allowed:
         return Response("Not Found", status=404, mimetype="text/plain")

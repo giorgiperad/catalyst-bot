@@ -30360,10 +30360,12 @@ async function startupSelectFingerprint(fingerprint, cardEl) {
 
 function startupShowRpcDisabled() {
     startupSetPhase('rpc_disabled', 'RPC Not Enabled', 'Sage is open but its RPC server is off', '');
-    startupShowProgress(10);
     document.getElementById('startupProgressTrack').style.display = 'none';
     document.getElementById('startupFpSection').style.display = 'none';
     document.getElementById('startupStartingFeedback').style.display = 'none';
+    document.getElementById('startupTitle').style.display = 'none';
+    document.getElementById('startupSubtitle').style.display = 'none';
+    startupSetDisclosureExtraInfoVisible(false);  // hide Sage chip + What is Sage card
     document.getElementById('startupRpcDisabledSection').style.display = 'block';
     document.getElementById('startupRpcDisabledStatus').textContent = '';
     const btn = document.getElementById('startupRpcRescanBtn');
