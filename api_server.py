@@ -7828,13 +7828,26 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
 
     # ═══ Fee estimation (Coinset) ═══
     # Use Coinset to estimate realistic fee coin sizes rather than hard-coded defaults.
-    # Target 120s confirmation; also fetch 60s to catch congestion spikes.
     # Fee coin size must comfortably exceed the fee so change can recycle.
+    #
+    # F82 (2026-04-20): target-seconds is now risk-profile driven (was
+    # hardcoded 120s). Conservative waits longer (cheaper fees, tolerates
+    # slower confirms), aggressive pays for speed (higher fees, rapid
+    # refresh). Also fetch a one-tier-faster quote to catch congestion
+    # spikes — ``tx_fees`` takes the max of the two so the fee coin size
+    # covers a sudden mempool surge.
+    if _risk_profile_name == "conservative":
+        _fee_target_secs = 300
+    elif _risk_profile_name == "aggressive":
+        _fee_target_secs = 60
+    else:
+        _fee_target_secs = 120
+    _fee_spike_secs = max(30, int(_fee_target_secs / 2))
     try:
         from tx_fees import get_suggested_transaction_fee
-        # Typical CAT spend ~35M cost units; target 120s for normal market-making pace
-        _fee_est = get_suggested_transaction_fee(target_seconds=120, cost=35_000_000)
-        _fee_est_60 = get_suggested_transaction_fee(target_seconds=60, cost=35_000_000)
+        # Typical CAT spend ~35M cost units.
+        _fee_est = get_suggested_transaction_fee(target_seconds=_fee_target_secs, cost=35_000_000)
+        _fee_est_60 = get_suggested_transaction_fee(target_seconds=_fee_spike_secs, cost=35_000_000)
         if _fee_est.get("available"):
             _fee_mojos = int(_fee_est.get("fee_mojos", 0) or 0)
             _fee_mojos_60 = int(_fee_est_60.get("fee_mojos", 0) or 0)
@@ -7855,7 +7868,9 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
                 getattr(cfg, "TRANSACTION_FEE_XCH", Decimal("0.000001"))
             )
             messages.append(
-                f"Fee (Coinset, 60s peak): {_peak_fee_xch:.8f} XCH → coin size {_fee_coin_size:.4f} XCH"
+                f"Fee (Coinset, {_fee_target_secs}s target / {_fee_spike_secs}s peak, "
+                f"{_risk_profile_name}): {_peak_fee_xch:.8f} XCH "
+                f"→ coin size {_fee_coin_size:.4f} XCH"
             )
         else:
             # Coinset unavailable — preserve existing values
@@ -8144,7 +8159,15 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
     # densest counts move to the smallest-size positions.  Effective buy
     # weighting therefore uses count_dist applied in reverse against size_mults.
     # In normal mode this collapses to the same value as _TIER_AVG.
-    _buy_ladder_reversed = bool(getattr(cfg, "BUY_LADDER_REVERSED", False))
+    # F82 (2026-04-20): Smart Settings always recommends reverse-buy ON (see
+    # ``"buy_ladder_reversed": True`` in the response ~line 9611, set by F78).
+    # Force the internal computation to match so the returned sizes are
+    # position-indexed under reverse=True and consistent with the returned
+    # flag. Previously this read cfg.BUY_LADDER_REVERSED, so when cfg was
+    # already True the sizes were computed reversed but the frontend did an
+    # extra swap on top, flipping them to the wrong orientation. Sell-only
+    # mode has no buy ladder so the flag is forced False there at line ~9798.
+    _buy_ladder_reversed = (liquidity_mode != "sell_only")
     _BUY_TIER_AVG = (
         sum(_count_dist[3 - i] * _size_mults[i] for i in range(4))
         if _buy_ladder_reversed else _TIER_AVG
@@ -9510,7 +9533,21 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
         # Auto-Requote
         "auto_requote": True,
         "requote_bps": int(round(requote_bps)),
-        "requote_cooldown": 60,
+        # F82 (2026-04-20): requote cooldown derived from fill frequency
+        # + volatility + risk profile (was hardcoded 60s).
+        # Base anchors on fill rate — busy markets need faster refresh
+        # (30s), quiet markets avoid churn (90s). Volatile regimes widen
+        # 25% so offers ride through noise. spread_step_mult applies the
+        # risk bias (conservative +20% cooldown = less churn, aggressive
+        # -15% = chase price). Clamped 20–180s.
+        "requote_cooldown": max(20, min(180, int(round(
+            (30 if fills_per_day > 10 else
+             45 if fills_per_day > 3 else
+             60 if fills_per_day > 1 else
+             90)
+            * (1.25 if regime in ("extreme", "volatile") else 1.0)
+            * _rp["spread_step_mult"]
+        )))),
         "requote_batch_size": requote_batch_size,
 
         # Safety & Limits (reserves intentionally excluded — user's choice)
@@ -9559,6 +9596,11 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
         "transaction_fee_xch": _smart_fee_xch,
         "fee_coin_size_xch": _fee_coin_size,
         "fee_prep_count": _fee_prep_count,
+        # F82 (2026-04-20): target confirmation window drives the runtime
+        # fee estimator in ``tx_fees.py``. Risk-profile scaled:
+        # conservative=300s (cheapest), balanced=120s, aggressive=60s
+        # (fastest).
+        "transaction_fee_target_secs": _fee_target_secs,
 
         # F49 (2026-04-09): two-tier reserve — topup pool allocation
         # F55 (2026-04-09): use the FINAL adjusted `_topup_buffer_xch`
@@ -9658,8 +9700,36 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
         "sniper_enabled": getattr(cfg, "SNIPER_ENABLED", True),
         "sniper_size_xch": _smart_sniper_size,
         "sniper_prep_count": _smart_sniper_prep,
-        "sniper_rearm_price_move_bps": getattr(cfg, "SNIPER_REARM_PRICE_MOVE_BPS", 100),
-        "sniper_rearm_gap_move_bps": getattr(cfg, "SNIPER_REARM_GAP_MOVE_BPS", 100),
+        # F82 (2026-04-20): derive re-arm thresholds from the same market
+        # signals that drive the main requote step — stops Smart Settings
+        # passing through a bad .env value (e.g. 0%, which makes sniper
+        # re-arm on every price tick → review-settings warning & thrash).
+        #
+        # Price-move trigger: how far the mid must move before the previous
+        # probe's pricing is stale. Anchor at 40% of base_spread — smaller
+        # than the main requote (60%) because sniper probes are
+        # expendable and benefit from faster refresh.
+        #
+        # Gap-move trigger: how far the dex/tibet arb gap must shift
+        # before the edge is worth re-probing. Anchor at 50% of
+        # arb_alert_threshold so re-arm fires at roughly half the
+        # alert-worthy gap.
+        #
+        # Volatility widen + spread_step_mult are reused from the requote
+        # logic so conservative/balanced/aggressive behave consistently
+        # across all three step-size knobs. Clamped to 50–500 bps
+        # (0.5%–5%): floor stops the 0% bug, ceiling keeps probes
+        # responsive on thin-liquidity tokens.
+        "sniper_rearm_price_move_bps": int(round(max(50, min(500,
+            base_spread_bps * 0.40
+            * (1.15 if regime in ("extreme", "volatile") else 1.0)
+            * _rp["spread_step_mult"]
+        )))),
+        "sniper_rearm_gap_move_bps": int(round(max(50, min(500,
+            arb_alert_threshold_bps * 0.50
+            * (1.15 if regime in ("extreme", "volatile") else 1.0)
+            * _rp["spread_step_mult"]
+        )))),
         "splash_enabled": cfg.SPLASH_ENABLED,
         "enable_coin_prep": cfg.ENABLE_COIN_PREP,
         "enable_runtime_coin_health": cfg.ENABLE_RUNTIME_COIN_HEALTH,
@@ -11844,6 +11914,52 @@ def api_coin_prep_trigger():
                     _coin_prep_state["phase"] = "complete"
                     prep_succeeded = True
                     log_event("info", "coin_prep_complete", "Coin prep finished successfully")
+                    # F82 (2026-04-20): push a coin_update SSE event so the
+                    # Command Centre tier-group card renders the fresh coin
+                    # inventory immediately. Without this the GUI only
+                    # shows live counts when the bot is running — the user
+                    # sees blank tier groups for the entire "coins ready,
+                    # bot not yet started" window. The worker writes the
+                    # designated/assigned_tier rows to the DB before exit,
+                    # so querying here reflects the final prep state.
+                    try:
+                        from database import (
+                            get_coin_summary as _gcs,
+                            get_live_tier_group_counts as _gltgc,
+                        )
+                        _summary = _gcs() or {}
+                        _tier_counts = _gltgc()
+                        _tier_counts["enabled"] = bool(
+                            getattr(cfg, "TIER_ENABLED", False)
+                        )
+                        _xch_locked_mojos = int(_summary.get("xch_locked_mojos", 0) or 0)
+                        _cat_locked_mojos = int(_summary.get("cat_locked_mojos", 0) or 0)
+                        _cat_dec = int(
+                            _active_cat.get("decimals")
+                            or getattr(cfg, "CAT_DECIMALS", 3)
+                            or 3
+                        )
+                        events.emit("coin_update", {
+                            "reason": "coin_prep_complete",
+                            "xch_free": int(_summary.get("xch_free_count", 0) or 0),
+                            "xch_locked": int(_summary.get("xch_locked_count", 0) or 0),
+                            "xch_total": int(_summary.get("xch_total", 0) or 0),
+                            "cat_free": int(_summary.get("cat_free_count", 0) or 0),
+                            "cat_locked": int(_summary.get("cat_locked_count", 0) or 0),
+                            "cat_total": int(_summary.get("cat_total", 0) or 0),
+                            "xch_locked_amount": (
+                                f"{_xch_locked_mojos / 1e12:.4f}"
+                                if _xch_locked_mojos > 0 else "0"
+                            ),
+                            "cat_locked_amount": (
+                                f"{_cat_locked_mojos / (10 ** _cat_dec):.{_cat_dec}f}"
+                                if _cat_locked_mojos > 0 else "0"
+                            ),
+                            "tier_counts": _tier_counts,
+                        })
+                    except Exception as _e:
+                        log_event("debug", "coin_prep_emit_failed",
+                                  f"Post-prep coin_update emit failed (non-critical): {_e}")
                 else:
                     _coin_prep_state["complete"] = False
                     _coin_prep_state["phase"] = "error"

@@ -16576,20 +16576,17 @@
                     _setBuy('configBuyMidSizeXch',     _buyMid);
                     _setBuy('configBuyOuterSizeXch',   _buyOuter);
                     _setBuy('configBuyExtremeSizeXch', _buyExt);
-                    // Smart settings always returns sizes in natural position order
-                    // (inner = largest). If the Reverse Buy Ladder toggle is ON the
-                    // sizes must be swapped so inner shows the smallest value, matching
-                    // the "small near price" orientation. This mirrors what
-                    // handleReverseLadderToggle does on a manual click.
-                    if (document.getElementById('configBuyLadderReversed')?.checked) {
-                        const _swapBuy = (idA, idB) => {
-                            const a = document.getElementById(idA);
-                            const b = document.getElementById(idB);
-                            if (a && b) { const t = a.value; a.value = b.value; b.value = t; }
-                        };
-                        _swapBuy('configBuyInnerSizeXch',   'configBuyExtremeSizeXch');
-                        _swapBuy('configBuyMidSizeXch',     'configBuyOuterSizeXch');
-                    }
+                    // F82 (2026-04-20): Smart Settings returns POSITION-INDEXED
+                    // sizes already consistent with the returned reverse flag
+                    // (buy_ladder_reversed: True ⇒ buy_inner_size_xch is the
+                    // SMALLEST value, as it's the size at inner POSITION under
+                    // reverse-buy). Apply the API values as-is — no swap.
+                    //
+                    // The previous code re-swapped inner↔extreme when the
+                    // checkbox was ticked, which double-transformed the values
+                    // whenever the current .env already had reverse=True.
+                    // Net effect was the toggle appeared backwards: ticked gave
+                    // the non-reversed layout, unticked gave the reversed one.
                     // Snapshot the final toggle state (post-swap) as the new
                     // "last optimised orientation" and clear the rerun hint.
                     window._smartSettingsToggleState = document.getElementById('configBuyLadderReversed')?.checked;
@@ -17910,20 +17907,69 @@
         // masking manual tweaks).
         function handleReverseLadderToggle() {
             // When the reverse-buy toggle changes, swap the buy-side size
-            // and count inputs (inner↔extreme, mid↔outer) so the values
-            // stay correct for the new orientation. Every toggle is a swap
-            // — it doesn't matter whether we're going on→off or off→on.
-            const _swap = (idA, idB) => {
-                const a = document.getElementById(idA);
-                const b = document.getElementById(idB);
-                if (a && b) { const t = a.value; a.value = b.value; b.value = t; }
+            // inputs (inner↔extreme, mid↔outer) so the values stay correct
+            // for the new orientation — counts stay positional (inner/mid/
+            // outer/extreme always mean the same position regardless of
+            // orientation). Every toggle is a swap.
+            //
+            // F82 (2026-04-20): after the swap, RESCALE the buy-side sizes so
+            // the total XCH committed by the buy ladder (and its coin-prep
+            // budget) stays the same as before the toggle. A raw swap leaves
+            // the shape flipped but changes the total dramatically because
+            // position counts are heavily weighted toward inner (42/30/20/8
+            // ratio) — swapping sizes without rescaling shifts ~half the
+            // capital between orientations, which breaks the coin prep budget.
+            const _getV = id => {
+                const v = parseFloat(document.getElementById(id)?.value);
+                return (isFinite(v) && v > 0) ? v : 0;
             };
-            // Swap buy-side sizes only — counts stay positional (inner/mid/outer/extreme
-            // always mean the same position regardless of orientation). The preview
-            // function (_flipSlotToSize) already handles position→size conversion
-            // accounting for orientation, so swapping counts here would double-transform.
-            _swap('configBuyInnerSizeXch',   'configBuyExtremeSizeXch');
-            _swap('configBuyMidSizeXch',     'configBuyOuterSizeXch');
+            const _getN = id => {
+                const n = parseInt(document.getElementById(id)?.value);
+                return (isFinite(n) && n > 0) ? n : 0;
+            };
+            // Effective buy-side counts = live tier counts + spare counts.
+            // Prefer the XCH (buy) row; fall back to the sell row when the
+            // per-side XCH row is blank (legacy configs).
+            const _nLive = (xchId, legacyId) => _getN(xchId) || _getN(legacyId);
+            const cI = _nLive('configInnerTierCountXch',   'configInnerTierCount')
+                     + _nLive('configInnerTierSpareCountXch','configInnerTierSpareCount');
+            const cM = _nLive('configMidTierCountXch',     'configMidTierCount')
+                     + _nLive('configMidTierSpareCountXch',  'configMidTierSpareCount');
+            const cO = _nLive('configOuterTierCountXch',   'configOuterTierCount')
+                     + _nLive('configOuterTierSpareCountXch','configOuterTierSpareCount');
+            const cE = _nLive('configExtremeTierCountXch', 'configExtremeTierCount')
+                     + _nLive('configExtremeTierSpareCountXch','configExtremeTierSpareCount');
+
+            const oldI = _getV('configBuyInnerSizeXch');
+            const oldM = _getV('configBuyMidSizeXch');
+            const oldO = _getV('configBuyOuterSizeXch');
+            const oldE = _getV('configBuyExtremeSizeXch');
+            const oldTotal = cI*oldI + cM*oldM + cO*oldO + cE*oldE;
+
+            // Swap sizes (inner↔extreme, mid↔outer)
+            const newI = oldE, newM = oldO, newO = oldM, newE = oldI;
+            const newPreTotal = cI*newI + cM*newM + cO*newO + cE*newE;
+
+            // Rescale to preserve total committed XCH. When counts or sizes
+            // are missing (e.g. form partially populated), skip rescale and
+            // just apply the bare swap.
+            let scale = 1.0;
+            if (oldTotal > 0 && newPreTotal > 0) {
+                scale = oldTotal / newPreTotal;
+            }
+            const _setV = (id, v) => {
+                const el = document.getElementById(id);
+                if (el) el.value = (v > 0 ? v.toFixed(4) : '');
+            };
+            _setV('configBuyInnerSizeXch',   newI * scale);
+            _setV('configBuyMidSizeXch',     newM * scale);
+            _setV('configBuyOuterSizeXch',   newO * scale);
+            _setV('configBuyExtremeSizeXch', newE * scale);
+
+            // Clear the Smart Settings buy-size stash since the form now
+            // reflects a user-driven orientation change, not the last Smart
+            // Settings snapshot.
+            window._smartBuySizes = null;
             // In auto-spare mode, recalculate with the new sizes.
             // In custom mode (set by Smart Settings), keep existing spare values
             // and show an inline reminder to re-run Smart Settings instead —
