@@ -9516,6 +9516,16 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
     # display only; the save path still × 100 (unchanged) — which together
     # round-trips correctly. Direct API callers can apply the response
     # straight to /api/config without conversion now.
+    #
+    # Sniper auto-enable: when Smart Settings has allocated a real sniper
+    # pool in two-sided mode (pool budget was already carved before
+    # trading_xch so totals fit), turn the feature on. See the matching
+    # "Bot Operations" block below for the rationale.
+    _sniper_auto = (
+        liquidity_mode == "two_sided"
+        and float(_smart_sniper_size or 0) > 0
+        and int(_smart_sniper_prep or 0) > 0
+    )
     result = {
         # Smart Pricing
         "dynamic_spread_enabled": has_both_prices,
@@ -9697,7 +9707,21 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
         "_capital_plan": _capital_plan,
 
         # Bot Operations
-        "sniper_enabled": getattr(cfg, "SNIPER_ENABLED", True),
+        # Smart Settings sizes a sniper pool (_smart_sniper_size /
+        # _smart_sniper_prep are carved BEFORE _trading_xch, so the pool
+        # always fits within the wallet). Previously this field was
+        # `getattr(cfg, "SNIPER_ENABLED", True)` — a pass-through from the
+        # current config. If the user had ever toggled sniper off, Smart
+        # Settings kept emitting sniper_enabled=False even while still
+        # allocating the pool sizing, so the GUI preview hid the row and
+        # coin prep never built the tier. Auto-enable whenever there's a
+        # real pool to prepare (two_sided mode, size>0, count>0); single-
+        # sided modes leave it off (sniper needs both sides). Users can
+        # still uncheck the box after Smart Settings runs if they want it
+        # off — a subsequent Smart Settings click will re-enable it, but
+        # that's the point of Smart Settings. `_sniper_auto` is computed
+        # just above the `result = {…}` dict literal (see a few lines up).
+        "sniper_enabled": bool(_sniper_auto),
         "sniper_size_xch": _smart_sniper_size,
         "sniper_prep_count": _smart_sniper_prep,
         # F82 (2026-04-20): derive re-arm thresholds from the same market
