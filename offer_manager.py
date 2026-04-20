@@ -1381,8 +1381,51 @@ class OfferManager:
                     net_pos_xch = abs(net_pos_cat) * mid_price
                 else:
                     net_pos_xch = Decimal("0")
-                # Project the position INCREASE if all these offers fill
-                projected_increase_xch = (default_size or Decimal("0")) * Decimal(num)
+                # Project the position INCREASE if all these offers fill.
+                # Use the REAL tier-summed ladder value when tiered sizing is
+                # on (the old `default_size × num` proxy over- or under-counts
+                # depending on which tier DEFAULT_TRADE_XCH lands on, and that
+                # drift was making the guard fire on legitimate ladders).
+                projected_increase_xch = self._estimate_ladder_worst_case_xch(
+                    side=side,
+                    num=num,
+                    slot_start=slot_start,
+                    total_slots=total_slots if total_slots is not None else num,
+                    slot_sequence=slot_sequence,
+                    risk_manager=risk_manager,
+                    default_size=default_size,
+                )
+
+                # Self-heal: if MAX_POSITION_XCH was set too low relative to
+                # the designed ladder (e.g. smart-defaults ran before the
+                # consistency clamp existed, or operator set it manually),
+                # the guard would block every ladder creation forever. Detect
+                # that case at net_pos≈0 and raise the session hard limit to
+                # the designed ladder + 5%. Log once per side. Smart Settings
+                # now emits a consistent MAX_POSITION_XCH so this only kicks
+                # in for legacy configs.
+                if (
+                    projected_increase_xch > hard_pos_xch
+                    and max_pos_xch > 0
+                    and net_pos_xch < max_pos_xch * Decimal("0.05")
+                ):
+                    _healed = projected_increase_xch * Decimal("1.05")
+                    if _healed > hard_pos_xch:
+                        if not getattr(self, "_max_pos_warned", False):
+                            log_event(
+                                "warning",
+                                "max_position_auto_raised",
+                                f"MAX_POSITION_XCH={max_pos_xch} XCH is inconsistent "
+                                f"with the configured ladder "
+                                f"(side={side}, num={num}, designed worst-case "
+                                f"{projected_increase_xch:.4f} XCH > hard limit "
+                                f"{hard_pos_xch:.4f} XCH). Session hard limit "
+                                f"auto-raised to {_healed:.4f} XCH so the bot "
+                                f"can operate. Re-run Smart Settings to persist "
+                                f"a consistent MAX_POSITION_XCH."
+                            )
+                            self._max_pos_warned = True
+                        hard_pos_xch = _healed
 
                 # F69 (2026-04-17): net out already-open same-side exposure.
                 # A REQUOTE (or top-up of an existing ladder) cancels N existing
@@ -1985,6 +2028,51 @@ class OfferManager:
             created.append(offer_detail)
 
         return created
+
+    def _estimate_ladder_worst_case_xch(
+        self,
+        side: str,
+        num: int,
+        slot_start: int,
+        total_slots: int,
+        slot_sequence: Optional[List[int]],
+        risk_manager,
+        default_size: Optional[Decimal],
+    ) -> Decimal:
+        """Sum of per-slot tier sizes for the slots this call will create.
+
+        Used by the F25 position hard guard to decide whether the full
+        ladder, if all filled, would exceed MAX_POSITION_XCH × 1.1. The
+        prior implementation used `default_size × num` which silently
+        under- or over-counted depending on which tier DEFAULT_TRADE_XCH
+        happened to map to — with reverse-buy on, that drifted enough
+        to block legitimate initial ladders. Summing the actual tier
+        sizes each slot will use eliminates the drift.
+
+        Falls back to `default_size × num` when tiered sizing is off or
+        the tier-size lookup fails, so the guard never becomes blind.
+        """
+        fallback = (default_size or Decimal("0")) * Decimal(num)
+        if not cfg.TIER_ENABLED or risk_manager is None:
+            return fallback
+        total = Decimal("0")
+        for i in range(num):
+            if slot_sequence is not None:
+                slot = slot_sequence[i]
+            else:
+                slot = slot_start + i
+            tier = self._classify_tier(slot, total_slots, side=side)
+            try:
+                sz = risk_manager.get_tier_size(tier, side=side)
+            except Exception:
+                sz = default_size or Decimal("0")
+            if sz is None:
+                sz = default_size or Decimal("0")
+            try:
+                total += Decimal(str(sz))
+            except Exception:
+                total += default_size or Decimal("0")
+        return total if total > 0 else fallback
 
     def _get_ladder_price(self, slot: int, side: str, mid_price: Decimal,
                            half_spread: Decimal, max_offers: int) -> Optional[Decimal]:

@@ -9886,6 +9886,58 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
         ]
         print("[SMART_DEFAULTS] liquidity_mode=sell_only — zeroed buy-side fields")
 
+    # ── UNIVERSAL MAX_POSITION_XCH CONSISTENCY CLAMP ──────────────────────
+    # The position hard guard in offer_manager.create_ladder() refuses to
+    # create a ladder whose projected XCH exposure would exceed
+    # MAX_POSITION_XCH × 1.1. Smart Defaults derives MAX_POSITION_XCH from
+    # wallet-size percentages (risk_level × position_mult) while the ladder
+    # is sized independently from the trading budget — those two can
+    # disagree, and when they do the bot blocks its own first cycle with
+    # `position_hard_guard_blocked`.
+    #
+    # Raise MAX_POSITION_XCH to cover the WORST CASE of:
+    #   1. buy-side tier-summed ladder value   (all buys fill → long)
+    #   2. sell-side tier-summed ladder value  (all sells fill → short)
+    #   3. default_trade_xch × max_active_buy  (guard's current naive proxy)
+    #   4. default_trade_xch × max_active_sell
+    # Dividing by 0.9 gives the 1.1× hard limit ~22% headroom over the
+    # ladder worst-case, so ordinary operation stays well clear of the
+    # guard. The existing buy_only/sell_only post-process branches apply a
+    # similar clamp for single-sided modes; this catches the default
+    # both-sides path which previously had no such check.
+    try:
+        import math as _math_mp
+        _buy_ladder_xch = 0.0
+        _sell_ladder_xch = 0.0
+        for _t in ("inner", "mid", "outer", "extreme"):
+            _bs = result.get(f"buy_{_t}_size_xch") or 0
+            _bc = result.get(f"buy_{_t}_tier_count") or 0
+            _buy_ladder_xch += float(_bs) * float(_bc)
+            _ss = result.get(f"sell_{_t}_size_xch") or 0
+            _sc = result.get(f"sell_{_t}_tier_count") or 0
+            _sell_ladder_xch += float(_ss) * float(_sc)
+        _dts = float(result.get("default_trade_xch") or 0)
+        _mab = float(result.get("max_active_buy") or 0)
+        _mas = float(result.get("max_active_sell") or 0)
+        _worst = max(_buy_ladder_xch, _sell_ladder_xch, _dts * _mab, _dts * _mas)
+        if _worst > 0:
+            _min_pos = round(_math_mp.ceil(_worst / 0.9 * 10) / 10, 1)
+            _cur = float(result.get("max_position_xch") or 0)
+            if _cur < _min_pos:
+                result["max_position_xch"] = _min_pos
+                result.setdefault("messages", []).append(
+                    f"MAX_POSITION_XCH raised {_cur} → {_min_pos} XCH so the "
+                    f"position guard's 1.1× hard limit covers the full "
+                    f"ladder (worst-case fill = {_worst:.2f} XCH)."
+                )
+                print(f"[SMART_DEFAULTS] Max position consistency clamp: "
+                      f"{_cur} → {_min_pos} XCH "
+                      f"(worst-case ladder {_worst:.2f} XCH, "
+                      f"buy={_buy_ladder_xch:.2f} sell={_sell_ladder_xch:.2f} "
+                      f"guard_buy={_dts * _mab:.2f} guard_sell={_dts * _mas:.2f})")
+    except Exception as _mp_err:
+        print(f"[SMART_DEFAULTS] Max position consistency clamp skipped: {_mp_err}")
+
     return jsonify(result)
 
 
