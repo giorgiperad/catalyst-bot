@@ -31438,6 +31438,63 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 
+
+// ============================================================
+// Input field right-click context menu (Copy / Paste / Cut)
+// PyWebView/WebView2 disables the native context menu by default.
+// This restores it for all <input> and <textarea> elements.
+// ============================================================
+(function () {
+    const _menu = document.createElement('div');
+    _menu.id = '_inputCtxMenu';
+    _menu.style.cssText = [
+        'position:fixed;z-index:999999;display:none',
+        'background:#1e293b;border:1px solid rgba(255,255,255,0.12)',
+        'border-radius:8px;padding:4px 0;box-shadow:0 8px 24px rgba(0,0,0,0.5)',
+        'min-width:120px;font-size:13px;font-family:inherit',
+    ].join(';');
+    document.body.appendChild(_menu);
+
+    let _ctxTarget = null;
+
+    function _hide() { _menu.style.display = 'none'; _ctxTarget = null; }
+
+    function _item(label, action) {
+        const el = document.createElement('div');
+        el.textContent = label;
+        el.style.cssText = 'padding:7px 14px;cursor:pointer;color:#cbd5e1;white-space:nowrap';
+        el.onmouseenter = () => { el.style.background = 'rgba(255,255,255,0.07)'; };
+        el.onmouseleave = () => { el.style.background = ''; };
+        el.onmousedown = (e) => { e.preventDefault(); action(); _hide(); };
+        return el;
+    }
+
+    _menu.appendChild(_item('Cut',   () => { if (_ctxTarget) { _ctxTarget.focus(); document.execCommand('cut'); } }));
+    _menu.appendChild(_item('Copy',  () => { if (_ctxTarget) { _ctxTarget.focus(); document.execCommand('copy'); } }));
+    _menu.appendChild(_item('Paste', () => { if (_ctxTarget) { _ctxTarget.focus(); document.execCommand('paste'); } }));
+
+    document.addEventListener('contextmenu', (e) => {
+        const t = e.target;
+        if (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA') {
+            e.preventDefault();
+            _ctxTarget = t;
+            // Position near cursor, keep inside viewport
+            const x = Math.min(e.clientX, window.innerWidth  - 140);
+            const y = Math.min(e.clientY, window.innerHeight - 110);
+            _menu.style.left = x + 'px';
+            _menu.style.top  = y + 'px';
+            _menu.style.display = 'block';
+        } else {
+            _hide();
+        }
+    });
+
+    document.addEventListener('mousedown', (e) => {
+        if (!_menu.contains(e.target)) _hide();
+    });
+    document.addEventListener('scroll', _hide, true);
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') _hide(); });
+})();
 </script>
 </body>
 </html>
