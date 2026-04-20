@@ -7485,6 +7485,33 @@
                 </div>
             </div>
 
+            <!-- RPC disabled: Sage is open but RPC server is off -->
+            <div id="startupRpcDisabledSection" style="display: none;">
+                <div style="margin-top: 12px; padding: 16px; background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.25); border-radius: 10px; text-align: left;">
+                    <div style="color: var(--warning-300); font-weight: 700; font-size: 14px; margin-bottom: 10px;">Sage RPC Server Is Not Enabled</div>
+                    <div style="color: var(--slate-300); font-size: 13px; line-height: 1.65; margin-bottom: 12px;">
+                        Sage is open but its RPC server is off — this app can't connect without it.<br>
+                        In Sage, follow these steps:
+                    </div>
+                    <ol style="color: var(--slate-300); font-size: 13px; line-height: 2; margin: 0 0 14px 18px; padding: 0;">
+                        <li>Open <strong style="color: var(--slate-100);">Settings</strong> (gear icon)</li>
+                        <li>Go to the <strong style="color: var(--slate-100);">Advanced</strong> tab</li>
+                        <li>Under <strong style="color: var(--slate-100);">RPC Server</strong> click <strong style="color: var(--slate-100);">Start</strong></li>
+                        <li>Enable <strong style="color: var(--slate-100);">Run on Startup</strong> so it stays on after restarts</li>
+                    </ol>
+                    <img src="/assets/sage_rpc_advanced.png" alt="Sage Advanced settings showing RPC Server Start button and Run on Startup toggle"
+                         style="width: 100%; border-radius: 8px; border: 1px solid rgba(255,255,255,0.1); margin-bottom: 14px; display: block;">
+                    <div style="color: var(--slate-500); font-size: 12px; margin-bottom: 14px;">
+                        Once the RPC server is running, click Rescan below and this app will connect automatically.
+                    </div>
+                    <button id="startupRpcRescanBtn" onclick="startupRpcRescan()"
+                            style="width: 100%; padding: 13px 18px; background: linear-gradient(135deg, var(--status-success), var(--success-600)); border: none; color: white; border-radius: 10px; cursor: pointer; font-size: 14px; font-weight: 700;">
+                        Rescan
+                    </button>
+                    <div id="startupRpcDisabledStatus" style="color: var(--slate-400); font-size: 12px; margin-top: 8px; min-height: 18px;"></div>
+                </div>
+            </div>
+
             <!-- Sage change-address recommendation (shown after wallet selection, before Splash) -->
             <div id="startupChangeAddressSection" style="display: none;">
                 <div style="margin-top: 12px; padding: 18px; background: rgba(6,182,212,0.08); border: 1px solid rgba(6,182,212,0.22); border-radius: 12px; text-align: left;">
@@ -29346,6 +29373,7 @@ function startupShowVersionUnsupported(sageVersion, minimumVersion, reason) {
     document.getElementById('startupFpSection').style.display = 'none';
     document.getElementById('startupStartingFeedback').style.display = 'none';
     document.getElementById('startupCertSection').style.display = 'none';
+    document.getElementById('startupRpcDisabledSection').style.display = 'none';
     document.getElementById('startupNotInstalledSection').style.display = 'none';
     if (updateEl) updateEl.style.display = 'none';
     if (section) section.style.display = 'block';
@@ -29439,6 +29467,7 @@ function startupShowRiskDisclosure() {
         'startupFpSection',
         'startupStartingFeedback',
         'startupCertSection',
+        'startupRpcDisabledSection',
         'startupNotInstalledSection',
         'startupVersionUpdateSection',
         'startupVersionUnsupportedSection',
@@ -29756,6 +29785,7 @@ async function startupMaybeShowChangeAddressPrompt() {
     document.getElementById('startupFpSection').style.display = 'none';
     document.getElementById('startupStartingFeedback').style.display = 'none';
     document.getElementById('startupCertSection').style.display = 'none';
+    document.getElementById('startupRpcDisabledSection').style.display = 'none';
     document.getElementById('startupNotInstalledSection').style.display = 'none';
     document.getElementById('startupVersionUpdateSection').style.display = 'none';
     startupHideVersionUnsupported();
@@ -30157,6 +30187,8 @@ async function startupBegin() {
     if (versionUnsupported) versionUnsupported.style.display = 'none';
     const changeAddressSection = document.getElementById('startupChangeAddressSection');
     if (changeAddressSection) changeAddressSection.style.display = 'none';
+    const rpcDisabledSection = document.getElementById('startupRpcDisabledSection');
+    if (rpcDisabledSection) rpcDisabledSection.style.display = 'none';
     const disclaimerSection = document.getElementById('startupDisclaimerSection');
     if (disclaimerSection) disclaimerSection.style.display = 'none';
     const sageLaunchSection = document.getElementById('startupSageLaunchSection');
@@ -30326,6 +30358,45 @@ async function startupSelectFingerprint(fingerprint, cardEl) {
     }
 }
 
+function startupShowRpcDisabled() {
+    startupSetPhase('rpc_disabled', 'RPC Not Enabled', 'Sage is open but its RPC server is off', '');
+    startupShowProgress(10);
+    document.getElementById('startupProgressTrack').style.display = 'none';
+    document.getElementById('startupFpSection').style.display = 'none';
+    document.getElementById('startupStartingFeedback').style.display = 'none';
+    document.getElementById('startupRpcDisabledSection').style.display = 'block';
+    document.getElementById('startupRpcDisabledStatus').textContent = '';
+    const btn = document.getElementById('startupRpcRescanBtn');
+    if (btn) { btn.disabled = false; btn.textContent = 'Rescan'; }
+}
+
+async function startupRpcRescan() {
+    const btn = document.getElementById('startupRpcRescanBtn');
+    const statusEl = document.getElementById('startupRpcDisabledStatus');
+    if (btn) { btn.disabled = true; btn.textContent = 'Rescanning…'; }
+    statusEl.textContent = 'Checking for Sage RPC…';
+    statusEl.style.color = 'var(--slate-400)';
+
+    try {
+        await apiFetch(API_URL + '/wallet/retry-sage-connect', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal: AbortSignal.timeout(8000),
+        });
+        document.getElementById('startupRpcDisabledSection').style.display = 'none';
+        document.getElementById('startupStartingFeedback').style.display = 'block';
+        document.getElementById('startupStartingText').textContent = 'Connecting to Sage RPC…';
+        startupSetPhase('starting', 'Connecting to Sage', 'Looking for RPC server…', '');
+        document.getElementById('startupProgressTrack').style.display = 'block';
+        startupShowProgress(null);
+        startupPollUntilReady();
+    } catch (err) {
+        statusEl.textContent = 'Rescan failed — is the bot running?';
+        statusEl.style.color = 'var(--sell-color)';
+        if (btn) { btn.disabled = false; btn.textContent = 'Rescan'; }
+    }
+}
+
 function startupShowCertSetup() {
     startupSetPhase('certs', 'Certificate Setup', 'Sage needs TLS certificates to connect', '');
     startupShowProgress(15);
@@ -30485,6 +30556,14 @@ function startupPollUntilReady() {
                 document.getElementById('startupStartingFeedback').style.display = 'none';
                 startupShowCertSetup();
                 return;  // Stop polling
+            }
+
+            // Sage RPC disabled: Sage is open but user hasn't enabled RPC
+            if (status.phase === 'rpc_disabled') {
+                console.log('[STARTUP POLL] Sage open but RPC disabled — showing instructions.');
+                document.getElementById('startupStartingFeedback').style.display = 'none';
+                startupShowRpcDisabled();
+                return;  // Stop polling — Rescan button restarts
             }
 
             // Show the feedback box so user can see progress text

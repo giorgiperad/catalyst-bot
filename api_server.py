@@ -12561,6 +12561,23 @@ def api_wallet_sage_running():
         return _api_error(e, request.path)
 
 
+@app.route("/api/wallet/retry-sage-connect", methods=["POST"])
+def api_wallet_retry_sage_connect():
+    """Reset and restart the Sage preload after user enables RPC.
+
+    Called by the 'Rescan' button on the rpc_disabled startup screen.
+    Resets the preload thread state then re-triggers begin-startup so
+    the startup wizard re-probes from scratch.
+    """
+    try:
+        import sage_node
+        sage_node.reset_preload()
+        sage_node.start_preload()
+        return jsonify({"started": True})
+    except Exception as e:
+        return _api_error(e, request.path)
+
+
 @app.route("/api/wallet/begin-startup", methods=["POST"])
 def api_wallet_begin_startup():
     """Trigger wallet preload after the user has chosen how to connect.

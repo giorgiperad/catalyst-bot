@@ -505,6 +505,34 @@ def start_preload():
                     print("[Sage] Checking if Sage is running...", flush=True)
                 time.sleep(3)
 
+            # --- Step 1b: Sage process running but RPC disabled ---
+            # Distinguish "Sage not open" from "Sage open, RPC off" so we can
+            # show actionable instructions rather than a generic wait spinner.
+            if not sage_running and _is_sage_process_running():
+                with _phase_lock:
+                    _sage_startup_phase = "rpc_disabled"
+                log_event("warning", "sage_startup",
+                          "Sage is running but RPC is not enabled — "
+                          "user needs to enable it in Sage Settings → Advanced")
+                print("[Sage] Sage open but RPC disabled — waiting for user to enable it",
+                      flush=True)
+                while _preload_running and not sage_running:
+                    if _is_sage_rpc_available():
+                        sage_running = True
+                        with _phase_lock:
+                            _sage_startup_phase = "connecting"
+                        log_event("success", "sage_startup",
+                                  "Sage RPC became available — resuming startup")
+                        print("[Sage] RPC enabled — resuming", flush=True)
+                        break
+                    time.sleep(5)
+                if not sage_running or not _preload_running:
+                    if _preload_running:
+                        with _phase_lock:
+                            _sage_startup_phase = "error"
+                    return
+                # Sage is now running with RPC — skip the launch block below
+
             # --- Step 2: Launch exe if not running ---
             if not sage_running:
                 with _phase_lock:
@@ -892,6 +920,9 @@ def get_startup_status() -> Dict:
         elif sp == "launching":
             phase = "launching"
             message = "Launching Sage wallet application..."
+        elif sp == "rpc_disabled":
+            phase = "rpc_disabled"
+            message = "Sage is open but RPC is not enabled"
         elif sp == "waiting_certs":
             phase = "waiting_certs"
             message = "Sage needs certificate configuration"
@@ -1114,6 +1145,41 @@ def _launch_sage_exe(exe_path: str) -> bool:
         print(f"[Sage] Failed to launch: {e}", flush=True)
         log_event("error", "sage_startup", f"Failed to launch sage-tauri.exe: {e}")
         return False
+
+
+def _is_sage_process_running() -> bool:
+    """Check if the Sage exe process is running regardless of RPC state.
+
+    Used to distinguish "Sage not open" from "Sage open but RPC disabled".
+    """
+    import sys as _sys
+    try:
+        if _sys.platform == "win32":
+            result = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq sage-tauri.exe", "/NH"],
+                capture_output=True, text=True, timeout=5,
+            )
+            return "sage-tauri.exe" in result.stdout
+        else:
+            result = subprocess.run(
+                ["pgrep", "-fi", "sage"],
+                capture_output=True, text=True, timeout=5,
+            )
+            return result.returncode == 0
+    except Exception:
+        return False
+
+
+def reset_preload():
+    """Reset preload thread state so start_preload() can be called again.
+
+    Call this before re-triggering begin-startup (e.g. after the user enables
+    Sage RPC and clicks Rescan in the startup wizard).
+    """
+    global _preload_running, _sage_startup_phase
+    _preload_running = False
+    with _phase_lock:
+        _sage_startup_phase = "connecting"
 
 
 def _is_sage_rpc_available() -> bool:
