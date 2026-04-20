@@ -19109,17 +19109,28 @@
             const input = document.getElementById(type === 'xch' ? 'configXchReserve' : 'configCatReserve');
             const slider = document.getElementById(type === 'xch' ? 'configXchReserveSlider' : 'configCatReserveSlider');
             const pctLabel = document.getElementById(type === 'xch' ? 'xchReservePercent' : 'catReservePercent');
-            
+
             if (!input || !slider) return;
-            
+
             const balance = getWalletBalance(type);
             const amount = parseFloat(input.value) || 0;
-            
-            // Calculate percentage from amount
-            const pct = balance > 0 ? Math.round((amount / balance) * 100) : 0;
-            slider.value = Math.min(75, pct);
-            if (pctLabel) pctLabel.textContent = Math.min(75, pct) + '%';
-            
+
+            // Calculate percentage from amount, clamped to the 75% ceiling
+            const rawPct = balance > 0 ? (amount / balance) * 100 : 0;
+            const clampedPct = Math.min(75, Math.round(rawPct));
+            slider.value = clampedPct;
+            if (pctLabel) pctLabel.textContent = clampedPct + '%';
+
+            // Clamp the input value to match the 75% ceiling so the field
+            // stays consistent with the slider (entering e.g. 999 XCH would
+            // leave the field showing 999 while the slider showed 75%).
+            if (rawPct > 75 && balance > 0) {
+                const maxAmt = type === 'xch'
+                    ? Math.round(balance * 75 / 100 * 1000) / 1000
+                    : Math.round(balance * 75 / 100);
+                input.value = maxAmt;
+            }
+
             updateReserveDisplay(type);
             checkSmartSettingsDirty();
         }

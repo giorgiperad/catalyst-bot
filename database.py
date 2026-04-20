@@ -3496,17 +3496,22 @@ def get_events_since(since: str, limit: int = 100,
         limit: Max events to return
         category: Optional category filter (see get_recent_events)
     """
+    # DB stores timestamps as "2026-04-20 02:52:06.xxx" (space separator, no tz).
+    # Callers may pass ISO format "2026-04-20T02:52:06+00:00" (T + tz offset).
+    # ASCII space (32) < T (84), so without normalization all space-format rows
+    # compare as less than any T-format cutoff, returning nothing.
+    since_normalized = since.replace("T", " ").split("+")[0].split("Z")[0]
     conn = get_connection()
     if category:
         rows = conn.execute(
             "SELECT * FROM events WHERE timestamp > ? AND event_category=?"
             " ORDER BY timestamp DESC LIMIT ?",
-            (since, category, limit)
+            (since_normalized, category, limit)
         ).fetchall()
     else:
         rows = conn.execute(
             "SELECT * FROM events WHERE timestamp > ? ORDER BY timestamp DESC LIMIT ?",
-            (since, limit)
+            (since_normalized, limit)
         ).fetchall()
     return [dict(row) for row in rows]
 

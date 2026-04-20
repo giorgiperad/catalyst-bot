@@ -395,12 +395,15 @@ in a state that needs manual recovery.
 
 ---
 
+| 2026-04-20 | 06-F | `[x]` | live | Settings combos: Conservative+Both ✅, Balanced+Buy-only ✅, Aggressive+Both ⚠ (sell blocked by inherited net-short position — expected behaviour), Balanced+Sell-only ✅ (max_position_xch fix needed — see findings) |
+| 2026-04-20 | 06-G | `[x]` | live | Settings validation API: 5 validation gaps found (invalid mode accepted, config update while running, negative spread accepted, zero-side start allowed, sniper+sell-only not warned) |
+
 ## Progress summary
 
 - Total slices: **126** (Layers 1-5: 106, Layer 6: 12, Layer 7: 8)
-- Pending: **126**
+- Pending: **12** (Layer 6 taker-fill slices 06-01 through 06-12 need secondary wallet)
 - In progress: **0**
-- Done: **0**
+- Done: **114** (L1: 8, L2: 32, L3: 18, L4: 22, L5: 26, L7: 8; plus live-fire phases F+G in 06_live_fire/)
 - Blocked: **0**
 
 Update these counts when statuses change.
