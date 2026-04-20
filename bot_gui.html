@@ -31473,24 +31473,20 @@ document.addEventListener('DOMContentLoaded', () => {
     _menu.appendChild(_item('Copy',  () => { if (_ctxTarget) { _ctxTarget.focus(); document.execCommand('copy'); } }));
     _menu.appendChild(_item('Paste', async () => {
         if (!_ctxTarget) return;
-        _ctxTarget.focus();
+        const el = _ctxTarget;  // capture before _hide() nulls _ctxTarget
+        el.focus();
         // execCommand('paste') is blocked by WebView2 — read via Python bridge instead
         try {
             const res = await window.pywebview.api.read_clipboard();
-            console.log('[paste]', JSON.stringify(res));
             if (res && res.success && res.text) {
-                const el = _ctxTarget;
                 const start = el.selectionStart ?? el.value.length;
                 const end   = el.selectionEnd   ?? el.value.length;
                 el.value = el.value.slice(0, start) + res.text + el.value.slice(end);
                 const cur = start + res.text.length;
                 el.setSelectionRange(cur, cur);
                 el.dispatchEvent(new Event('input', { bubbles: true }));
-            } else if (res && !res.success) {
-                console.warn('[paste] bridge error:', res.error);
             }
         } catch (err) {
-            console.warn('[paste] exception:', err);
             // pywebview not available (browser mode) — fall back
             document.execCommand('paste');
         }
