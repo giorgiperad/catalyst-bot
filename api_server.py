@@ -9073,6 +9073,60 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
         )
     # ═══ END PER-SIDE TIER SIZES ══════════════════════════════════════════
 
+    # ═══ F66 FINAL BUY-SIDE XCH VERIFICATION ══════════════════════════════
+    # Belt-and-suspenders check mirroring F65 (which does the same for CAT
+    # sell side).  F62 computes _smart_buy_* from _orig_xch_budget, but
+    # _launcher_buy_budget may be smaller because the 2× largest-tier topup
+    # guard (line 8501) can increase _topup_buffer_xch AFTER _orig_xch_budget
+    # was captured.  This guard recomputes the buy-side coin-prep total with
+    # the F62 sizes and scales them down if they exceed the available budget.
+    if _smart_buy_inner > 0 and _avail_xch > 0:
+        _f66_hm = 1.0 + (coin_prep_headroom_pct / 100.0)
+        # Build (count, size) pairs in SLOT-indexed order.
+        # Under reverse-buy the slot-indexed buy counts are position counts;
+        # the corresponding sizes are already position-semantic too
+        # (_smart_buy_inner = smallest size, used by position inner = many offers).
+        _f66_tiers = [
+            (_buy_n_inner   + _buy_spare_inner,   _smart_buy_inner),
+            (_buy_n_mid     + _buy_spare_mid,     _smart_buy_mid),
+        ]
+        if _max_tiers >= 3 and _smart_buy_outer > 0:
+            _f66_tiers.append((_buy_n_outer + _buy_spare_outer, _smart_buy_outer))
+        if _max_tiers == 4 and _smart_buy_extreme > 0:
+            _f66_tiers.append((_buy_n_extreme + _buy_spare_extreme, _smart_buy_extreme))
+        _f66_tier_xch = sum(_cnt * _sx * _f66_hm for _cnt, _sx in _f66_tiers)
+        # Budget: avail minus fixed carve-outs (fee pool, sniper pool, topup buffer).
+        # Use _topup_buffer_xch (the final bumped value) not _topup_buffer_reserve.
+        _f66_budget = max(0.0,
+            (_avail_xch - _fee_pool_xch - _sniper_pool_xch - _topup_buffer_xch) * 0.98)
+        if _f66_tier_xch > _f66_budget > 0:
+            _f66_scale = _f66_budget / _f66_tier_xch
+            _f66_old_inner = _smart_buy_inner
+            _smart_buy_inner   = max(_MIN_OFFER_XCH, round(_smart_buy_inner   * _f66_scale, 4))
+            _smart_buy_mid     = max(_MIN_OFFER_XCH, round(_smart_buy_mid     * _f66_scale, 4))
+            _smart_buy_outer   = (max(_MIN_OFFER_XCH, round(_smart_buy_outer  * _f66_scale, 4))
+                                  if _smart_buy_outer > 0 else 0.0)
+            _smart_buy_extreme = (max(_MIN_OFFER_XCH, round(_smart_buy_extreme * _f66_scale, 4))
+                                  if _smart_buy_extreme > 0 else 0.0)
+            # Keep shared sizes in sync (pre-F62 callers read these).
+            _smart_inner   = _smart_buy_inner
+            _smart_mid     = _smart_buy_mid
+            _smart_outer   = _smart_buy_outer
+            _smart_extreme = _smart_buy_extreme
+            _smart_trade_size = _smart_buy_mid  # mid is the reference "base"
+            messages.append(
+                f"F66 buy-side XCH safety clamp: "
+                f"inner {_f66_old_inner:.4f} → {_smart_buy_inner:.4f} "
+                f"({_f66_scale*100:.1f}% scale, tier prep "
+                f"{_f66_tier_xch:.2f} → {_f66_budget:.2f} XCH budget)"
+            )
+            print(
+                f"[SMART_DEFAULTS] F66 XCH safety clamp: "
+                f"inner {_f66_old_inner:.4f} → {_smart_buy_inner:.4f}, "
+                f"tier_xch {_f66_tier_xch:.2f} → budget {_f66_budget:.2f}"
+            )
+    # ═══ END F66 FINAL BUY-SIDE XCH VERIFICATION ══════════════════════════
+
     # ═══ F64 (2026-04-12): SELL-SIDE INDEPENDENT SIZING ═════════════════
     # Mirror of F62 (which gives the buy side independent *sizes* from the
     # XCH budget).  F64 handles the reverse: when the CAT balance can fund
@@ -9412,6 +9466,24 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
                 f"(budget {_avail_cat:,.0f})"
             )
     # ═══ END F65 FINAL SELL-SIDE CAT VERIFICATION ═════════════════════════
+
+    # Diagnostic dump — printed on every smart-defaults call so any
+    # future coin-prep overshoot can be traced from the server log.
+    print(
+        f"[SMART_DEFAULTS] Capital summary: "
+        f"spendable={xch_spendable:.4f} avail={_avail_xch:.4f} "
+        f"fee={_fee_pool_xch:.4f} sniper={_sniper_pool_xch:.4f} "
+        f"topup={_topup_buffer_xch:.4f} trading={_trading_xch:.4f} | "
+        f"fills/day={fills_per_day:.2f} regime={regime} n_final={_n_final} "
+        f"size_mults={tuple(round(m,3) for m in _size_mults)} | "
+        f"spares={_spare_inner}/{_spare_mid}/{_spare_outer}/{_spare_extreme} | "
+        f"buy_sizes(F62)={_smart_buy_inner:.4f}/{_smart_buy_mid:.4f}/"
+        f"{_smart_buy_outer:.4f}/{_smart_buy_extreme:.4f} | "
+        f"sell_sizes={_smart_sell_inner:.4f}/{_smart_sell_mid:.4f}/"
+        f"{_smart_sell_outer:.4f}/{_smart_sell_extreme:.4f} | "
+        f"orig_xch_budget={_orig_xch_budget:.4f} "
+        f"reversed={_buy_ladder_reversed}"
+    )
 
     # ═══ Build response ═══
     # F78 (2026-04-18): *_bps fields now return integer basis points
