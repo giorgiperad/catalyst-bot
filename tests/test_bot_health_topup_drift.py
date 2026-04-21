@@ -78,11 +78,10 @@ import bot_health
 class TopupBudgetDriftTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
+        # Leave bot_health / config / database loaded to avoid cross-test
+        # re-import timing issues.
         for name in _INSTALLED_STUBS:
             sys.modules.pop(name, None)
-        for name in list(sys.modules):
-            if name in ("bot_health", "config", "database", "super_log"):
-                sys.modules.pop(name, None)
 
     # ------------------------------------------------------------------
     # Healthy: stored counter matches observed reserve

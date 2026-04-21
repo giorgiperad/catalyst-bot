@@ -804,6 +804,250 @@ def check_topup_budget_drift(auto_repair: bool = True) -> HealthCheck:
     )
 
 
+# ── Check 6: low-funds advisory ───────────────────────────────────────
+
+# How many "inner" tier splits the wallet must be able to support to count
+# as healthy. Below this, topup can't refill a depleted tier without
+# breaching the hard reserve — so we surface a user-actionable advisory
+# with the wallet address and a suggested send amount.
+_FUNDS_ADVISORY_TIER_BUFFER = 2  # need room for ~2 inner-size splits
+_FUNDS_ADVISORY_FEE_HEADROOM_XCH_MOJOS = int(
+    Decimal("0.01") * Decimal("1000000000000")
+)  # reserve 0.01 XCH for tx fees over the advisory window
+
+# Suggested top-up sizing: enough for ~5 inner-tier refills so the user
+# doesn't need to come back for another advisory in 5 minutes.
+_FUNDS_ADVISORY_SUGGEST_MULTIPLIER = 5
+
+
+def check_funds_advisory(auto_repair: bool = True) -> HealthCheck:
+    """Detect when the wallet is genuinely out of capital for tier refills.
+
+    Distinct from the budget-drift check: that one heals a stale counter.
+    This one flags the real-world case — the user's wallet doesn't have
+    enough XCH or CAT above the hard reserve to support even one more
+    inner-tier split. Without an advisory the only signal is the silent
+    `blocked_by_reserve` log line, easily missed.
+
+    When triggered, emits a persistent alert via the AlertStore showing:
+      - Which asset is low (XCH or CAT)
+      - How much to send (covers ~5 inner-tier refills)
+      - The wallet's own receive address
+
+    Auto-clears as soon as the wallet balance climbs back above the
+    operating floor. `auto_repair` has no meaning here — funds can only
+    be added by the operator — so both True and False behave identically
+    except that False returns the check as "warn" rather than emitting
+    the alert. (We still surface it in the report either way.)
+    """
+    findings = []
+    alerts_raised = []
+    alerts_cleared = []
+
+    # Resolve the live event bus lazily; avoids a circular import at
+    # module load, and degrades gracefully when running under tests
+    # that don't spin up api_server.
+    events_bus = None
+    try:
+        from api_server import events as events_bus  # type: ignore
+    except Exception:
+        events_bus = None
+
+    def _emit_alert(alert_id: str, title: str, message: str,
+                    severity: str = "warning") -> None:
+        alerts_raised.append(alert_id)
+        if events_bus is None or not auto_repair:
+            return
+        try:
+            events_bus.alert(alert_id, severity, title, message)
+        except Exception as e:
+            slog("BOT_HEALTH",
+                 f"Failed to emit funds advisory alert {alert_id}: {e}",
+                 level="warn")
+
+    def _clear_alert(alert_id: str) -> None:
+        alerts_cleared.append(alert_id)
+        if events_bus is None:
+            return
+        try:
+            store = getattr(events_bus, "_alert_store", None)
+            if store is not None:
+                store.clear(alert_id)
+        except Exception:
+            pass
+
+    # ---- XCH advisory ----
+    try:
+        from wallet_sage import get_wallet_balance as _sage_balance
+        from wallet import get_wallet_type as _wt
+        if _wt() == "sage":
+            raw = _sage_balance(int(getattr(cfg, "WALLET_ID_XCH", 1) or 1)) or {}
+            wb = raw.get("wallet_balance") or {}
+            spendable_mojos = int(wb.get("spendable_balance", 0) or 0)
+        else:
+            spendable_mojos = None
+
+        if spendable_mojos is not None:
+            hard_reserve_mojos = int(
+                Decimal(str(getattr(cfg, "XCH_RESERVE", 0) or 0))
+                * Decimal("1000000000000")
+            )
+            # Smallest tier size — use the sell side for a conservative floor,
+            # falling back to INNER_SIZE_XCH then to a 0.1 XCH default.
+            inner_size_xch = Decimal(str(
+                getattr(cfg, "SELL_INNER_SIZE_XCH", 0)
+                or getattr(cfg, "INNER_SIZE_XCH", 0)
+                or "0.1"
+            ))
+            inner_size_mojos = int(inner_size_xch * Decimal("1000000000000"))
+            min_operating_mojos = (
+                _FUNDS_ADVISORY_TIER_BUFFER * inner_size_mojos
+                + _FUNDS_ADVISORY_FEE_HEADROOM_XCH_MOJOS
+            )
+            available_mojos = spendable_mojos - hard_reserve_mojos
+
+            if available_mojos < min_operating_mojos:
+                # Shortfall = how much extra XCH the operator must send
+                # to cover the operating buffer + a few refill cycles.
+                target_mojos = (
+                    hard_reserve_mojos
+                    + _FUNDS_ADVISORY_SUGGEST_MULTIPLIER * inner_size_mojos
+                    + _FUNDS_ADVISORY_FEE_HEADROOM_XCH_MOJOS
+                )
+                shortfall_mojos = max(0, target_mojos - spendable_mojos)
+                shortfall_xch = Decimal(shortfall_mojos) / Decimal("1000000000000")
+                address = str(getattr(cfg, "WALLET_ADDRESS", "") or "")
+                msg_lines = [
+                    f"XCH spendable ({spendable_mojos / 1e12:.4f}) is below the "
+                    f"operating floor needed to refill tiers."
+                ]
+                if shortfall_xch > 0:
+                    msg_lines.append(
+                        f"Send at least {shortfall_xch:.4f} XCH to resume "
+                        f"full topup activity."
+                    )
+                if address:
+                    msg_lines.append(f"Address: {address}")
+                _emit_alert(
+                    alert_id="funds_advisory_xch",
+                    title="XCH running low",
+                    message=" ".join(msg_lines),
+                    severity="warning",
+                )
+                findings.append(
+                    f"XCH shortfall {shortfall_xch:.4f} "
+                    f"(spendable={spendable_mojos / 1e12:.4f}, "
+                    f"floor={min_operating_mojos / 1e12:.4f})"
+                )
+            else:
+                _clear_alert("funds_advisory_xch")
+    except Exception as e:
+        slog("BOT_HEALTH", f"XCH funds advisory check error: {e}", level="warn")
+
+    # ---- CAT advisory ----
+    try:
+        from wallet_sage import get_wallet_balance as _sage_balance
+        from wallet import get_wallet_type as _wt
+        if _wt() == "sage":
+            raw = _sage_balance(int(getattr(cfg, "CAT_WALLET_ID", 2) or 2)) or {}
+            wb = raw.get("wallet_balance") or {}
+            spendable_mojos = int(wb.get("spendable_balance", 0) or 0)
+        else:
+            spendable_mojos = None
+
+        if spendable_mojos is not None:
+            cat_decimals = int(getattr(cfg, "CAT_DECIMALS", 3))
+            scale = Decimal(10) ** Decimal(cat_decimals)
+            hard_reserve_mojos = int(
+                Decimal(str(getattr(cfg, "CAT_RESERVE", 0) or 0)) * scale
+            )
+            # CAT inner tier size in CAT units. We size the CAT floor as
+            # N × inner-CAT-per-offer — no fee headroom on CAT (fees are
+            # paid in XCH by the cat_wallet under the hood).
+            cat_inner_xch = Decimal(str(
+                getattr(cfg, "SELL_INNER_SIZE_XCH", 0)
+                or getattr(cfg, "INNER_SIZE_XCH", 0)
+                or "0"
+            ))
+            # Approximate CAT size per offer: inner_xch / current_price.
+            # We don't have live price in bot_health, so fall back to a
+            # sane fraction of the user's configured reserve (10%) if no
+            # better signal is available.
+            try:
+                price_xch = Decimal(str(getattr(cfg, "LAST_QUOTED_MID", 0) or 0))
+            except Exception:
+                price_xch = Decimal("0")
+            if price_xch > 0 and cat_inner_xch > 0:
+                inner_size_cat = (cat_inner_xch / price_xch)
+            else:
+                # Fallback: assume the configured CAT_RESERVE is sized
+                # sensibly relative to tier use, so 10% of it is one tier's
+                # worth. Still better than nothing.
+                inner_size_cat = Decimal(str(
+                    getattr(cfg, "CAT_RESERVE", 0) or 0
+                )) * Decimal("0.1")
+            inner_size_mojos = int(inner_size_cat * scale)
+            if inner_size_mojos <= 0:
+                raise RuntimeError("could not estimate CAT tier size")
+            min_operating_mojos = _FUNDS_ADVISORY_TIER_BUFFER * inner_size_mojos
+            available_mojos = spendable_mojos - hard_reserve_mojos
+
+            if available_mojos < min_operating_mojos:
+                target_mojos = (
+                    hard_reserve_mojos
+                    + _FUNDS_ADVISORY_SUGGEST_MULTIPLIER * inner_size_mojos
+                )
+                shortfall_mojos = max(0, target_mojos - spendable_mojos)
+                shortfall_cat = Decimal(shortfall_mojos) / scale
+                address = str(getattr(cfg, "WALLET_ADDRESS", "") or "")
+                ticker = str(getattr(cfg, "CAT_NAME", "") or "CAT")
+                msg_lines = [
+                    f"{ticker} spendable ({spendable_mojos / float(scale):,.4f}) "
+                    f"is below the operating floor."
+                ]
+                if shortfall_cat > 0:
+                    msg_lines.append(
+                        f"Send at least {shortfall_cat:,.4f} {ticker} "
+                        f"to resume full topup activity."
+                    )
+                if address:
+                    msg_lines.append(f"Address: {address}")
+                _emit_alert(
+                    alert_id="funds_advisory_cat",
+                    title=f"{ticker} running low",
+                    message=" ".join(msg_lines),
+                    severity="warning",
+                )
+                findings.append(
+                    f"{ticker} shortfall {shortfall_cat:,.4f} "
+                    f"(spendable={spendable_mojos / float(scale):,.4f})"
+                )
+            else:
+                _clear_alert("funds_advisory_cat")
+    except Exception as e:
+        slog("BOT_HEALTH", f"CAT funds advisory check error: {e}", level="warn")
+
+    if not findings:
+        return HealthCheck(
+            name="funds_advisory",
+            category="wallet",
+            status="pass",
+            severity="info",
+            message="Wallet balances above operating floors.",
+        )
+
+    return HealthCheck(
+        name="funds_advisory",
+        category="wallet",
+        status="warn",
+        severity="warning",
+        message="; ".join(findings),
+        anomaly_count=len(findings),
+        repaired_count=0,  # repair is out-of-band (user action)
+        repair_log=[f"raised:{a}" for a in alerts_raised],
+    )
+
+
 # ── Top-level runner ───────────────────────────────────────────────────
 
 # Cache to avoid running checks more often than needed (the bot loop
@@ -854,6 +1098,7 @@ def run_runtime_checks(auto_repair: bool = True,
     report.checks.append(check_stale_dexie_posts(auto_repair=auto_repair))
     report.checks.append(check_ladder_overbuild(auto_repair=auto_repair))
     report.checks.append(check_topup_budget_drift(auto_repair=auto_repair))
+    report.checks.append(check_funds_advisory(auto_repair=auto_repair))
 
     report.duration_ms = (time.time() - start) * 1000.0
     _last_run_lock_ts = time.time()
