@@ -8092,8 +8092,7 @@
                             <div class="v4-hero-label">Mid Price <span class="cc-help">?<span class="cc-tooltip">Best available mid-price blended from Dexie orderbook and TibetSwap AMM. Used as the reference point for calculating your buy and sell prices. If TibetSwap has no pool for this token, Dexie alone is used.</span></span></div>
                             <div class="v4-hero-value data-pending" id="heroMidPrice">—</div>
                             <div class="v4-hero-sub data-pending" id="heroSpread">spread —</div>
-                            <div id="heroPriceSpark" aria-hidden="true" style="margin-top: var(--space-2); height: 24px;"></div>
-                            <a href="javascript:void(0)" onclick="v4SwitchView('intel')" style="font-size: 10px; color: var(--text-tertiary); text-decoration: none; opacity: 0.6; display: inline-block; margin-top: 2px;" onmouseover="this.style.opacity='1'; this.style.color='var(--accent-primary)'" onmouseout="this.style.opacity='0.6'; this.style.color='var(--text-tertiary)'" title="Open Market Intel for full price history">Full chart →</a>
+                            <a href="javascript:void(0)" onclick="v4SwitchView('intel')" style="font-size: 10px; color: var(--text-tertiary); text-decoration: none; opacity: 0.6; display: inline-block; margin-top: 6px;" onmouseover="this.style.opacity='1'; this.style.color='var(--accent-primary)'" onmouseout="this.style.opacity='0.6'; this.style.color='var(--text-tertiary)'" title="Open Market Intel for full price history">Full chart →</a>
                         </div>
                         <div class="v4-hero-card">
                             <div class="v4-hero-label">Active Offers <span class="cc-help">?<span class="cc-tooltip">Total number of your active buy and sell offers on Dexie right now.</span></span></div>
@@ -8234,13 +8233,6 @@
                          (sidebar → Logs), which avoids the footgun where
                          closing the console window killed the bot. -->
                     <div id="consoleWarningBanner" style="display:none;" aria-hidden="true"></div>
-
-                    <!-- Full Mid Price history chart moved to the Market
-                         Intelligence tab. The header already shows a
-                         live sparkline next to the mid-price value
-                         (#heroPriceSpark), which is enough for at-a-
-                         glance trend. Frees ~200px above the fold for
-                         Recommendations + Activity + Advisor. -->
 
                     <!-- ===== SPLIT PANEL: RECOMMENDATIONS + ACTIVITY ===== -->
                     <div id="dashboardActivityRow" style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px;">
@@ -12863,40 +12855,8 @@
             if (_v4PriceHistory.length > _V4_PRICE_HISTORY_MAX) {
                 _v4PriceHistory.shift();
             }
-            // Render the sparkline in the hero card if it exists
-            try { v4RenderPriceSparkline(); } catch (_) {}
             // Render the full-size chart if it exists
             try { v4RenderPriceHistoryChart(); } catch (_) {}
-        }
-        function v4RenderPriceSparkline() {
-            const el = document.getElementById('heroPriceSpark');
-            if (!el) return;
-            if (_v4PriceHistory.length < 2) {
-                el.innerHTML = '';
-                return;
-            }
-            // Extract y values
-            const vals = _v4PriceHistory.map(p => p.y);
-            const min = Math.min.apply(null, vals);
-            const max = Math.max.apply(null, vals);
-            const span = max - min;
-            const w = 120, h = 24;
-            const norm = (v) => span > 0 ? h - ((v - min) / span) * h : h / 2;
-            // Build SVG polyline
-            const pts = vals.map((v, i) => {
-                const x = (i / (vals.length - 1)) * w;
-                return x.toFixed(1) + ',' + norm(v).toFixed(1);
-            }).join(' ');
-            const latest = vals[vals.length - 1];
-            const earliest = vals[0];
-            const up = latest >= earliest;
-            const color = up ? 'var(--status-success)' : 'var(--status-danger)';
-            el.innerHTML =
-                '<svg viewBox="0 0 ' + w + ' ' + h + '" width="100%" height="' + h + '" ' +
-                    'preserveAspectRatio="none" role="img" aria-label="Price trend">' +
-                    '<polyline fill="none" stroke="' + color + '" stroke-width="1.5" ' +
-                        'stroke-linejoin="round" stroke-linecap="round" points="' + pts + '"/>' +
-                '</svg>';
         }
         function v4RenderPriceHistoryChart() {
             const chart = document.getElementById('v4PriceHistoryChart');
