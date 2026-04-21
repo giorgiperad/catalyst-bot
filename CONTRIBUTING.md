@@ -1,6 +1,6 @@
 # Contributing to CATalyst
 
-Thanks for taking an interest. CATalyst is beta software controlling live trading wallets, so contributions — reports, ideas, expert reviews, or code — are genuinely valued.
+Thanks for taking an interest. CATalyst is beta software controlling live trading wallets, so contributions (reports, ideas, expert reviews, or code) are genuinely valued.
 
 ## Where different things go
 
@@ -13,17 +13,17 @@ Thanks for taking an interest. CATalyst is beta software controlling live tradin
 | Offer expert review (Chialisp, wallet security, MM theory, etc.) | [Discussions → General](https://github.com/Lowestofttim/catalyst-bot/discussions/categories/general) |
 | Submit a code change | Open a pull request (see below) |
 
-**Rule of thumb:** Issues are for things we will close. Discussions are for things that stay open-ended. If you're unsure, start in Discussions — a maintainer will promote it to an Issue if it fits there.
+**Rule of thumb:** Issues are for things we will close. Discussions are for things that stay open-ended. If you're unsure, start in Discussions; a maintainer will promote it to an Issue if it fits there.
 
 ## Reporting bugs
 
 Include:
-- **Version** — run `Help → About` or check `Catalyst-Setup-*.exe` filename
-- **OS** — Windows 10/11, macOS, Linux
-- **Wallet** — Sage version
-- **CAT pair** — asset ID or ticker
-- **What you expected vs. what happened**
-- **Logs** — tail of `%APPDATA%\ChiaMarketMaker\bot_superlog_*.log` (redact asset IDs if you prefer)
+- **Version.** Run `Help → About` or check the `Catalyst-Setup-*.exe` filename.
+- **OS.** Windows 10/11, macOS, or Linux.
+- **Wallet.** Sage version.
+- **CAT pair.** Asset ID or ticker.
+- **What you expected vs. what happened.**
+- **Logs.** Tail of `%APPDATA%\ChiaMarketMaker\bot_superlog_*.log` (redact asset IDs if you prefer).
 
 Never paste wallet certs, private keys, or the contents of `.env` or `user_secrets.json`.
 
@@ -39,7 +39,7 @@ Maintainers will convert accepted Ideas into tracked Issues.
 ## Submitting code
 
 1. Fork the repo and create a branch from `master`.
-2. Follow the conventions in [CLAUDE.md](CLAUDE.md) — `Decimal` for prices, `slog()` for logging, DB access via `database.py`, etc.
+2. Follow the conventions in [CLAUDE.md](CLAUDE.md): `Decimal` for prices, `slog()` for logging, DB access via `database.py`, etc.
 3. Run the tests: `cd tests && pytest`.
 4. Run the static checks: `ruff check .` and `bandit -r . -c .bandit`.
 5. Open a PR with a clear description of **why** the change is needed.
@@ -48,7 +48,7 @@ Small, focused PRs get reviewed faster. If you're unsure whether an approach wil
 
 ## Expert review welcome
 
-If you know Chia deeply (coin-set model, Chialisp, offer mechanics), market microstructure, Python security hardening, or desktop app packaging — please look at whatever subset interests you and say what you'd do differently. Post in **General** or tag the maintainer in a relevant file.
+If you know Chia deeply (coin-set model, Chialisp, offer mechanics), market microstructure, Python security hardening, or desktop app packaging, please look at whatever subset interests you and say what you'd do differently. Post in **General** or tag the maintainer in a relevant file.
 
 ## Ground rules
 
