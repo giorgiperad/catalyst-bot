@@ -1,8 +1,8 @@
 # CATalyst
 
-**Automated market maker for CAT tokens on the Chia blockchain.**
+**Provide liquidity on Dexie without babysitting your offers.**
 
-CATalyst is a native desktop application that runs a tiered bid/ask ladder on [Dexie](https://dexie.space), the leading Chia DEX. It quotes competitive prices, adapts to market volatility, manages wallet coin inventory automatically, and recovers from faults without operator intervention. Powered by the [Sage wallet](https://sage.rigidnetwork.io).
+Providing liquidity on [Dexie](https://dexie.space) — Chia's main DEX — means manually adjusting your offers every time the price moves and re-posting the ones that get filled. It is a full-time job if you do it by hand. CATalyst does it for you: set your target liquidity and capital budget, and it maintains a live bid/ask ladder around the market price, requotes when the market moves, and refills filled offers. It runs as a native desktop application on your own machine and connects to your [Sage wallet](https://sage.rigidnetwork.io) — your keys, your coins, your trades.
 
 **Status:** Beta — actively used in production. No warranty. Use at your own risk.
 
