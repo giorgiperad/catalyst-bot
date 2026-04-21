@@ -198,6 +198,7 @@ class UnclaimedDepositsTests(unittest.TestCase):
             "amount_mojos": 750_000_000,   # 750,000 CAT at 3 decimals
             "first_seen": "2026-04-21 20:13:01",
             "wallet_type": "cat",
+            "wallet_type": "cat",
         })
         bus, cleanup = self._install(rows=[row])
         try:
@@ -230,6 +231,7 @@ class UnclaimedDepositsTests(unittest.TestCase):
             "coin_id": "0xdeadbeef",
             "amount_mojos": 750_000_000,
             "first_seen": "2026-04-21 20:13:01",
+            "wallet_type": "cat",
         })
         bus, cleanup = self._install(
             rows=[row], advised="0xdeadbeef,0xcafebabe")
@@ -250,6 +252,7 @@ class UnclaimedDepositsTests(unittest.TestCase):
             "coin_id": "0xfeed",
             "amount_mojos": 750_000_000,
             "first_seen": "2026-04-21 20:13:01",
+            "wallet_type": "cat",
         })
         import time as _t
         # Absorption happened 30s ago — within the 90s cooldown.
@@ -288,6 +291,7 @@ class UnclaimedDepositsTests(unittest.TestCase):
             "coin_id": "0xdeadbeef",
             "amount_mojos": 750_000_000,
             "first_seen": "2026-04-21 20:13:01",
+            "wallet_type": "cat",
         })
         # First call: raise alert.
         bus, cleanup = self._install(rows=[row])
@@ -350,6 +354,7 @@ class UnclaimedDepositsTests(unittest.TestCase):
             "coin_id": "0xbeef",
             "amount_mojos": 750_000_000,
             "first_seen": "2026-04-21 20:13:01",
+            "wallet_type": "cat",
         })
         bus, cleanup = self._install(rows=[row])
         try:
