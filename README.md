@@ -16,7 +16,7 @@ Market making means posting both a buy offer and a sell offer around the current
 
 - Offers are native blockchain assets, not database rows — every quote move costs a transaction.
 - Wallet coins must be pre-split into the right denominations before offers can be created.
-- Fills arrive through multiple paths (Dexie API, mempool, on-chain) and each source lies sometimes.
+- Fills arrive through multiple paths (Dexie API, mempool, on-chain), each with its own latency and propagation delay — they can temporarily disagree.
 - Competitors move the order book constantly and arbitrageurs sweep gaps.
 
 CATalyst handles all of that. You tell it the CAT you want to trade and your capital budget; it produces and maintains a professional order book that stays live through wallet reconnects, API outages, and market shocks.
