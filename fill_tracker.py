@@ -300,6 +300,63 @@ class FillTracker:
             log_event("debug", "fill_tracker_wallet_batch_failed",
                       f"Wallet status batch check failed ({_ws_err}) — falling back to serial")
 
+        # Parallel Spacescan pre-verification — avoids N×20s serial latency.
+        # For a 14-fill sweep this compresses ~4min of HTTP waits to ~30s,
+        # which is the main driver of offer-replacement latency after a sweep.
+        #
+        # We skip obvious non-fills (bot-cancelled, still open in wallet,
+        # or closed as non-fill per wallet RPC) so we don't waste calls on
+        # trades that the main loop will early-continue anyway. Everything
+        # else is verified in parallel up-front and cached; the main loop
+        # pulls from the cache instead of calling _verify_fill_on_chain
+        # serially. Behaviour with an empty cache is identical to before —
+        # this is strictly a latency optimisation, not a correctness change.
+        _verify_cache: Dict[str, str] = {}
+        _verify_candidates: List[str] = []
+        for _pv_tid in disappeared_ids:
+            if self._offer_manager and self._offer_manager.is_bot_cancelled(_pv_tid):
+                continue
+            if _pv_tid in _wallet_status_cache:
+                _pv_still, _pv_closed, _ = _wallet_status_cache[_pv_tid]
+                if _pv_still or _pv_closed:
+                    continue
+            _verify_candidates.append(_pv_tid)
+
+        if len(_verify_candidates) > 1:
+            def _verify_one_parallel(_tid: str):
+                try:
+                    return _tid, self._verify_fill_on_chain(_tid, side)
+                except Exception as _ve:
+                    log_event("debug", "fill_verify_parallel_error",
+                              f"Parallel verify of {_tid[:16]}... failed: {_ve}")
+                    return _tid, None  # None sentinel → main loop falls back to serial call
+
+            _max_workers = min(len(_verify_candidates), 6)
+            try:
+                with ThreadPoolExecutor(max_workers=_max_workers,
+                                        thread_name_prefix="fill-verify") as _pool:
+                    _futures = {_pool.submit(_verify_one_parallel, _c): _c
+                                for _c in _verify_candidates}
+                    # Outer cap: 180s total so a pathologically-hung Spacescan
+                    # call can't stall fill detection indefinitely. Individual
+                    # calls already have their own 20s timeouts; this is a
+                    # belt-and-braces cap for the whole batch.
+                    for _f in as_completed(_futures, timeout=180):
+                        try:
+                            _tid, _result = _f.result()
+                            if _result is not None:
+                                _verify_cache[_tid] = _result
+                        except Exception:
+                            pass
+                log_event("info", "fill_verify_parallel_done",
+                          f"Parallel pre-verify: {len(_verify_cache)}/"
+                          f"{len(_verify_candidates)} resolved "
+                          f"({_max_workers} workers)")
+            except Exception as _pv_err:
+                log_event("warning", "fill_verify_parallel_failed",
+                          f"Parallel pre-verify batch failed ({_pv_err}) — "
+                          f"falling back to serial verification in main loop")
+
         for trade_id in disappeared_ids:
             # Check if WE cancelled it (requote, cleanup, etc.)
             was_cancelled = False
@@ -421,7 +478,12 @@ class FillTracker:
             except Exception:
                 pass  # additive — never block fill detection
 
-            verification = self._verify_fill_on_chain(trade_id, side)
+            # Use cached result from parallel pre-verify when available,
+            # otherwise fall back to serial call (e.g. single-fill case,
+            # or if parallel batch failed).
+            verification = _verify_cache.get(trade_id)
+            if verification is None:
+                verification = self._verify_fill_on_chain(trade_id, side)
             if verification == "filled":
                 # Lifecycle: FILL_VERIFIED signal advances mempool_observed → filled.
                 # _record_fill also calls update_offer_status("filled") which sets
