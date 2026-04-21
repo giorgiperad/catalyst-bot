@@ -953,6 +953,41 @@ def _spacescan_count_from_payload(payload: Any, *,
     return best_list_len
 
 
+def refresh_spacescan_cache(asset_id: str) -> Optional[Dict]:
+    """Re-fetch Spacescan token data and update the cache.
+
+    Standalone helper for the periodic cache-staleness self-heal driven
+    by `bot_health.check_spacescan_cache_stale`. Returns the fresh payload
+    on success, or None if the fetch failed / returned no data.
+
+    Respects the same partial-failure TTL logic as the full market-data
+    collector: when activity or holders silently returned empty, we cache
+    with a 30-min TTL so the next refresh retries promptly rather than
+    baking the hiccup into the full 24-hour window.
+    """
+    if not asset_id:
+        return None
+    try:
+        payload = _fetch_spacescan_data(asset_id)
+    except Exception as e:
+        print(f"[MARKET_DATA] Spacescan refresh failed: {e}")
+        return None
+    if not payload or not payload.get("has_data"):
+        return None
+    try:
+        _partial = (
+            int(payload.get("holder_count", 0) or 0) <= 0
+            or bool(payload.get("activity_fetch_failed"))
+        )
+        _ttl = 30 if _partial else CACHE_TTL_SPACESCAN
+        set_market_analysis_cache(asset_id, "spacescan", payload, _ttl)
+    except Exception as e:
+        print(f"[MARKET_DATA] Spacescan cache write failed: {e}")
+        # Still return the fresh payload — caller may use it even if the
+        # persist failed. Next refresh will retry the write naturally.
+    return payload
+
+
 def _fetch_spacescan_data(asset_id: str) -> Optional[Dict]:
     """Fetch token info from Spacescan (free tier + Pro API).
 

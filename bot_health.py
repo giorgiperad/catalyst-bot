@@ -970,9 +970,9 @@ def check_funds_advisory(auto_repair: bool = True) -> HealthCheck:
                 or "0"
             ))
             # Approximate CAT size per offer: inner_xch / current_price.
-            # We don't have live price in bot_health, so fall back to a
-            # sane fraction of the user's configured reserve (10%) if no
-            # better signal is available.
+            # We don't have a fresh live price in bot_health, so fall back
+            # to 10% of the user's configured CAT_RESERVE when no better
+            # signal is available.
             try:
                 price_xch = Decimal(str(getattr(cfg, "LAST_QUOTED_MID", 0) or 0))
             except Exception:
@@ -980,50 +980,54 @@ def check_funds_advisory(auto_repair: bool = True) -> HealthCheck:
             if price_xch > 0 and cat_inner_xch > 0:
                 inner_size_cat = (cat_inner_xch / price_xch)
             else:
-                # Fallback: assume the configured CAT_RESERVE is sized
-                # sensibly relative to tier use, so 10% of it is one tier's
-                # worth. Still better than nothing.
                 inner_size_cat = Decimal(str(
                     getattr(cfg, "CAT_RESERVE", 0) or 0
                 )) * Decimal("0.1")
             inner_size_mojos = int(inner_size_cat * scale)
             if inner_size_mojos <= 0:
-                raise RuntimeError("could not estimate CAT tier size")
-            min_operating_mojos = _FUNDS_ADVISORY_TIER_BUFFER * inner_size_mojos
-            available_mojos = spendable_mojos - hard_reserve_mojos
-
-            if available_mojos < min_operating_mojos:
-                target_mojos = (
-                    hard_reserve_mojos
-                    + _FUNDS_ADVISORY_SUGGEST_MULTIPLIER * inner_size_mojos
-                )
-                shortfall_mojos = max(0, target_mojos - spendable_mojos)
-                shortfall_cat = Decimal(shortfall_mojos) / scale
-                address = str(getattr(cfg, "WALLET_ADDRESS", "") or "")
-                ticker = str(getattr(cfg, "CAT_NAME", "") or "CAT")
-                msg_lines = [
-                    f"{ticker} spendable ({spendable_mojos / float(scale):,.4f}) "
-                    f"is below the operating floor."
-                ]
-                if shortfall_cat > 0:
-                    msg_lines.append(
-                        f"Send at least {shortfall_cat:,.4f} {ticker} "
-                        f"to resume full topup activity."
-                    )
-                if address:
-                    msg_lines.append(f"Address: {address}")
-                _emit_alert(
-                    alert_id="funds_advisory_cat",
-                    title=f"{ticker} running low",
-                    message=" ".join(msg_lines),
-                    severity="warning",
-                )
-                findings.append(
-                    f"{ticker} shortfall {shortfall_cat:,.4f} "
-                    f"(spendable={spendable_mojos / float(scale):,.4f})"
-                )
+                # No meaningful CAT tier size signal available (e.g. fresh
+                # install before Smart Settings has run, or CAT_RESERVE=0
+                # configured intentionally). Skip CAT side silently —
+                # without a floor estimate there's nothing actionable to
+                # say. Previously this raised and logged on every check,
+                # spamming the log once per minute forever.
+                pass
             else:
-                _clear_alert("funds_advisory_cat")
+                min_operating_mojos = _FUNDS_ADVISORY_TIER_BUFFER * inner_size_mojos
+                available_mojos = spendable_mojos - hard_reserve_mojos
+
+                if available_mojos < min_operating_mojos:
+                    target_mojos = (
+                        hard_reserve_mojos
+                        + _FUNDS_ADVISORY_SUGGEST_MULTIPLIER * inner_size_mojos
+                    )
+                    shortfall_mojos = max(0, target_mojos - spendable_mojos)
+                    shortfall_cat = Decimal(shortfall_mojos) / scale
+                    address = str(getattr(cfg, "WALLET_ADDRESS", "") or "")
+                    ticker = str(getattr(cfg, "CAT_NAME", "") or "CAT")
+                    msg_lines = [
+                        f"{ticker} spendable ({spendable_mojos / float(scale):,.4f}) "
+                        f"is below the operating floor."
+                    ]
+                    if shortfall_cat > 0:
+                        msg_lines.append(
+                            f"Send at least {shortfall_cat:,.4f} {ticker} "
+                            f"to resume full topup activity."
+                        )
+                    if address:
+                        msg_lines.append(f"Address: {address}")
+                    _emit_alert(
+                        alert_id="funds_advisory_cat",
+                        title=f"{ticker} running low",
+                        message=" ".join(msg_lines),
+                        severity="warning",
+                    )
+                    findings.append(
+                        f"{ticker} shortfall {shortfall_cat:,.4f} "
+                        f"(spendable={spendable_mojos / float(scale):,.4f})"
+                    )
+                else:
+                    _clear_alert("funds_advisory_cat")
     except Exception as e:
         slog("BOT_HEALTH", f"CAT funds advisory check error: {e}", level="warn")
 
@@ -1243,6 +1247,129 @@ def check_splash_daemon(auto_repair: bool = True) -> HealthCheck:
     )
 
 
+# ── Check 8: Spacescan cache staleness → background refresh ───────────
+
+# The Spacescan cache has a 24h TTL normally but drops to 30min when the
+# activity endpoint silently fails (holder_count=0 or activity_fetch_failed).
+# That 30min window is intentional — it's meant to encourage a retry —
+# but nothing automatically triggers the retry. The result: after 30min
+# the dashboard shows "Unknown / Unknown / —" until the user manually
+# re-runs Smart Settings. This check fires the retry on the same 60s
+# cadence as everything else in bot_health, in a background thread so a
+# slow Spacescan call doesn't stall the health pass.
+
+_spacescan_refresh_inflight: bool = False
+_spacescan_refresh_last_at: float = 0.0
+
+
+def check_spacescan_cache_stale(auto_repair: bool = True) -> HealthCheck:
+    """Refresh the Spacescan cache when it's missing or expired.
+
+    Read-only when auto_repair=False; otherwise spawns a single-shot
+    background thread that calls `refresh_spacescan_cache(asset_id)`.
+    Double-fire guarded by `_spacescan_refresh_inflight`, and a 60s
+    min-interval enforced so a repeat upstream failure doesn't turn into
+    a tight retry loop.
+
+    Skips quietly when SPACESCAN_ENABLED is off or CAT_ASSET_ID isn't
+    set — nothing to refresh.
+    """
+    global _spacescan_refresh_inflight, _spacescan_refresh_last_at
+
+    if not bool(getattr(cfg, "SPACESCAN_ENABLED", True)):
+        return HealthCheck(
+            name="spacescan_cache", category="wallet", status="pass",
+            severity="info", message="Spacescan disabled.",
+        )
+
+    asset_id = str(getattr(cfg, "CAT_ASSET_ID", "") or "").strip().lower()
+    if not asset_id:
+        return HealthCheck(
+            name="spacescan_cache", category="wallet", status="pass",
+            severity="info", message="No CAT selected.",
+        )
+
+    # Peek at cache age. An expired cache will appear as None here because
+    # get_market_analysis_cache filters by expires_at.
+    try:
+        from database import get_market_analysis_cache
+        cached = get_market_analysis_cache(asset_id, "spacescan")
+    except Exception:
+        cached = None
+
+    if cached:
+        return HealthCheck(
+            name="spacescan_cache", category="wallet", status="pass",
+            severity="info",
+            message=(f"Spacescan cache warm for "
+                     f"{asset_id[:16]}... (has_data="
+                     f"{bool(cached.get('has_data'))})"),
+        )
+
+    # Cache is empty or expired. Rate-limit the refresh so we don't
+    # hammer Spacescan if the upstream is down.
+    now = time.time()
+    if now - _spacescan_refresh_last_at < 60.0:
+        return HealthCheck(
+            name="spacescan_cache", category="wallet", status="pass",
+            severity="info",
+            message="Spacescan cache stale; refresh pending (throttled).",
+        )
+    if _spacescan_refresh_inflight:
+        return HealthCheck(
+            name="spacescan_cache", category="wallet", status="pass",
+            severity="info",
+            message="Spacescan refresh already in flight.",
+        )
+
+    if not auto_repair:
+        return HealthCheck(
+            name="spacescan_cache", category="wallet", status="warn",
+            severity="warning",
+            message=f"Spacescan cache missing/expired for {asset_id[:16]}...",
+            anomaly_count=1,
+        )
+
+    # Kick off the refresh in a background thread — the Spacescan API call
+    # chain can take several seconds, and we don't want to block the health
+    # pass (which holds the loop back).
+    import threading as _threading
+
+    def _do_refresh():
+        global _spacescan_refresh_inflight
+        try:
+            from market_data_collector import refresh_spacescan_cache
+            result = refresh_spacescan_cache(asset_id)
+            if result:
+                slog("BOT_HEALTH",
+                     f"spacescan_cache_refreshed {asset_id[:16]}... "
+                     f"holders={result.get('holder_count', 0)} "
+                     f"activity={result.get('activity_count', 0)}",
+                     level="info")
+            else:
+                slog("BOT_HEALTH",
+                     f"spacescan_cache_refresh_empty {asset_id[:16]}...",
+                     level="info")
+        except Exception as e:
+            slog("BOT_HEALTH",
+                 f"spacescan_cache_refresh_error: {e}",
+                 level="warn")
+        finally:
+            _spacescan_refresh_inflight = False
+
+    _spacescan_refresh_inflight = True
+    _spacescan_refresh_last_at = now
+    _threading.Thread(target=_do_refresh, daemon=True,
+                      name="spacescan-refresh").start()
+
+    return HealthCheck(
+        name="spacescan_cache", category="wallet", status="pass",
+        severity="info",
+        message=f"Spacescan refresh dispatched for {asset_id[:16]}...",
+        repaired_count=1,
+    )
+
+
 # ── Top-level runner ───────────────────────────────────────────────────
 
 # Cache to avoid running checks more often than needed (the bot loop
@@ -1295,6 +1422,7 @@ def run_runtime_checks(auto_repair: bool = True,
     report.checks.append(check_topup_budget_drift(auto_repair=auto_repair))
     report.checks.append(check_funds_advisory(auto_repair=auto_repair))
     report.checks.append(check_splash_daemon(auto_repair=auto_repair))
+    report.checks.append(check_spacescan_cache_stale(auto_repair=auto_repair))
 
     report.duration_ms = (time.time() - start) * 1000.0
     _last_run_lock_ts = time.time()

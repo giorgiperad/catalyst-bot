@@ -2837,6 +2837,10 @@ def get_live_tier_group_counts() -> Dict[str, Dict[str, int]]:
     This is the live source of truth for the GUI tier-group card:
     - free `tier_spare` coins count toward their assigned tier
     - free `reserve` coins count toward `reserve`
+    - free `dust` coins count toward `dust` (change outputs below the
+      smallest tier size; still spendable, just not usable as tier coins
+      without consolidation). Showing this row closes the arithmetic gap
+      where tier totals wouldn't add up to spendable balance.
 
     It intentionally ignores locked/tier_active coins because the dashboard
     copy describes the pool as coins still available before a top-up is needed.
@@ -2844,15 +2848,15 @@ def get_live_tier_group_counts() -> Dict[str, Dict[str, int]]:
     conn = get_connection()
     result = {
         "enabled": True,
-        "xch": {"inner": 0, "mid": 0, "outer": 0, "extreme": 0, "sniper": 0, "fees": 0, "reserve": 0},
-        "cat": {"inner": 0, "mid": 0, "outer": 0, "extreme": 0, "sniper": 0, "fees": 0, "reserve": 0},
+        "xch": {"inner": 0, "mid": 0, "outer": 0, "extreme": 0, "sniper": 0, "fees": 0, "reserve": 0, "dust": 0},
+        "cat": {"inner": 0, "mid": 0, "outer": 0, "extreme": 0, "sniper": 0, "fees": 0, "reserve": 0, "dust": 0},
     }
 
     rows = conn.execute(
         """SELECT wallet_type, designation, assigned_tier, COUNT(*) as cnt
            FROM coins
            WHERE status='free'
-             AND designation IN ('tier_spare', 'reserve')
+             AND designation IN ('tier_spare', 'reserve', 'dust')
            GROUP BY wallet_type, designation, assigned_tier"""
     ).fetchall()
 
@@ -2862,6 +2866,9 @@ def get_live_tier_group_counts() -> Dict[str, Dict[str, int]]:
             continue
         if row["designation"] == "reserve":
             result[wallet_type]["reserve"] += int(row["cnt"] or 0)
+            continue
+        if row["designation"] == "dust":
+            result[wallet_type]["dust"] += int(row["cnt"] or 0)
             continue
         assigned_tier = row["assigned_tier"] or "none"
         if assigned_tier in result[wallet_type]:

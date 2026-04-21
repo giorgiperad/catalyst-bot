@@ -21166,22 +21166,37 @@
                         : '-';
                 }
                 if (el('splashPeersHint')) {
+                    // Tiered hints: low-signal observations stay neutral,
+                    // actionable problems go warning/danger. Keeps the
+                    // panel from crying wolf when the daemon has just seen
+                    // its first couple of offers.
                     const parts = [];
+                    let tone = 'neutral';
                     if (nm.reachable) {
                         const seen = Number(nm.offers_received || 0);
                         const got = Number(receive.total || 0);
-                        if (seen > 0 && got === 0) {
+                        const peerCount = Number(nm.peers || 0);
+                        if (peerCount === 0) {
+                            parts.push('Daemon has no peers — check network/firewall on port 11511.');
+                            tone = 'warning';
+                        } else if (seen >= 10 && got === 0) {
                             parts.push('Daemon has seen ' + seen.toLocaleString()
                                 + ' offers but the webhook has delivered 0 — offer-hook may be broken.');
-                        } else if ((nm.peers || 0) === 0) {
-                            parts.push('Daemon has no peers — check network/firewall on port 11511.');
+                            tone = 'warning';
+                        } else if (seen > 0 && got === 0) {
+                            parts.push('Daemon seen ' + seen + ', webhook delivered 0 — watching.');
                         } else if (seen === 0) {
-                            parts.push('Peers connected but no offers seen yet — gossip may be sparse.');
+                            parts.push('Peers connected — waiting for offers (Splash gossip can be sparse).');
                         }
                     } else if (nm.last_error) {
                         parts.push('Metrics endpoint unreachable: ' + nm.last_error);
+                        tone = 'warning';
                     }
-                    el('splashPeersHint').textContent = parts.join(' ');
+                    const hintEl = el('splashPeersHint');
+                    hintEl.textContent = parts.join(' ');
+                    hintEl.style.color = tone === 'warning'
+                        ? 'var(--status-warning)'
+                        : 'rgba(255,255,255,0.45)';
                 }
                 if (el('splashListenToggle')) {
                     const btn = el('splashListenToggle');
@@ -22047,6 +22062,7 @@
                 sniper: 'Sniper',
                 fees: 'Fees',
                 reserve: 'Reserve',
+                dust: 'Dust (change)',
             };
             return labels[name] || escapeHtml(name);
         }
@@ -22059,7 +22075,7 @@
             const enabled = !!(tierData && tierData.enabled);
             const xch = (tierData && tierData.xch) || {};
             const cat = (tierData && tierData.cat) || {};
-            const order = ['inner', 'mid', 'outer', 'extreme', 'sniper', 'fees', 'reserve'];
+            const order = ['inner', 'mid', 'outer', 'extreme', 'sniper', 'fees', 'reserve', 'dust'];
             const rows = order.filter(name =>
                 Object.prototype.hasOwnProperty.call(xch, name) ||
                 Object.prototype.hasOwnProperty.call(cat, name)
