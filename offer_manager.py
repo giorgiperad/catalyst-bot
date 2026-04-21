@@ -1526,17 +1526,37 @@ class OfferManager:
             exact_tier_spend_mode and prep_headroom_pct <= Decimal("0")
         )
 
+        # Snapshot of surviving same-side offers' PRICES grouped by DB tier.
+        # Consumed by `_interpolate_refill_price` so that refill slots land
+        # INSIDE the existing tier's price band rather than at a fresh
+        # grid position anchored on a mid that has drifted. Initial-ladder
+        # calls (slot_sequence is None) don't use this — they fall back to
+        # the classical `_get_ladder_price` formula. The loop below also
+        # populates the size-dedup set that existed previously.
+        existing_prices_by_tier: Dict[str, List[Decimal]] = {}
         try:
             for open_offer in get_open_offers(side=side, cat_asset_id=asset_id):
-                tier_name = open_offer.get("tier") or "mid"
+                tier_name = (open_offer.get("tier") or "mid").lower()
                 raw_size = open_offer.get("size_xch")
-                if raw_size is None:
+                if raw_size is not None:
+                    try:
+                        size_key = self._size_key(Decimal(str(raw_size)))
+                        used_size_keys_by_tier.setdefault(tier_name, set()).add(size_key)
+                    except Exception:
+                        pass
+                # Price capture — skip non-ladder tiers (sniper/fees/reserve
+                # aren't part of the main book and shouldn't anchor refills).
+                if tier_name in ("sniper", "fees", "reserve"):
+                    continue
+                raw_price = open_offer.get("price_xch") or open_offer.get("price")
+                if raw_price is None:
                     continue
                 try:
-                    size_key = self._size_key(Decimal(str(raw_size)))
+                    p = Decimal(str(raw_price))
+                    if p > 0:
+                        existing_prices_by_tier.setdefault(tier_name, []).append(p)
                 except Exception:
                     continue
-                used_size_keys_by_tier.setdefault(tier_name, set()).add(size_key)
             existing_size_counts_by_tier = {
                 tier_name: len(size_keys)
                 for tier_name, size_keys in used_size_keys_by_tier.items()
@@ -1582,7 +1602,22 @@ class OfferManager:
             if self.is_slot_suspended(side, slot):
                 continue
 
-            price = self._get_ladder_price(slot, side, mid_price, half_spread, total_slots)
+            # Pricing path:
+            #   * Initial-ladder call (slot_sequence is None): classical
+            #     grid formula anchored on mid_price.
+            #   * Refill call (slot_sequence is not None): interpolate
+            #     into the surviving tier band so the new offer lands at
+            #     a price consistent with the existing ladder, even if
+            #     mid has drifted. Falls back to the grid formula when
+            #     the target tier is empty or the surrounding data is
+            #     insufficient.
+            if slot_sequence is not None and existing_prices_by_tier:
+                price = self._interpolate_refill_price(
+                    slot, side, total_slots,
+                    existing_prices_by_tier, mid_price, half_spread,
+                )
+            else:
+                price = self._get_ladder_price(slot, side, mid_price, half_spread, total_slots)
             price = self._apply_price_bounds(
                 price,
                 side,
@@ -2112,6 +2147,157 @@ class OfferManager:
 
         if price <= 0:
             return None
+
+        return price
+
+    def _interpolate_refill_price(
+        self,
+        slot: int,
+        side: str,
+        total_slots: int,
+        existing_prices_by_tier: Dict[str, List[Decimal]],
+        mid_price: Decimal,
+        half_spread: Decimal,
+    ) -> Optional[Decimal]:
+        """Price a refill slot by interpolating into the existing ladder.
+
+        When a filled slot gets refilled, the mid price has usually drifted
+        since the ladder was built. Pricing the replacement from the live
+        mid produces an offer that interleaves with surviving offers at
+        their original prices, scrambling the tier ordering on Dexie and
+        tripping the ladder-taper watchdog.
+
+        This helper anchors refills to the tier they belong to:
+
+        * **≥2 surviving same-tier offers** → interpolate between the
+          tier's closest-to-mid and furthest-from-mid prices, by the
+          slot's rank-within-tier. New offers slot into the gap in the
+          tier's existing price band.
+        * **Exactly 1 surviving same-tier offer** → use it as one anchor
+          and the adjacent tier's boundary as the other. If no neighbour
+          is usable, fall back to the live-mid grid price.
+        * **0 survivors in the target tier** → fall back to
+          ``_get_ladder_price`` anchored on ``mid_price``. The refill
+          repopulates the empty tier from scratch at the current market.
+
+        Sanity guard: if the interpolated price falls outside
+        ``mid × (1 ± MAX_SPREAD_BPS/10000)`` returns None so the caller
+        skips the slot. The graduated-requote path will rebuild the
+        whole ladder when drift is that large — patching would produce
+        economically bad offers.
+        """
+        target_tier = self._classify_tier(slot, total_slots, side=side)
+
+        # Build this side's tier-count map so we can compute rank-within-tier.
+        tier_order = ("inner", "mid", "outer", "extreme")
+        prefix = "BUY_" if (side or "").lower() == "buy" else "SELL_"
+        tier_sizes = {
+            t: int(getattr(cfg, f"{prefix}{t.upper()}_TIER_COUNT", 0) or 0)
+            for t in tier_order
+        }
+        if sum(tier_sizes.values()) == 0:
+            # Legacy shared counts (pre-F62).
+            tier_sizes = {
+                t: int(getattr(cfg, f"{t.upper()}_TIER_COUNT", 0) or 0)
+                for t in tier_order
+            }
+
+        tier_size = tier_sizes.get(target_tier, 0)
+        if tier_size <= 0:
+            # No tier structure configured → no sensible interpolation.
+            return self._get_ladder_price(slot, side, mid_price, half_spread, total_slots)
+
+        # Rank-within-tier is slot minus the total slots in prior tiers.
+        rank_within_tier = slot
+        for t in tier_order:
+            if t == target_tier:
+                break
+            rank_within_tier -= tier_sizes.get(t, 0)
+        if rank_within_tier < 0 or rank_within_tier >= tier_size:
+            # Inconsistency — safer to fall back than extrapolate.
+            return self._get_ladder_price(slot, side, mid_price, half_spread, total_slots)
+
+        # Sort prices by distance-from-mid. Buy side: closest-to-mid is
+        # HIGHEST price (just below mid). Sell side: closest-to-mid is
+        # LOWEST price (just above mid).
+        def _dist_key(p: Decimal) -> Decimal:
+            return -p if (side or "").lower() == "buy" else p
+
+        same_tier_prices = existing_prices_by_tier.get(target_tier) or []
+        sorted_tier = sorted(same_tier_prices, key=_dist_key)
+
+        # Locate adjacent tiers so a lone survivor can still interpolate.
+        prev_tier = None
+        next_tier = None
+        for i, t in enumerate(tier_order):
+            if t == target_tier:
+                if i > 0:
+                    prev_tier = tier_order[i - 1]
+                if i < len(tier_order) - 1:
+                    next_tier = tier_order[i + 1]
+                break
+
+        inner_anchor: Optional[Decimal] = None
+        outer_anchor: Optional[Decimal] = None
+
+        if len(sorted_tier) >= 2:
+            inner_anchor = sorted_tier[0]
+            outer_anchor = sorted_tier[-1]
+        elif len(sorted_tier) == 1:
+            sole = sorted_tier[0]
+            prev_prices = sorted(existing_prices_by_tier.get(prev_tier, []), key=_dist_key) if prev_tier else []
+            next_prices = sorted(existing_prices_by_tier.get(next_tier, []), key=_dist_key) if next_tier else []
+            # Use the adjacent-tier boundary on whichever side the survivor
+            # doesn't cover. If we have neighbour boundaries on both sides,
+            # prefer those as anchors — the sole survivor is already in the
+            # band and the interpolation across the full tier width is
+            # more accurate.
+            if prev_prices:
+                inner_anchor = prev_prices[-1]
+            else:
+                inner_anchor = sole
+            if next_prices:
+                outer_anchor = next_prices[0]
+            else:
+                outer_anchor = sole
+            if inner_anchor == outer_anchor:
+                # Both fell back to the sole survivor → can't interpolate.
+                return self._get_ladder_price(slot, side, mid_price, half_spread, total_slots)
+        else:
+            # Empty tier → fresh grid price anchored on current mid.
+            return self._get_ladder_price(slot, side, mid_price, half_spread, total_slots)
+
+        if inner_anchor is None or outer_anchor is None:
+            return self._get_ladder_price(slot, side, mid_price, half_spread, total_slots)
+
+        # Linear interpolation by rank-within-tier. Formula is side-agnostic
+        # because `sorted_tier` is always [closest, …, furthest] regardless
+        # of which direction "closest" means numerically.
+        denom = Decimal(max(1, tier_size - 1))
+        fraction = Decimal(rank_within_tier) / denom
+        inner_d = Decimal(str(inner_anchor))
+        outer_d = Decimal(str(outer_anchor))
+        price = inner_d + (outer_d - inner_d) * fraction
+
+        if price <= 0:
+            return None
+
+        # Economic sanity guard — reject prices outside MAX_SPREAD_BPS of
+        # mid. A stale tier + big mid move can produce interpolated prices
+        # well off the current market. Returning None skips this slot;
+        # the graduated-requote path will catch up when drift is real.
+        try:
+            max_bps = Decimal(str(getattr(cfg, "MAX_SPREAD_BPS", 2500) or 2500))
+            if max_bps > 0:
+                offset = max_bps / Decimal("10000")
+                lower = mid_price * (Decimal("1") - offset)
+                upper = mid_price * (Decimal("1") + offset)
+                if price < lower or price > upper:
+                    return None
+        except Exception:
+            # Sanity check is best-effort — never block an otherwise valid
+            # refill just because the MAX_SPREAD_BPS config is odd.
+            pass
 
         return price
 

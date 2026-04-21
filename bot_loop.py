@@ -220,7 +220,15 @@ class BotLoop:
         # operator-visible warning.
         self._watchdog_violation_streaks: Dict[tuple, int] = {}
         self._watchdog_post_fill_cooldown_secs: float = 120.0
-        self._watchdog_persistence_threshold: int = 2
+        # Bumped 2 → 5 alongside the refill-price interpolator (see
+        # OfferManager._interpolate_refill_price). Interpolation lets the
+        # bot self-heal a tier-drift violation over the next few refill
+        # cycles; the higher threshold means the dashboard alert only
+        # appears after ~5 audit passes of persistent mismatch — i.e.
+        # when self-heal has genuinely failed and user intervention
+        # (force-requote) is needed. Watchdog runs every 10 cycles, so
+        # this corresponds to ~50 cycles of sustained drift.
+        self._watchdog_persistence_threshold: int = 5
 
         # ---- Ladder anchor state ----
         # Replacement offers must price against the same grid the original
@@ -908,39 +916,37 @@ class BotLoop:
         probe[tid_key] = None
         probe[price_key] = Decimal("0")
 
-        # F67: snap requote baseline from probe-anchored mid → plain mid.
+        # Snap requote baseline from probe-anchored mid → plain mid.
         # At ladder creation we stored the probe-offset mid in
         # _last_quoted_price and the un-anchored mid in _last_quoted_plain_mid.
-        # Once the probe is gone, the existing ladder offers are still priced
-        # against the STALE probe-anchored mid — they don't match the plain
-        # mid the bot now trades against. Replacement offers created while
-        # this stale ladder is live end up interleaved with the old price
-        # grid (inner offers sitting at mid-tier prices, etc.), breaking the
-        # ladder shape. Snapping the baseline silently (the original F67
-        # behaviour) prevents the drift-detection requote from firing and
-        # leaves the misaligned ladder in place. Correct fix: snap the
-        # baseline AND force a one-shot requote on this side so the ladder
-        # realigns to plain_mid cleanly, once.
+        # Once the probe is gone, the main ladder is still priced against
+        # the probe-anchored mid. Previously (F67) we force-requoted the
+        # inner tier on probe clear to avoid a subsequent fill-triggered
+        # replacement landing at plain-mid prices and interleaving with
+        # the surviving probe-anchored offers. That was a workaround for
+        # the refill-pricing interleave, not a market signal.
+        #
+        # The refill-price interpolator (see
+        # OfferManager._interpolate_refill_price) fills gaps into the
+        # existing tier band regardless of where the current mid is, so
+        # any subsequent refill stays in the ladder's original grid. The
+        # forced requote is no longer needed — dropping it saves the
+        # batched ~6+6 cancel/recreate churn that fired ~10 minutes into
+        # every bot session and repeated after every probe cycle.
+        #
+        # We still snap the baseline so the drift-detection code has a
+        # meaningful reference for real market moves going forward.
         try:
             plain_mid = self._last_quoted_plain_mid.get(side, Decimal("0"))
             current_baseline = self._last_quoted_price.get(side, Decimal("0"))
             if plain_mid > 0 and current_baseline != plain_mid:
                 self._last_quoted_price[side] = plain_mid
-                # Consumed — next creation/requote will set a fresh pair
                 self._last_quoted_plain_mid[side] = Decimal("0")
-                # Flag this side for requote so the stale probe-anchored
-                # offers get replaced with plain-mid-anchored ones in a
-                # single coordinated batch, rather than drifting as
-                # individual fill-triggered replacements land at the new
-                # price grid.
-                try:
-                    self._force_requote[side] = True
-                except Exception:
-                    pass
                 log_event("info", "probe_baseline_snap",
                           f"{side} baseline snapped to plain mid "
                           f"({current_baseline:.8f} -> {plain_mid:.8f}) on probe clear; "
-                          f"requote flagged to realign ladder")
+                          f"ladder kept in place — refills will interpolate into the "
+                          f"existing tier band on next fill/expiry turnover")
         except Exception as _e:
             log_event("debug", "probe_baseline_snap_failed",
                       f"Could not snap {side} baseline on probe clear: {_e}")
