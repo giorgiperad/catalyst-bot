@@ -8260,7 +8260,7 @@
                                 <a href="javascript:void(0)" onclick="v4SwitchView('logs')" style="font-size: 10px; color: var(--text-tertiary); text-decoration: none; opacity: 0.7;" onmouseover="this.style.opacity='1'; this.style.color='var(--accent-primary)'" onmouseout="this.style.opacity='0.7'; this.style.color='var(--text-tertiary)'">View full logs →</a>
                             </div>
                             <div class="panel-context-note">Recent bot work only: postings, cancels, fills, probes, requotes, coin work, and recoveries.</div>
-                            <div class="la-body" id="laBody">
+                            <div class="la-body" id="laBody" style="max-height: 280px; overflow-y: auto;">
                                 <div class="la-empty">Waiting for bot to start...</div>
                             </div>
                         </div>
@@ -23127,7 +23127,7 @@
         // Shows only what matters: fills, offers, coins, bot status, errors.
         // Detailed logs go to the Logs tab. Debug goes to the superlog file.
         // =================================================================
-        const _laMax = 5;           // Only show latest 5 entries
+        const _laMax = 60;          // Retain last 60 entries — feed mirrors Logs page
         let _laBuffer = [];         // Entries (newest first)
 
         // Translate technical events into friendly one-liners.
@@ -23478,9 +23478,41 @@
             if (eventType === 'fast_reconcile_applied')
                 return { icon: '🔁', msg: 'Fast reconcile (post-cancel) — picking up returned coins', cls: 'la-info' };
 
-            // --- Everything else: skip from activity feed ---
-            // Only specifically translated events appear in the activity ticker.
-            // All other warnings/errors go to the Logs tab only.
+            // --- Fallback: mirror whatever the Logs page would show ---
+            // Design: the activity feed is meant to be "the Logs page without
+            // having to navigate there", so any event that passes the Logs-page
+            // filter (shouldShowSystemLogEvent) also shows here as a generic
+            // entry. Severity maps to class, icon comes from SYSTEM_LOG_EVENT_ICONS
+            // when available or a default based on severity. Events that were
+            // explicitly `return null`'d above (startup spam, watcher_wake, etc.)
+            // stay filtered because we never reach this fallback for them.
+            if (typeof shouldShowSystemLogEvent === 'function'
+                && shouldShowSystemLogEvent(severity, eventType)) {
+                const sevKey = String(severity || 'info').toLowerCase();
+                const clsBySev = {
+                    error: 'la-error',
+                    warning: 'la-warning',
+                    success: 'la-success',
+                    info: 'la-info',
+                };
+                const defaultIconBySev = {
+                    error: '🚨',
+                    warning: '⚠️',
+                    success: '✅',
+                    info: 'ℹ️',
+                };
+                const mappedIcon = (typeof SYSTEM_LOG_EVENT_ICONS === 'object'
+                    && SYSTEM_LOG_EVENT_ICONS
+                    && SYSTEM_LOG_EVENT_ICONS[eventType]) || defaultIconBySev[sevKey] || 'ℹ️';
+                // Cap message length so a runaway log line doesn't blow out the row.
+                const rawMsgStr = String(m || eventType || '');
+                const msgOut = rawMsgStr.length > 140 ? rawMsgStr.slice(0, 137) + '...' : rawMsgStr;
+                return {
+                    icon: mappedIcon,
+                    msg: msgOut,
+                    cls: clsBySev[sevKey] || 'la-info',
+                };
+            }
             return null;
         }
 
@@ -23524,8 +23556,10 @@
                     badgeHtml = '<span class="fill-cls-badge ' + escapeHtml(e.badge.cls) + '">'
                         + escapeHtml(e.badge.label) + '</span>';
                 }
+                // Timestamps dropped by design — the Logs page is the place for
+                // time-indexed history. The feed is a "what's happening right now"
+                // flow; adding timestamps made every row wider without helping.
                 html += '<div class="la-entry ' + escapeHtml(e.cls) + '">'
-                    + '<span class="la-time">' + escapeHtml(e.time) + '</span>'
                     + '<span class="la-icon">' + escapeHtml(e.icon) + '</span>'
                     + '<span class="la-msg">' + escapeHtml(e.msg) + badgeHtml + '</span>'
                     + '</div>';
