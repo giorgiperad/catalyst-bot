@@ -229,6 +229,17 @@ class BotLoop:
         # (force-requote) is needed. Watchdog runs every 10 cycles, so
         # this corresponds to ~50 cycles of sustained drift.
         self._watchdog_persistence_threshold: int = 5
+        # 2026-04-22: if the same shape-drift has persisted this many passes,
+        # stop waiting for an operator click and auto-dispatch the ShapeFix
+        # flow. Set well above the warn threshold so self-heal and operator
+        # intervention both get a fair chance first. 10 watchdog passes ≈
+        # 100 cycles of unresolved drift — a stronger signal that the
+        # problem needs the cancel+rebuild sequence, not more waiting.
+        self._watchdog_auto_heal_threshold: int = 10
+        # Remember which (side, code, alert_id) we've already auto-healed
+        # this session so we don't fire the orchestrator repeatedly for the
+        # same persistent alert if it somehow reappears mid-flow.
+        self._watchdog_auto_healed: set = set()
 
         # ---- Ladder anchor state ----
         # Replacement offers must price against the same grid the original
@@ -1909,6 +1920,45 @@ class BotLoop:
                               f"Watchdog alert dispatch failed (non-fatal): "
                               f"{_alert_err}")
 
+                # 2026-04-22: auto-dispatch the ShapeFix flow once the same
+                # drift has persisted past the auto-heal threshold. Gates:
+                #   * the issue has trade_ids we can act on
+                #   * the ShapeFixOrchestrator exists and isn't already busy
+                #   * we haven't already auto-healed this alert this session
+                if (has_targets
+                        and new_streak >= self._watchdog_auto_heal_threshold
+                        and alert_id not in self._watchdog_auto_healed):
+                    orchestrator = getattr(self, "shape_fix_orchestrator", None)
+                    if orchestrator is not None:
+                        try:
+                            outcome = orchestrator.start_flow(
+                                side=side,
+                                trade_ids=tids,
+                                alert_id=alert_id,
+                            )
+                            if outcome.get("accepted"):
+                                self._watchdog_auto_healed.add(alert_id)
+                                log_event("info", "watchdog_auto_heal_dispatched",
+                                          f"Auto-heal: {issue.code} on {side} "
+                                          f"persisted {new_streak} passes — "
+                                          f"ShapeFix flow started for "
+                                          f"{len(tids)} offer(s)",
+                                          data={
+                                              "alert_id": alert_id,
+                                              "flow_id": outcome.get("flow_id"),
+                                              "side": side,
+                                              "trade_id_count": len(tids),
+                                              "streak": new_streak,
+                                          })
+                            else:
+                                log_event("debug", "watchdog_auto_heal_busy",
+                                          f"Auto-heal deferred: orchestrator "
+                                          f"busy ({outcome.get('error')})")
+                        except Exception as _ah_err:
+                            log_event("debug", "watchdog_auto_heal_failed",
+                                      f"Auto-heal dispatch failed (non-fatal): "
+                                      f"{_ah_err}")
+
         # Clear any previously-raised watchdog alerts that did NOT fire
         # this pass — those conditions have resolved.
         #
@@ -1952,6 +2002,11 @@ class BotLoop:
             except Exception:
                 pass
         self._watchdog_active_alert_ids = raised_alert_ids
+        # When an alert clears (no longer firing), also forget that we
+        # auto-healed it — so if the same drift recurs later, we'll
+        # dispatch ShapeFix again rather than silently ignoring.
+        if to_clear:
+            self._watchdog_auto_healed -= to_clear
 
         if not issues:
             # All clear — log at debug so we can confirm the watchdog is
