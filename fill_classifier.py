@@ -86,7 +86,7 @@ def classify_fill(
         from config import cfg
         raw_hashes = getattr(cfg, "KNOWN_ARB_PUZZLE_HASHES", [])
         known_arb_hashes = {
-            h.strip().lower().lstrip("0x")
+            h.strip().lower().removeprefix("0x")
             for h in (raw_hashes if isinstance(raw_hashes, (list, tuple)) else [])
             if h.strip()
         }
@@ -134,7 +134,7 @@ def classify_fill(
 
     # --- Arb detection via known puzzle hash ---
     if result.taker_puzzle_hash and known_arb_hashes:
-        norm = result.taker_puzzle_hash.lower().lstrip("0x")
+        norm = result.taker_puzzle_hash.lower().removeprefix("0x")
         if norm in known_arb_hashes:
             result.classification = (
                 FillType.ARB_SWEEP_BUY if side == "sell"
@@ -240,7 +240,7 @@ def _extract_taker_puzzle_hash(detail: Dict, side: str) -> Optional[str]:
     if isinstance(first, dict):
         ph = first.get("puzzle_hash") or first.get("puzzleHash")
         if ph:
-            return str(ph).lower().lstrip("0x")
+            return str(ph).lower().removeprefix("0x")
 
     return None
 

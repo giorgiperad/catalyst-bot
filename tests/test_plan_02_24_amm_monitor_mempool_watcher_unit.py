@@ -99,10 +99,21 @@ class TestComputeCoinId(unittest.TestCase):
         self.assertEqual(compute_coin_id(_PARENT, "ZZZ", 100), "")
 
     def test_0x_prefix_stripped(self):
-        # lstrip("0x") normalises 0x-prefixed inputs
+        # removeprefix("0x") normalises 0x-prefixed inputs without
+        # over-stripping leading zeros in the hash body.
         r1 = compute_coin_id(_PARENT, _PUZZLE, 100)
         r2 = compute_coin_id("0x" + _PARENT, "0x" + _PUZZLE, 100)
         self.assertEqual(r1, r2)
+
+    def test_leading_zero_in_hash_not_over_stripped(self):
+        # Regression: lstrip("0x") would strip leading zeros from the
+        # hash body, producing a short/incorrect input to bytes.fromhex.
+        # "0x0abc..." must strip only the "0x" prefix, not the leading 0.
+        zero_parent = "0" + _PARENT[1:]  # force leading 0 in the hash body
+        r1 = compute_coin_id(zero_parent, _PUZZLE, 100)
+        r2 = compute_coin_id("0x" + zero_parent, _PUZZLE, 100)
+        self.assertEqual(r1, r2)
+        self.assertNotEqual(r1, "")
 
 
 # ---------------------------------------------------------------------------

@@ -429,7 +429,7 @@ class Config:
         # Known arb bot puzzle hashes (hex, no 0x prefix, comma-separated).
         # Used to classify fills as arb sweeps vs retail/combined.
         self.KNOWN_ARB_PUZZLE_HASHES = [
-            h.strip().lower().lstrip("0x")
+            h.strip().lower().removeprefix("0x")
             for h in _str("KNOWN_ARB_PUZZLE_HASHES", "").split(",")
             if h.strip()
         ]

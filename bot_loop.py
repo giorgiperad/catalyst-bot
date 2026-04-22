@@ -2552,12 +2552,19 @@ class BotLoop:
 
         log_event("info", "bot_loop_exit", "Bot loop exited cleanly")
 
-    def _defensive_cancel_active_tiers(self) -> set:
+    def _defensive_cancel_active_tiers(self, side: str = None) -> set:
         """Return the set of tiers currently in-flight from a recent defensive
         cancel. Used by the requote path so it doesn't duplicate cancels the
         mempool watcher already submitted. Entries expire after the
         defensive-cancel grace window (enough for on-chain confirmation +
-        coin return)."""
+        coin return).
+
+        ``side`` (2026-04-22) optionally narrows the result to only the tiers
+        in-flight for that side. Without it (legacy callers), any tier with
+        at least one side in-flight is returned. Tracked entries may be
+        plain tier strings (legacy, both-sides implied) or ``(tier, side)``
+        tuples produced by side-aware cancels.
+        """
         info = getattr(self, "_last_defensive_cancel", None)
         if not info:
             return set()
@@ -2572,16 +2579,27 @@ class BotLoop:
             return set()
         if time.time() - at > self._defensive_cancel_grace_secs:
             return set()
-        if isinstance(tiers, (set, list, tuple)):
-            return set(tiers)
-        return set()
+        if not isinstance(tiers, (set, list, tuple)):
+            return set()
+        result = set()
+        side_lc = side.lower() if isinstance(side, str) else None
+        for entry in tiers:
+            if isinstance(entry, tuple) and len(entry) == 2:
+                tier_name, tier_side = entry
+                if side_lc is None or tier_side == side_lc:
+                    result.add(tier_name)
+            else:
+                # Legacy entry: plain tier string implies both sides in-flight.
+                result.add(entry)
+        return result
 
     def _defensive_cancel_inner_offers(self, reason: str) -> int:
         """Backwards-compat wrapper — cancel inner tier only."""
         return self._defensive_cancel_tiers(("inner",), reason)
 
-    def _defensive_cancel_tiers(self, tiers: tuple, reason: str) -> int:
-        """F83: bulk-cancel offers in the given tiers on both sides.
+    def _defensive_cancel_tiers(self, tiers: tuple, reason: str,
+                                sides: tuple = ("buy", "sell")) -> int:
+        """F83: bulk-cancel offers in the given tiers.
 
         Triggered when the mempool watcher detects a pool spend. The TIER
         SET should grow with the magnitude of the move:
@@ -2590,10 +2608,20 @@ class BotLoop:
           * medium move (5-10%):  ('inner', 'mid')      — inner+mid exposed
           * large move (> 10%):   ('inner', 'mid', 'outer')
 
-        For confirmed price_move signals we know the magnitude and can pick
-        the right tier set. For pre-confirmation imminent_swap signals we
-        don't yet know magnitude, so default to inner-only (the most
-        conservative — at minimum protect the most-exposed offers).
+        The SIDES tuple filters which side's offers are at risk from the
+        move (2026-04-22):
+
+          * direction "up"   (CAT price rising) → our SELL offers are now
+            underpriced vs market → ("sell",)
+          * direction "down" (CAT price falling) → our BUY offers are now
+            overpriced vs market → ("buy",)
+          * unknown direction → both sides (default), caller's choice
+
+        For confirmed price_move signals we know the magnitude AND the
+        direction, so both can be narrowed. Prior behaviour cancelled both
+        sides unconditionally, which wasted 50% of the cancels and the
+        associated fee coins on offers that were now MORE attractive to
+        hold, not less.
 
         Live evidence (test 3, 2026-04-18 ~13.1% Tibet drop):
           - F82 cancelled inner-tier on imminent_swap → 0 inner fills ✓
@@ -2605,26 +2633,32 @@ class BotLoop:
         Returns number of trade_ids submitted for cancel.
         """
         tiers_lc = tuple(t.lower() for t in tiers)
+        sides_lc = tuple(s.lower() for s in sides)
         try:
             from database import get_open_offers
             from config import cfg as _cfg
             asset_id = getattr(_cfg, "CAT_ASSET_ID", "") or ""
-            buys = [o for o in (get_open_offers(side="buy",
-                                                cat_asset_id=asset_id) or [])
-                    if (o.get("tier") or "").lower() in tiers_lc]
-            sells = [o for o in (get_open_offers(side="sell",
-                                                 cat_asset_id=asset_id) or [])
-                     if (o.get("tier") or "").lower() in tiers_lc]
+            buys = []
+            sells = []
+            if "buy" in sides_lc:
+                buys = [o for o in (get_open_offers(side="buy",
+                                                    cat_asset_id=asset_id) or [])
+                        if (o.get("tier") or "").lower() in tiers_lc]
+            if "sell" in sides_lc:
+                sells = [o for o in (get_open_offers(side="sell",
+                                                     cat_asset_id=asset_id) or [])
+                         if (o.get("tier") or "").lower() in tiers_lc]
             tids = [o.get("trade_id") for o in (buys + sells)
                     if o.get("trade_id")]
             tier_label = "+".join(tiers_lc)
+            side_label = "+".join(sides_lc)
             if not tids:
                 log_event("info", "defensive_cancel_skip",
-                          f"Defensive cancel: no {tier_label} offers to cancel "
-                          f"(reason={reason})")
+                          f"Defensive cancel: no {tier_label} {side_label} offers "
+                          f"to cancel (reason={reason})")
                 return 0
             log_event("info", "defensive_cancel_start",
-                      f"Defensive cancel: firing on {len(tids)} {tier_label} offers "
+                      f"Defensive cancel: firing on {len(tids)} {tier_label} {side_label} offers "
                       f"({len(buys)} buy + {len(sells)} sell, reason={reason})")
             try:
                 self.offer_manager.cancel_offers(
@@ -2660,25 +2694,22 @@ class BotLoop:
                 if sig_type == "imminent_swap":
                     log_event("info", "mempool_imminent_wake",
                               "Mempool: pending pool-coin spend detected — "
-                              "pre-emptive defensive cancel + requote",
+                              "waking bot; will evaluate magnitude once reserves confirm",
                               data={"pool_coin_id": (sig.get("pool_coin_id") or "")[:24]})
-                    # F81 (2026-04-18): defensive bulk-cancel of inner-tier
-                    # offers BEFORE the swap confirms. Inner offers sit closest
-                    # to mid and are the most likely to be arbed during an AMM
-                    # move. Cancelling them immediately means the arber finds
-                    # no profitable target on Dexie when their TibetSwap swap
-                    # confirms ~50s later. Mid/outer/extreme offers stay in
-                    # place — they're far enough from mid to absorb the move.
-                    try:
-                        self._defensive_cancel_inner_offers(
-                            reason="mempool_imminent_swap")
-                    except Exception as _dc_err:
-                        log_event("warning", "mempool_defensive_cancel_failed",
-                                  f"Defensive cancel failed: {_dc_err}")
+                    # 2026-04-22: no longer cancels pre-confirmation. The
+                    # mempool signal has no magnitude info, so the prior
+                    # inner-tier blanket cancel fired on every tiny TibetSwap
+                    # trade (20 cancels per trigger) even when inner offers
+                    # were still well inside the edge. On Chia, cancels cost
+                    # real money (one spend + fee coin each, ~19s confirm),
+                    # and nothing lands faster than the next block anyway,
+                    # so the previous behaviour paid to race a race we can
+                    # never win. The confirmed price_move handler below now
+                    # owns defensive cancels — it has magnitude and uses
+                    # MIN_EDGE_BPS-aware trigger + tier scaling. The wake
+                    # below is still useful: it lets fill detection run
+                    # immediately if the spend was a taker hitting us.
                     if not in_cycle:
-                        # Fix C: wake the bot immediately so we can requote
-                        # before the swap confirms, rather than sleeping up
-                        # to LOOP_SECONDS.
                         self._watcher_event.set()
                 elif sig_type == "fill_imminent":
                     coin_id = sig.get("coin_id", "?")[:16]
@@ -2735,20 +2766,37 @@ class BotLoop:
                             tiers = ("inner", "mid")
                         else:
                             tiers = ("inner",)
+                        # 2026-04-22: narrow cancels to the at-risk side.
+                        # direction "up"   → CAT price rising → our SELL
+                        #                    offers now cheap → cancel sells.
+                        # direction "down" → CAT price falling → our BUY
+                        #                    offers now expensive → cancel buys.
+                        # Unknown direction → fall back to both sides.
+                        if direction == "up":
+                            at_risk_sides = ("sell",)
+                        elif direction == "down":
+                            at_risk_sides = ("buy",)
+                        else:
+                            at_risk_sides = ("buy", "sell")
                         try:
                             n = self._defensive_cancel_tiers(
                                 tiers=tiers,
+                                sides=at_risk_sides,
                                 reason=f"mempool_price_move_{pct:.2f}pct_{direction}")
                             log_event("info", "mempool_defensive_cancel_done",
                                       f"price_move {pct:.2f}% {direction} — "
-                                      f"cancelled {n} offers across {'+'.join(tiers)}")
+                                      f"cancelled {n} {'+'.join(at_risk_sides)} offers "
+                                      f"across {'+'.join(tiers)}")
                             # Record the cancel so the next cycle's requote
                             # knows the tier was just cleared and defers to
                             # ladder-fill instead of treating it as cold-start.
+                            # 2026-04-22: record (tier, side) tuples so the
+                            # opposite side (not at risk, not cancelled) isn't
+                            # wrongly deferred by the requote path.
                             try:
                                 self._last_defensive_cancel = {
                                     "at": time.time(),
-                                    "tiers": set(tiers),
+                                    "tiers": {(t, s) for t in tiers for s in at_risk_sides},
                                     "reason": f"mempool_price_move_{pct:.2f}pct_{direction}",
                                 }
                             except Exception:
@@ -5795,7 +5843,7 @@ class BotLoop:
                 # the allowed_tiers is None (no filter applied), so this
                 # only tightens the INNER / INNER_MID paths.
                 if severity not in (RequoteSeverity.FULL, RequoteSeverity.EMERGENCY):
-                    _inflight = self._defensive_cancel_active_tiers()
+                    _inflight = self._defensive_cancel_active_tiers(side=side)
                     if _inflight and _allowed_tiers:
                         _overlap = _allowed_tiers & _inflight
                         if _overlap:

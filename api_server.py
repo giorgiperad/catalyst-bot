@@ -4527,7 +4527,7 @@ def api_fills_arb_wallets():
         })
 
         for row in rows:
-            ph = str(row["taker_puzzle_hash"]).lower().lstrip("0x")
+            ph = str(row["taker_puzzle_hash"]).lower().removeprefix("0x")
             s = stats[ph]
             s["fill_count"] += 1
             if row["sweep_group_id"]:
