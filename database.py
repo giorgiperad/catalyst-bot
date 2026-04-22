@@ -3469,21 +3469,75 @@ def log_event(severity: str, event_type: str, message: str,
         # 3446) still carries the original "critical" severity for
         # high-visibility UI rendering.
         db_severity = "error" if str(severity).lower() == "critical" else severity
-        if event_category:
-            conn.execute(
-                """INSERT INTO events (timestamp, event_type, severity, message, data, event_category)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (now, event_type, db_severity, message,
-                 json.dumps(data) if data else None, event_category)
-            )
-        else:
-            conn.execute(
-                """INSERT INTO events (timestamp, event_type, severity, message, data)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (now, event_type, db_severity, message,
-                 json.dumps(data) if data else None)
-            )
-        conn.commit()
+
+        # Short-timeout write path.
+        # The connection's default busy_timeout is 5000 ms so queries
+        # wait up to 5 s on a locked writer. During log storms from
+        # watchers/posters that adds 5 s of latency to every hot-path
+        # thread that happens to call log_event, amplifying the DB
+        # contention it's trying to observe. Drop the timeout to 500 ms
+        # for this specific insert; on contention we'd rather lose the
+        # low-severity log than stall the cycle, and high-severity logs
+        # get one-shot retry at the full timeout via the OperationalError
+        # branch below.
+        try:
+            conn.execute("PRAGMA busy_timeout=500")
+            if event_category:
+                conn.execute(
+                    """INSERT INTO events (timestamp, event_type, severity, message, data, event_category)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (now, event_type, db_severity, message,
+                     json.dumps(data) if data else None, event_category)
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO events (timestamp, event_type, severity, message, data)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (now, event_type, db_severity, message,
+                     json.dumps(data) if data else None)
+                )
+            conn.commit()
+        except sqlite3.OperationalError as _lock_err:
+            if "locked" in str(_lock_err).lower() and db_severity in ("error", "warning"):
+                # High-severity event: don't drop silently. Retry once at the
+                # full connection timeout before giving up.
+                try:
+                    conn.execute("PRAGMA busy_timeout=5000")
+                    if event_category:
+                        conn.execute(
+                            """INSERT INTO events (timestamp, event_type, severity, message, data, event_category)
+                               VALUES (?, ?, ?, ?, ?, ?)""",
+                            (now, event_type, db_severity, message,
+                             json.dumps(data) if data else None, event_category)
+                        )
+                    else:
+                        conn.execute(
+                            """INSERT INTO events (timestamp, event_type, severity, message, data)
+                               VALUES (?, ?, ?, ?, ?)""",
+                            (now, event_type, db_severity, message,
+                             json.dumps(data) if data else None)
+                        )
+                    conn.commit()
+                except Exception:
+                    raise  # fall through to outer except rollback
+            else:
+                # Low-severity event under contention — drop and release
+                # the lock fast so hot-path threads aren't stalled. The
+                # SSE stream already delivered this event in real time
+                # (see line 3446) so operators still see it live; only
+                # the DB-backed history loses this entry under load.
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                return False
+        finally:
+            # Always restore the connection-level timeout so other
+            # callers on this thread-local connection behave normally.
+            try:
+                conn.execute("PRAGMA busy_timeout=5000")
+            except Exception:
+                pass
         return True
     except Exception:
         # CRITICAL: rollback on failure to release the write lock.
