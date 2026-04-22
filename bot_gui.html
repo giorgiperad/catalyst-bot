@@ -4285,10 +4285,11 @@
             to { opacity: 1; transform: translateY(0); }
         }
         .la-entry .la-time {
-            color: rgba(255,255,255,0.2);
+            color: rgba(255,255,255,0.35);
             font-size: 10px;
+            font-family: var(--font-mono);
             flex-shrink: 0;
-            min-width: 52px;
+            min-width: 42px;
         }
         .la-entry .la-icon {
             flex-shrink: 0;
@@ -4319,9 +4320,7 @@
         .fill-cls-arb         { background: #4c1d95; color: #c4b5fd; }
         .fill-cls-combined    { background: #78350f; color: var(--warning-200); }
         .fill-cls-unknown     { background: #1f2937; color: var(--slate-400); }
-        /* Older entries fade out */
-        .la-entry:nth-child(4) { opacity: 0.5; }
-        .la-entry:nth-child(5) { opacity: 0.3; }
+        /* Five equally-legible rows — older entries cycle off the window */
         .la-empty {
             color: rgba(255,255,255,0.15);
             text-align: center;
@@ -7922,6 +7921,9 @@
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
                     <span id="logsUnreadBadge" aria-live="polite" style="display:none; position:absolute; top:2px; right:2px; background:var(--status-danger); color:white; font-size:9px; font-weight:700; min-width:14px; height:14px; padding:0 3px; border-radius:7px; line-height:14px; text-align:center; box-sizing:border-box; pointer-events:none;"></span>
                 </button>
+                <button class="v4-nav-item" type="button" data-view="data" data-tooltip="Data Reset" aria-label="Data reset" onclick="v4SwitchView('data')">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/></svg>
+                </button>
             </div>
 
             <div class="v4-sidebar-bottom">
@@ -8260,7 +8262,7 @@
                                 <a href="javascript:void(0)" onclick="v4SwitchView('logs')" style="font-size: 10px; color: var(--text-tertiary); text-decoration: none; opacity: 0.7;" onmouseover="this.style.opacity='1'; this.style.color='var(--accent-primary)'" onmouseout="this.style.opacity='0.7'; this.style.color='var(--text-tertiary)'">View full logs →</a>
                             </div>
                             <div class="panel-context-note">Recent bot work only: postings, cancels, fills, probes, requotes, coin work, and recoveries.</div>
-                            <div class="la-body" id="laBody" style="max-height: 280px; overflow-y: auto;">
+                            <div class="la-body" id="laBody" style="min-height: 120px;">
                                 <div class="la-empty">Waiting for bot to start...</div>
                             </div>
                         </div>
@@ -10091,44 +10093,6 @@
                         </div>
                     </div>
 
-                    <!-- ══ SECTION: Data Management ══ -->
-                    <div class="v4-settings-section v4-settings-red">
-                        <div class="v4-settings-section-title" style="color: var(--sell-color);">Data Management <span class="cc-help">?<span class="cc-tooltip">Reset tracking data without touching coin prep or wallet state. All three actions require the bot to be stopped and ask for confirmation. None of these touch on-chain state or settings.</span></span></div>
-                        <div class="v4-settings-hint" style="margin-bottom: 12px;">Clear accumulated tracking data. Each option is independent — pick the one that matches what you want to reset. The bot must be stopped first.</div>
-
-                        <div style="display: grid; grid-template-columns: 1fr; gap: 10px;">
-                            <div style="padding: 10px 12px; background: rgba(248,113,113,0.05); border: 1px solid rgba(248,113,113,0.2); border-radius: 6px;">
-                                <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px;">
-                                    <div style="flex: 1;">
-                                        <div style="font-weight: 600; font-size: 0.95em;">Reset P&amp;L Counters</div>
-                                        <div class="v4-settings-hint" style="margin-top: 2px;">Wipes fill history, round-trips, price history, inventory snapshots, and the position baseline. Open offers, coins, and settings are kept.</div>
-                                    </div>
-                                    <button class="btn" id="btnResetPnl" onclick="handleResetPnL()" style="padding: 8px 14px; background: rgba(248,113,113,0.15); border: 1px solid rgba(248,113,113,0.4); color: var(--sell-color); border-radius: 6px; white-space: nowrap;">Reset P&amp;L</button>
-                                </div>
-                            </div>
-
-                            <div style="padding: 10px 12px; background: rgba(248,113,113,0.05); border: 1px solid rgba(248,113,113,0.2); border-radius: 6px;">
-                                <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px;">
-                                    <div style="flex: 1;">
-                                        <div style="font-weight: 600; font-size: 0.95em;">Clear Offer History</div>
-                                        <div class="v4-settings-hint" style="margin-top: 2px;">Deletes all closed, cancelled, and expired offer rows. Live (open) offers remain. Keeps P&amp;L counters and all other data untouched.</div>
-                                    </div>
-                                    <button class="btn" id="btnResetOfferHistory" onclick="handleClearOfferHistory()" style="padding: 8px 14px; background: rgba(248,113,113,0.15); border: 1px solid rgba(248,113,113,0.4); color: var(--sell-color); border-radius: 6px; white-space: nowrap;">Clear History</button>
-                                </div>
-                            </div>
-
-                            <div style="padding: 10px 12px; background: rgba(248,113,113,0.08); border: 1px solid rgba(248,113,113,0.35); border-radius: 6px;">
-                                <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px;">
-                                    <div style="flex: 1;">
-                                        <div style="font-weight: 600; font-size: 0.95em; color: var(--sell-color);">Full Reset</div>
-                                        <div class="v4-settings-hint" style="margin-top: 2px;">Both of the above, plus runtime stat counters (sniper history, watchdog streaks, fill-tracker state). Coin designations, settings, and wallet state are preserved.</div>
-                                    </div>
-                                    <button class="btn" id="btnResetFull" onclick="handleFullReset()" style="padding: 8px 14px; background: rgba(248,113,113,0.25); border: 1px solid var(--sell-color); color: var(--sell-color); border-radius: 6px; white-space: nowrap; font-weight: 600;">Full Reset</button>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-
                 </div>
 
                 <!-- Sticky footer — always visible at bottom, never scrolls away -->
@@ -10189,6 +10153,56 @@
 
                 </div><!-- /.container (logs) -->
             </div><!-- /#v4View-logs -->
+
+            <!-- ===== DATA RESET VIEW ===== -->
+            <div class="v4-view" id="v4View-data">
+                <div class="container">
+                    <div class="v4-view-header">
+                        <div class="v4-view-header-copy">
+                            <div class="v4-view-kicker">Maintenance</div>
+                            <h1 class="v4-view-title">Data Reset</h1>
+                            <p class="v4-view-subtitle">Clear accumulated tracking data without touching coin prep or wallet state. All three actions require the bot to be stopped and ask for confirmation. None of these touch on-chain state or saved settings.</p>
+                        </div>
+                    </div>
+
+                    <div class="card" style="margin-top: 12px;">
+                        <div class="card-title" style="color: var(--sell-color);">Data Management <span class="cc-help">?<span class="cc-tooltip">Reset tracking data without touching coin prep or wallet state. All three actions require the bot to be stopped and ask for confirmation.</span></span></div>
+                        <div class="v4-settings-hint" style="margin-bottom: 16px;">Each option is independent. Pick the one that matches what you want to reset. The bot must be stopped first.</div>
+
+                        <div style="display: grid; grid-template-columns: 1fr; gap: 10px;">
+                            <div style="padding: 12px 14px; background: rgba(248,113,113,0.05); border: 1px solid rgba(248,113,113,0.2); border-radius: 8px;">
+                                <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px;">
+                                    <div style="flex: 1;">
+                                        <div style="font-weight: 600; font-size: 0.95em;">Reset P&amp;L Counters</div>
+                                        <div class="v4-settings-hint" style="margin-top: 4px;">Wipes fill history, round-trips, price history, inventory snapshots, and the position baseline. Open offers, coins, and settings are kept.</div>
+                                    </div>
+                                    <button class="btn" id="btnResetPnl" onclick="handleResetPnL()" style="padding: 8px 14px; background: rgba(248,113,113,0.15); border: 1px solid rgba(248,113,113,0.4); color: var(--sell-color); border-radius: 6px; white-space: nowrap;">Reset P&amp;L</button>
+                                </div>
+                            </div>
+
+                            <div style="padding: 12px 14px; background: rgba(248,113,113,0.05); border: 1px solid rgba(248,113,113,0.2); border-radius: 8px;">
+                                <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px;">
+                                    <div style="flex: 1;">
+                                        <div style="font-weight: 600; font-size: 0.95em;">Clear Offer History</div>
+                                        <div class="v4-settings-hint" style="margin-top: 4px;">Deletes all closed, cancelled, and expired offer rows. Live (open) offers remain. Keeps P&amp;L counters and all other data untouched.</div>
+                                    </div>
+                                    <button class="btn" id="btnResetOfferHistory" onclick="handleClearOfferHistory()" style="padding: 8px 14px; background: rgba(248,113,113,0.15); border: 1px solid rgba(248,113,113,0.4); color: var(--sell-color); border-radius: 6px; white-space: nowrap;">Clear History</button>
+                                </div>
+                            </div>
+
+                            <div style="padding: 12px 14px; background: rgba(248,113,113,0.08); border: 1px solid rgba(248,113,113,0.35); border-radius: 8px;">
+                                <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px;">
+                                    <div style="flex: 1;">
+                                        <div style="font-weight: 600; font-size: 0.95em; color: var(--sell-color);">Full Reset</div>
+                                        <div class="v4-settings-hint" style="margin-top: 4px;">Both of the above, plus runtime stat counters (sniper history, watchdog streaks, fill-tracker state). Coin designations, settings, and wallet state are preserved.</div>
+                                    </div>
+                                    <button class="btn" id="btnResetFull" onclick="handleFullReset()" style="padding: 8px 14px; background: rgba(248,113,113,0.25); border: 1px solid var(--sell-color); color: var(--sell-color); border-radius: 6px; white-space: nowrap; font-weight: 600;">Full Reset</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div><!-- /.container (data) -->
+            </div><!-- /#v4View-data -->
 
         </div><!-- /.v4-main-content -->
     </div><!-- /.v4-app-shell -->
@@ -23129,7 +23143,11 @@
         // Detailed logs go to the Logs tab. Debug goes to the superlog file.
         // =================================================================
         const _laMax = 60;          // Retain last 60 entries — feed mirrors Logs page
+        const _laWindow = 5;        // Display window — lines shown at once
+        const _laCycleMs = 3500;    // Auto-advance cadence when buffer > window
         let _laBuffer = [];         // Entries (newest first)
+        let _laCycleOffset = 0;     // Where in the buffer the displayed window starts
+        let _laCycleTimer = null;   // setInterval handle for auto-advance
 
         // Translate technical events into friendly one-liners.
         // Returns { icon, msg, cls } or null to skip the event.
@@ -23534,11 +23552,23 @@
             });
             if (_laBuffer.length > _laMax) _laBuffer.length = _laMax;
 
+            // Reset the cycle window so the freshly-arrived event is on screen
+            _laCycleOffset = 0;
+            _laEnsureCycleTimer();
             _laRender();
 
             // Pulse the indicator
             const pulse = document.getElementById('laPulse');
             if (pulse) pulse.classList.add('active');
+        }
+
+        function _laEnsureCycleTimer() {
+            if (_laCycleTimer) return;
+            _laCycleTimer = setInterval(() => {
+                if (_laBuffer.length <= _laWindow) return;  // nothing to cycle
+                _laCycleOffset = (_laCycleOffset + 1) % _laBuffer.length;
+                _laRender();
+            }, _laCycleMs);
         }
 
         function _laRender() {
@@ -23550,17 +23580,27 @@
                 return;
             }
 
+            // Fixed-height window of _laWindow entries. When the buffer has
+            // more than _laWindow entries the window auto-advances (see
+            // _laEnsureCycleTimer) and wraps circularly so older events
+            // cycle back into view without ever introducing a scrollbar.
+            const n = _laBuffer.length;
+            const count = Math.min(_laWindow, n);
+            const offset = n > 0 ? (((_laCycleOffset % n) + n) % n) : 0;
+            const visible = [];
+            for (let i = 0; i < count; i++) {
+                visible.push(_laBuffer[(offset + i) % n]);
+            }
+
             let html = '';
-            for (const e of _laBuffer) {
+            for (const e of visible) {
                 let badgeHtml = '';
                 if (e.badge) {
                     badgeHtml = '<span class="fill-cls-badge ' + escapeHtml(e.badge.cls) + '">'
                         + escapeHtml(e.badge.label) + '</span>';
                 }
-                // Timestamps dropped by design — the Logs page is the place for
-                // time-indexed history. The feed is a "what's happening right now"
-                // flow; adding timestamps made every row wider without helping.
                 html += '<div class="la-entry ' + escapeHtml(e.cls) + '">'
+                    + '<span class="la-time">' + escapeHtml(e.time || '') + '</span>'
                     + '<span class="la-icon">' + escapeHtml(e.icon) + '</span>'
                     + '<span class="la-msg">' + escapeHtml(e.msg) + badgeHtml + '</span>'
                     + '</div>';
@@ -23570,6 +23610,7 @@
 
         function laClear() {
             _laBuffer = [];
+            _laCycleOffset = 0;
             const body = document.getElementById('laBody');
             if (body) body.innerHTML = '<div class="la-empty">Waiting for activity...</div>';
         }

@@ -75,11 +75,31 @@ def _local_api_headers() -> dict:
 try:
     from database import (
         init_database, upsert_coin, set_coin_designation, designate_reserve,
-        get_reserve_coins, mark_coins_gone
+        get_reserve_coins, mark_coins_gone, get_setting, set_setting
     )
     DB_AVAILABLE = True
 except ImportError:
     DB_AVAILABLE = False
+
+
+def _mark_coin_already_advised(coin_id: str) -> None:
+    """Suppress the deposit-advisory alert for a coin that coin prep itself
+    just created/designated as reserve. Without this the advisor treats
+    the post-consolidation pool coin as a freshly-arrived external deposit
+    and asks the operator to allocate it, even though it was already
+    accounted for in the coin-prep plan.
+    """
+    if not DB_AVAILABLE or not coin_id:
+        return
+    try:
+        raw = get_setting("deposit_advisory_advised_coins", "") or ""
+        existing = {s.strip() for s in raw.split(",") if s.strip()}
+        if coin_id in existing:
+            return
+        existing.add(coin_id)
+        set_setting("deposit_advisory_advised_coins", ",".join(sorted(existing)))
+    except Exception:
+        pass
 
 
 
@@ -742,6 +762,7 @@ class CoinPrepWorker:
         if reserve_coin:
             try:
                 designate_reserve(reserve_coin[0], wallet_type, reserve_coin[1])
+                _mark_coin_already_advised(reserve_coin[0])
                 self.log(f"   DB: topup pool coin {wallet_type} → {reserve_coin[0][:16]}... "
                          f"({reserve_coin[1]:,} mojos)")
             except Exception as e:
@@ -768,6 +789,7 @@ class CoinPrepWorker:
                 try:
                     upsert_coin(coin_id, wallet_type, amount)
                     designate_reserve(coin_id, wallet_type, amount)
+                    _mark_coin_already_advised(coin_id)
                     self.log(f"   DB: post-consolidation {wallet_type} topup pool coin → "
                              f"{coin_id[:16]}... ({amount:,} mojos)")
                 except Exception as e:
@@ -1036,6 +1058,7 @@ class CoinPrepWorker:
                     result = designate_reserve(reserve_coin_id, wallet_type, reserve_amount)
                     if result:
                         desig_ok += 1
+                        _mark_coin_already_advised(reserve_coin_id)
                     else:
                         desig_fail += 1
                         self.log("   DB: reserve designation returned False")
@@ -5572,7 +5595,19 @@ class CoinPrepWorker:
                 # Only log full snapshot for non-Sage path (Sage already logged it)
                 self._log_coin_snapshot(self.xch_wallet_id, "XCH", "FINAL")
                 self._log_coin_snapshot(self.cat_wallet_id, "CAT", "FINAL")
-            
+
+            # Suppress the deposit-advisory alert for every coin the prep
+            # run designated as reserve. Without this the advisor treats
+            # the post-prep pool coins as fresh external deposits and asks
+            # the operator to allocate them, even though they were already
+            # accounted for in the prep plan.
+            try:
+                for _wtype in ("xch", "cat"):
+                    for _rc in (get_reserve_coins(_wtype) or []):
+                        _mark_coin_already_advised(_rc.get("coin_id") or "")
+            except Exception as _e:
+                self.log(f"   DB: deposit-advisory backfill skipped: {_e}")
+
             # Complete!
             self.update_status(
                 PrepPhase.COMPLETE,
