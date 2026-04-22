@@ -28079,26 +28079,13 @@
         // SETTINGS MODAL
         // =================================================================
         async function openConfig() {
-            // Block settings navigation while bot is running — redirect to Live Controls
-            if (bot_state && bot_state.running) {
-                const result = await showStyledConfirm({
-                    icon: '&#9881;',
-                    title: 'Settings Locked While Running',
-                    message: 'Core settings cannot be changed while the bot is running.<br><br>Use <strong>Live Controls</strong> on the dashboard for real-time adjustments (spread, inventory, requote), or <strong>stop the bot</strong> first to change setup settings.',
-                    confirmText: 'Go to Live Controls',
-                    cancelText: 'Back',
-                    style: 'warning'
-                });
-                if (result) {
-                    v4SwitchView('dashboard');
-                    // Scroll Live Controls into view after a short delay for view switch
-                    setTimeout(() => {
-                        const lc = document.getElementById('liveControlsSection') || document.getElementById('settingsLiveSection');
-                        if (lc) lc.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                    }, 150);
-                }
-                return;
-            }
+            // Previously this blocked Settings navigation while running and
+            // redirected to a Live Controls panel on the dashboard. That
+            // guard is obsolete after the 2026-04-22 refactor: Settings now
+            // has Live | Setup sub-tabs (Live is safe while running; Setup
+            // shows an amber "applies on restart" banner), so Settings is
+            // always safely enterable. Just switch to the view and let
+            // updateSettingsLock() auto-pick the right sub-tab.
             setSaveConfigButtonState(false);
             if (typeof v4SwitchView === 'function') {
                 await v4SwitchView('settings');
