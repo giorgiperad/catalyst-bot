@@ -14905,12 +14905,16 @@
                 }
             } catch (_) {}
 
-            // 5-minute cooldown (was 60 s).  In quiet markets where REQUOTE_BPS
-            // hasn't been hit, open offers don't get repriced for many minutes.
-            // A 60 s cooldown caused the "repeating recommendation" UX bug where
-            // the same suggestion re-fired every minute because liveSpreadBps
-            // hadn't moved yet.  5 minutes gives one full requote cycle to land.
-            _saSpreadActionCooldownUntil = Date.now() + 300000;
+            // 20-minute cooldown (was 5 min, originally 60 s).
+            // A spread change needs time to (a) propagate to live offers via
+            // requote — REQUOTE_BPS gates this at a 4% price move, which can
+            // take many minutes in a quiet market — and (b) produce observable
+            // fill-rate evidence under the new regime. 5 minutes was enough
+            // for a requote in a normal market but not enough to observe
+            // whether the change actually helped, so the tighten suggestion
+            // kept re-firing and nagging. 20 min covers both requote latency
+            // and a meaningful fills-per-hour window.
+            _saSpreadActionCooldownUntil = Date.now() + 1200000;
             // Immediately refresh advisor so the recommendation disappears
             if (typeof saUpdateAdvisor === 'function' && window._lastDashboard) {
                 saUpdateAdvisor(window._lastDashboard);
