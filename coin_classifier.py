@@ -71,8 +71,14 @@ DEFAULT_DUST_FRACTION = Decimal("0.5")
 
 # Reserve promotion threshold — coins ABOVE this multiple of the largest
 # tier are reserve candidates (too big for any tier slot; function as
-# topup fuel). Matches the legacy _classify_coins_tiered logic.
-DEFAULT_RESERVE_MULTIPLE = Decimal("2.0")
+# topup fuel). Tracks DEFAULT_MAX_RATIO so there is no gap between the
+# largest tier's ceiling and the reserve floor. Before 2026-04-22 this was
+# 2.0 while max_ratio was 1.5, which left coins in the 1.5×–2.0× range as
+# misfits (UNKNOWN) — seen in practice when a split's change coin (e.g. an
+# 8 XCH leftover from an extreme-tier split) sat unclassified while the
+# reserve showed topup_pool=0. With the threshold pulled down, those
+# change coins land in reserve and the topup pool refills naturally.
+DEFAULT_RESERVE_MULTIPLE = Decimal("1.5")
 
 
 # ---------------------------------------------------------------------------
@@ -211,8 +217,14 @@ def classify_coin(
         )
 
     # Reserve: above reserve_multiple × largest. Not a misfit (topup fuel).
+    # Strict `>` so that a coin at exactly reserve_multiple × largest still
+    # flows into the tier loop and registers as OVERSIZE_FIT of the largest
+    # tier (preserves the candidates map callers expect for diagnostics).
+    # When reserve_multiple tracks max_ratio, the coin would match the
+    # largest tier's ceiling and exit as OVERSIZE_FIT; any amount strictly
+    # above that goes to reserve.
     reserve_threshold = int(Decimal(largest_size) * reserve_multiple)
-    if amount_mojos >= reserve_threshold:
+    if amount_mojos > reserve_threshold:
         return CoinClassification(
             amount_mojos=amount_mojos,
             fit=CoinFit.OVER_CEILING,
