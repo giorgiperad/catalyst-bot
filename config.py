@@ -656,6 +656,24 @@ class Config:
         self.COINSET_TIMEOUT = _int("COINSET_TIMEOUT", 5)
         self.COINSET_FALLBACK_WALLET = _bool("COINSET_FALLBACK_WALLET", True)
 
+        # ----- Local Chia full-node RPC (optional, 2026-04-22) -----
+        # When a local full-node is configured, the mempool watcher polls it
+        # directly instead of Coinset's indexed snapshot. Eliminates the
+        # third-party indexer lag that caused 0/13 mempool hits on same-block
+        # sweeps during testing. Leave blank to keep the Coinset path active.
+        # Typical values:
+        #   FULL_NODE_RPC_URL=https://127.0.0.1:8555
+        #   FULL_NODE_CERT_PATH=~/.chia/mainnet/config/ssl/full_node/private_full_node.crt
+        #   FULL_NODE_KEY_PATH=~/.chia/mainnet/config/ssl/full_node/private_full_node.key
+        self.FULL_NODE_RPC_URL = _safe_url("FULL_NODE_RPC_URL", "")
+        self.FULL_NODE_CERT_PATH = _str("FULL_NODE_CERT_PATH", "")
+        self.FULL_NODE_KEY_PATH = _str("FULL_NODE_KEY_PATH", "")
+        self.FULL_NODE_TIMEOUT = _int("FULL_NODE_TIMEOUT", 5)
+        self.FULL_NODE_ENABLED = _bool(
+            "FULL_NODE_ENABLED",
+            "True" if self.FULL_NODE_RPC_URL else "False",
+        )
+
         # ----- Spacescan (V4 — on-chain verification, golden source of truth) -----
         self.SPACESCAN_ENABLED = _bool("SPACESCAN_ENABLED", True)
         self.SPACESCAN_API_KEY = _str("SPACESCAN_API_KEY", "")
@@ -788,6 +806,12 @@ class Config:
         "COIN_IDS_ENABLED",
         # Coinset
         "COINSET_ENABLED", "COINSET_TIMEOUT", "COINSET_FALLBACK_WALLET",
+        # Local Chia full-node RPC (optional zero-lag mempool source).
+        # URL + cert/key paths are updatable from the GUI so the operator
+        # can point the watcher at their own node without editing .env.
+        "FULL_NODE_ENABLED", "FULL_NODE_RPC_URL",
+        "FULL_NODE_CERT_PATH", "FULL_NODE_KEY_PATH",
+        "FULL_NODE_TIMEOUT",
         # Spacescan
         "SPACESCAN_ENABLED", "SPACESCAN_TIMEOUT",
         "SPACESCAN_BALANCE_CHECK_EVERY_N",

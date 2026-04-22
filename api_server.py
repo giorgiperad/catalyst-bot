@@ -10909,6 +10909,51 @@ def api_balances_refresh():
         return _api_error(e, request.path)
 
 
+@app.route("/api/full-node/status", methods=["GET"])
+def api_full_node_status():
+    """Report the mempool watcher's current source and session counters.
+
+    Used by the dashboard to show whether the bot is polling a local Chia
+    full node or falling back to Coinset. Returns the configured URL
+    (credentials paths are NOT returned) and call counts for both sources
+    so operators can see a clean handover after enabling the full-node
+    option.
+    """
+    status = {
+        "success": True,
+        "full_node_enabled": bool(getattr(cfg, "FULL_NODE_ENABLED", False)),
+        "full_node_url": str(getattr(cfg, "FULL_NODE_RPC_URL", "") or ""),
+        "full_node_cert_configured": bool(getattr(cfg, "FULL_NODE_CERT_PATH", "")),
+        "full_node_key_configured": bool(getattr(cfg, "FULL_NODE_KEY_PATH", "")),
+        "full_node_timeout": int(getattr(cfg, "FULL_NODE_TIMEOUT", 5) or 5),
+        "active_source": "coinset",   # overridden below if watcher reports full_node
+        "full_node_calls": 0,
+        "coinset_calls": 0,
+        "fill_warn_hits": 0,
+        "fill_warn_misses": 0,
+    }
+    try:
+        import mempool_watcher as _mw
+        w = getattr(_mw, "_watcher_instance", None)
+        if w is not None:
+            status["active_source"] = (
+                "full_node" if getattr(w, "_full_node_active", False) else "coinset"
+            )
+            status["full_node_calls"] = int(
+                getattr(w, "_full_node_api_calls", 0) or 0
+            )
+            status["coinset_calls"] = int(
+                getattr(w, "_coinset_api_calls", 0) or 0
+            )
+            status["fill_warn_hits"] = int(getattr(w, "_fill_warn_hits", 0) or 0)
+            status["fill_warn_misses"] = int(
+                getattr(w, "_fill_warn_misses", 0) or 0
+            )
+    except Exception as _err:
+        status["watcher_error"] = str(_err)
+    return jsonify(status)
+
+
 @app.route("/api/settings/defaults")
 def api_settings_defaults():
     """Get default settings (current config as defaults for GUI)."""

@@ -6016,31 +6016,43 @@ class BotLoop:
         for _side in ("buy", "sell"):
             self.offer_manager.unsuspend_slots_if_coins_available(_side)
 
+        # 2026-04-22: early-return log levels promoted from debug to info for
+        # sides that are under target. A silent debug-only skip when the
+        # wallet is short of MAX_ACTIVE_*_OFFERS left operators without
+        # visibility into why refills stalled (observed after a 5-fill buy
+        # sweep: ladder stayed at 19/24 for 10+ minutes with every cycle
+        # flagging ladder_anchor_drift and every early-return logged at
+        # debug level). The helper below raises the log level whenever a
+        # side actually needs a refill.
+        def _skip_level(also_under_target: bool) -> str:
+            return "info" if also_under_target else "debug"
+        _buy_under = (cfg.ENABLE_BUY and not skip_buy
+                      and int(current_buy_count or 0) < int(cfg.MAX_ACTIVE_BUY_OFFERS))
+        _sell_under = (cfg.ENABLE_SELL and not skip_sell
+                       and int(current_sell_count or 0) < int(cfg.MAX_ACTIVE_SELL_OFFERS))
+        _any_under = bool(_buy_under or _sell_under)
+
         if cfg.DRY_RUN:
-            log_event("debug", "create_skip", "DRY_RUN is on — not creating offers")
+            log_event(_skip_level(_any_under), "create_skip_dry_run",
+                      "DRY_RUN is on — not creating offers")
             return
 
         # Don't create offers while graceful migration is cancelling old ones —
         # new offers would just get cancelled by the migration thread.
         if self._graceful_creation_blocked():
-            log_event("debug", "create_skip",
+            log_event(_skip_level(_any_under), "create_skip_graceful_migration",
                       "Graceful config migration in progress — not creating offers")
             return
 
         # Don't create main offers while sniper probe is still being confirmed.
         # Wait for probes to survive one loop before deploying the main book.
         if self._probe_state.get("active", False) and not recovery_active:
-            log_event("debug", "create_skip",
-                      "Sniper probe active — waiting for confirmation before main offers")
+            log_event(_skip_level(_any_under), "create_skip_probe_active",
+                      "Sniper probe active — waiting for confirmation before main offers",
+                      data={"probe_state": dict(self._probe_state)})
             return
 
-        needs_main_ladder = (
-            (cfg.ENABLE_BUY  and not skip_buy
-             and int(current_buy_count  or 0) < int(cfg.MAX_ACTIVE_BUY_OFFERS))
-            or
-            (cfg.ENABLE_SELL and not skip_sell
-             and int(current_sell_count or 0) < int(cfg.MAX_ACTIVE_SELL_OFFERS))
-        )
+        needs_main_ladder = _any_under
         if needs_main_ladder:
             current_buy_ids, current_sell_ids, probe_rearmed = self._revalidate_confirmed_probe_edges(
                 current_buy_ids=current_buy_ids,
@@ -6048,7 +6060,7 @@ class BotLoop:
                 arb_gap=arb_gap,
             )
             if probe_rearmed:
-                log_event("debug", "create_skip",
+                log_event(_skip_level(_any_under), "create_skip_probe_rearmed",
                           "Confirmed probe edge disappeared — waiting for re-test before main offers")
                 return
 
@@ -6057,11 +6069,12 @@ class BotLoop:
 
         # Don't create while coin operations are running
         if self.coin_manager.is_busy():
-            log_event("debug", "create_skip", "Coin manager busy — not creating offers")
+            log_event(_skip_level(_any_under), "create_skip_coin_mgr_busy",
+                      "Coin manager busy — not creating offers")
             return
 
         if recovery_active and self._wallet_sync_stale_cycle:
-            log_event("debug", "recovery_create_wait",
+            log_event(_skip_level(_any_under), "recovery_create_wait",
                       "Recovery mode waiting for a fresh wallet view before creating offers")
             return
 
@@ -6098,12 +6111,20 @@ class BotLoop:
         _rq = getattr(self, "_requoted_this_cycle", set())
         if "buy" in _rq:
             skip_buy = True
-            log_event("debug", "create_skip_requoted",
-                      "Skipping buy creation — already requoted this cycle")
+            log_event(_skip_level(_buy_under), "create_skip_requoted",
+                      "Skipping buy creation — already requoted this cycle",
+                      data={"side": "buy",
+                            "effective_count": effective_buy_count,
+                            "target": int(cfg.MAX_ACTIVE_BUY_OFFERS),
+                            "recently_created": self.offer_manager.get_recently_created_count("buy")})
         if "sell" in _rq:
             skip_sell = True
-            log_event("debug", "create_skip_requoted",
-                      "Skipping sell creation — already requoted this cycle")
+            log_event(_skip_level(_sell_under), "create_skip_requoted",
+                      "Skipping sell creation — already requoted this cycle",
+                      data={"side": "sell",
+                            "effective_count": effective_sell_count,
+                            "target": int(cfg.MAX_ACTIVE_SELL_OFFERS),
+                            "recently_created": self.offer_manager.get_recently_created_count("sell")})
 
         buy_enabled  = (cfg.ENABLE_BUY  and not skip_buy
                         and effective_buy_count  < cfg.MAX_ACTIVE_BUY_OFFERS
@@ -6111,6 +6132,60 @@ class BotLoop:
         sell_enabled = (cfg.ENABLE_SELL and not skip_sell
                         and effective_sell_count < cfg.MAX_ACTIVE_SELL_OFFERS
                         and self.risk_manager.should_enable_side("sell", mid_price))
+
+        # 2026-04-22: when a side is under target but disabled, log the
+        # reason at info-level so a stalled refill is diagnosable from the
+        # event stream. Silent gating hides recovery-mode stalls for hours.
+        if _buy_under and not buy_enabled:
+            _rc_buy = self.offer_manager.get_recently_created_count("buy")
+            _reason = []
+            if not cfg.ENABLE_BUY:
+                _reason.append("ENABLE_BUY=False")
+            if skip_buy:
+                _reason.append("skip_buy=True")
+            if effective_buy_count >= cfg.MAX_ACTIVE_BUY_OFFERS:
+                _reason.append(
+                    f"effective_count {effective_buy_count} >= target "
+                    f"{cfg.MAX_ACTIVE_BUY_OFFERS} (current={current_buy_count}, "
+                    f"recently_created={_rc_buy})"
+                )
+            if not self.risk_manager.should_enable_side("buy", mid_price):
+                _reason.append("risk_manager disabled buy side")
+            log_event("info", "create_disabled_buy_under_target",
+                      f"Buy side under target "
+                      f"({current_buy_count}/{cfg.MAX_ACTIVE_BUY_OFFERS}) but "
+                      f"creation disabled: {'; '.join(_reason) or 'unknown'}",
+                      data={"current": current_buy_count,
+                            "effective": effective_buy_count,
+                            "target": int(cfg.MAX_ACTIVE_BUY_OFFERS),
+                            "recently_created": _rc_buy,
+                            "skip_buy": skip_buy,
+                            "enable_buy": cfg.ENABLE_BUY})
+        if _sell_under and not sell_enabled:
+            _rc_sell = self.offer_manager.get_recently_created_count("sell")
+            _reason = []
+            if not cfg.ENABLE_SELL:
+                _reason.append("ENABLE_SELL=False")
+            if skip_sell:
+                _reason.append("skip_sell=True")
+            if effective_sell_count >= cfg.MAX_ACTIVE_SELL_OFFERS:
+                _reason.append(
+                    f"effective_count {effective_sell_count} >= target "
+                    f"{cfg.MAX_ACTIVE_SELL_OFFERS} (current={current_sell_count}, "
+                    f"recently_created={_rc_sell})"
+                )
+            if not self.risk_manager.should_enable_side("sell", mid_price):
+                _reason.append("risk_manager disabled sell side")
+            log_event("info", "create_disabled_sell_under_target",
+                      f"Sell side under target "
+                      f"({current_sell_count}/{cfg.MAX_ACTIVE_SELL_OFFERS}) but "
+                      f"creation disabled: {'; '.join(_reason) or 'unknown'}",
+                      data={"current": current_sell_count,
+                            "effective": effective_sell_count,
+                            "target": int(cfg.MAX_ACTIVE_SELL_OFFERS),
+                            "recently_created": _rc_sell,
+                            "skip_sell": skip_sell,
+                            "enable_sell": cfg.ENABLE_SELL})
 
         # Results containers for parallel threads
         _parallel_results = {"buy": [], "sell": []}

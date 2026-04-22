@@ -86,6 +86,10 @@ class MempoolWatcher:
         coinset_timeout: int = 5,
         tibet_url: str = "https://api.v2.tibetswap.io",
         wake_callback=None,
+        full_node_url: str = "",
+        full_node_cert_path: str = "",
+        full_node_key_path: str = "",
+        full_node_timeout: int = 5,
     ):
         self._pair_id = pair_id
         self._asset_id = asset_id
@@ -95,6 +99,20 @@ class MempoolWatcher:
         self._tibet_url = tibet_url.rstrip("/")
         self._wake_callback = wake_callback  # callable to wake bot loop immediately
 
+        # Local Chia full-node config (optional). When a URL + cert + key
+        # are all provided, the mempool watcher queries the local node
+        # directly via its RPC instead of Coinset's indexed snapshot.
+        # Zero indexer latency; also not subject to Coinset rate limits.
+        self._full_node_url = (full_node_url or "").rstrip("/")
+        self._full_node_cert_path = full_node_cert_path or ""
+        self._full_node_key_path = full_node_key_path or ""
+        self._full_node_timeout = int(full_node_timeout or 5)
+        self._full_node_active: bool = bool(
+            self._full_node_url
+            and self._full_node_cert_path
+            and self._full_node_key_path
+        )
+
         self._lock = threading.Lock()
         self._signals: List[Dict] = []
         self._stop_event = threading.Event()
@@ -102,6 +120,9 @@ class MempoolWatcher:
         # API call counters (session-scoped)
         self._coinset_api_calls: int = 0
         self._tibet_api_calls: int = 0
+        # Count full-node RPC calls separately so diagnostics can show
+        # which source served the mempool queries this session.
+        self._full_node_api_calls: int = 0
         # Fill-miss counters: how often a confirmed fill was pre-warned in
         # mempool vs slipped through between polls. Updated by was_fill_warned().
         self._fill_warn_hits: int = 0
@@ -401,17 +422,43 @@ class MempoolWatcher:
         if not pool_check_needed and not offer_check_needed:
             return
 
+        # Pick the source: local full node if configured, else Coinset.
+        if self._full_node_active:
+            target_url = f"{self._full_node_url}/get_all_mempool_items"
+            cert = (self._full_node_cert_path, self._full_node_key_path)
+            timeout = (3, self._full_node_timeout)
+            source_name = "full_node"
+        else:
+            target_url = f"{self._coinset_url}/get_all_mempool_items"
+            cert = None
+            timeout = (3, self._coinset_timeout)
+            source_name = "coinset"
+
         try:
-            self._coinset_api_calls += 1
-            resp = session.post(
-                f"{self._coinset_url}/get_all_mempool_items",
-                json={},
-                headers={
-                    "content-type": "application/json",
-                    "User-Agent": "ChiaMarketMaker/2.0",
-                },
-                timeout=(3, self._coinset_timeout),
-            )
+            if source_name == "full_node":
+                self._full_node_api_calls += 1
+                resp = session.post(
+                    target_url,
+                    json={},
+                    headers={
+                        "content-type": "application/json",
+                        "User-Agent": "ChiaMarketMaker/2.0",
+                    },
+                    cert=cert,
+                    verify=False,  # Chia uses self-signed certs for local RPC
+                    timeout=timeout,
+                )
+            else:
+                self._coinset_api_calls += 1
+                resp = session.post(
+                    target_url,
+                    json={},
+                    headers={
+                        "content-type": "application/json",
+                        "User-Agent": "ChiaMarketMaker/2.0",
+                    },
+                    timeout=timeout,
+                )
             if resp.status_code != 200:
                 return
             data = resp.json()
@@ -426,7 +473,7 @@ class MempoolWatcher:
             # F81: surface errors at debug so persistent failures are visible
             try:
                 log_event("debug", "mempool_watcher_poll_failed",
-                          f"Mempool poll failed: {_e}")
+                          f"Mempool poll ({source_name}) failed: {_e}")
             except Exception:
                 pass
             return  # network error, retry next interval
@@ -539,6 +586,11 @@ def get_or_create_watcher(
             coinset_url = str(getattr(cfg, "COINSET_API_URL", "https://api.coinset.org") or "")
             coinset_timeout = int(getattr(cfg, "COINSET_TIMEOUT", 5) or 5)
             tibet_url = str(getattr(cfg, "TIBET_API_BASE", "https://api.v2.tibetswap.io") or "https://api.v2.tibetswap.io")
+            fn_enabled = bool(getattr(cfg, "FULL_NODE_ENABLED", False))
+            fn_url = str(getattr(cfg, "FULL_NODE_RPC_URL", "") or "") if fn_enabled else ""
+            fn_cert = str(getattr(cfg, "FULL_NODE_CERT_PATH", "") or "") if fn_enabled else ""
+            fn_key = str(getattr(cfg, "FULL_NODE_KEY_PATH", "") or "") if fn_enabled else ""
+            fn_timeout = int(getattr(cfg, "FULL_NODE_TIMEOUT", 5) or 5)
             _watcher_instance = MempoolWatcher(
                 pair_id=pair_id,
                 asset_id=asset_id,
@@ -547,7 +599,19 @@ def get_or_create_watcher(
                 coinset_timeout=coinset_timeout,
                 tibet_url=tibet_url,
                 wake_callback=wake_callback,
+                full_node_url=fn_url,
+                full_node_cert_path=fn_cert,
+                full_node_key_path=fn_key,
+                full_node_timeout=fn_timeout,
             )
+            if _watcher_instance._full_node_active:
+                try:
+                    log_event("info", "mempool_watcher_full_node_source",
+                              f"Mempool watcher using local full node at "
+                              f"{fn_url} (cert configured). Zero-indexer-lag "
+                              f"mempool poll active.")
+                except Exception:
+                    pass
         elif wake_callback and not _watcher_instance._wake_callback:
             # Attach callback if watcher already exists but had no callback
             _watcher_instance._wake_callback = wake_callback
