@@ -2143,13 +2143,39 @@ def api_status():
             xch_bal = {"spendable": 0, "total": 0}
             cat_bal = {"spendable": 0, "total": 0}
 
-            # Note: pricing/offer fetches below run pre-bot for GUI display.
-            # TODO: Move to /api/dashboard and cache; /api/status should be read-only.
+            # Pre-start pricing cache. Without this, every /api/status poll
+            # (every 5 s) fires a live TibetSwap and Dexie fetch AND writes
+            # a price_lookup / price_found log row — opening the dashboard
+            # before the bot started generated ~720 log rows per hour and
+            # put pointless load on the oracles. Cache the lookup result
+            # for 60 s so log entries and HTTP calls drop to 1 per minute.
+            global _prebot_price_cache  # noqa: PLW0603
+            try:
+                _prebot_price_cache
+            except NameError:  # first call in this process
+                _prebot_price_cache = {"fetched_at": 0.0, "pricing": None,
+                                        "asset_id": ""}
+
             pricing = {"bid": 0, "mid": 0, "ask": 0}
             asset_id = _active_cat.get("asset_id") or (cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else "")
             cat_dec = _active_cat.get("decimals") or getattr(cfg, "CAT_DECIMALS", 3)
-            print(f"[STATUS] Pricing lookup: asset_id={asset_id!r}, decimals={cat_dec}", flush=True)
-            log_event("info", "price_lookup", f"Looking up price for {_active_cat.get('name', 'unknown')}")
+
+            _cache_ttl = 60.0
+            _now_ts = time.time()
+            _use_cache = (
+                _prebot_price_cache.get("pricing") is not None
+                and _prebot_price_cache.get("asset_id") == asset_id
+                and (_now_ts - _prebot_price_cache.get("fetched_at", 0.0)) < _cache_ttl
+            )
+            if _use_cache:
+                pricing = dict(_prebot_price_cache["pricing"])
+                # Skip all HTTP fetches and logging below for this poll —
+                # the cache is fresh enough for a pre-bot dashboard.
+                asset_id = ""
+
+            if asset_id:
+                print(f"[STATUS] Pricing lookup: asset_id={asset_id!r}, decimals={cat_dec}", flush=True)
+                log_event("info", "price_lookup", f"Looking up price for {_active_cat.get('name', 'unknown')}")
             if asset_id:
                 import requests as _req
                 mid = 0
@@ -2238,6 +2264,24 @@ def api_status():
                 _spread_frac = _spread_bps / Decimal("10000")
                 pricing["bid"] = pricing["mid"] * (1 - _spread_frac / 2)
                 pricing["ask"] = pricing["mid"] * (1 + _spread_frac / 2)
+
+            # Cache the freshly-fetched result so the next ~60 s of polls
+            # serves this response without refetching. We stash the
+            # upstream asset_id to invalidate the cache when the operator
+            # switches CATs. If pricing is empty (no price found) we also
+            # cache that so a dead pair doesn't get retried every 5 s.
+            if not _use_cache:
+                asset_id_current = (
+                    _active_cat.get("asset_id")
+                    or (cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else "")
+                    or ""
+                )
+                try:
+                    _prebot_price_cache["pricing"] = dict(pricing)
+                    _prebot_price_cache["asset_id"] = asset_id_current
+                    _prebot_price_cache["fetched_at"] = _now_ts
+                except Exception:
+                    pass
 
             # Fetch open offers from wallet RPC — uses the same normalize path
             # as the bot (get_all_offers → classify_offers_from_list) so prices

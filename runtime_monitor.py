@@ -941,7 +941,20 @@ class RuntimeMonitor:
             self._bot._clear_alert("runtime_monitor")
             self._bot._clear_alert("bot_health_watch")
             return
-        lines = [item.get("detail") or item["message"] for item in active_conditions[:3]]
+        # Show the first 5 conditions (was 3). When more remain, append
+        # an explicit overflow note so the operator knows there are more
+        # problems beyond what the banner shows — previously the 4th+
+        # condition was silently truncated and could go un-triaged while
+        # the banner implied everything visible was the full story.
+        max_visible = 5
+        visible = active_conditions[:max_visible]
+        overflow = max(0, len(active_conditions) - max_visible)
+        lines = [item.get("detail") or item["message"] for item in visible]
+        if overflow:
+            lines.append(
+                f"+{overflow} more condition{'s' if overflow != 1 else ''} "
+                f"not shown — check the health log for the full list"
+            )
         title = "Bot Health Warning" if status == "warning" else "Bot Health Critical"
         severity = "warning" if status == "warning" else "error"
         self._bot._emit_alert(
