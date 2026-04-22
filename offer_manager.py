@@ -71,6 +71,13 @@ CANCEL_PENDING_METHODS = frozenset({
     "submitted_pending_confirm",
     "already_in_mempool",
     "mempool_conflict_inflight",
+    # "already_gone_ambiguous" represents a Sage 404 on the cancel RPC:
+    # the offer is no longer in the wallet but Sage does NOT tell us
+    # whether it was cancelled, filled, or expired. DB status must stay
+    # open so fill_tracker (Spacescan) and bot_health (Dexie reconcile)
+    # can settle the real state — writing `cancelled` here would silently
+    # misclassify any fills that raced the cancel.
+    "already_gone_ambiguous",
 })
 
 
@@ -2809,11 +2816,16 @@ class OfferManager:
                     # Submission accepted but not on-chain yet. Leave DB
                     # status alone — a later cancel reconcile or fill
                     # detection will catch the true state once the TX
-                    # confirms (or times out in the mempool).
+                    # confirms (or times out in the mempool). For the
+                    # specific "already_gone_ambiguous" case (Sage 404)
+                    # also drop the local bot-cancel flag so fill_tracker
+                    # does not skip on-chain verification on the next pass.
                     log_event("debug", "cancel_pending_mempool",
                               f"Cancel for {tid[:16]}... submitted but not "
                               f"yet confirmed (method={method}); leaving DB "
                               f"status open")
+                    if method == "already_gone_ambiguous":
+                        self._bot_cancelled_ids.discard(tid)
                     continue
                 # update_offer_status propagates lifecycle_state → "cancelled" automatically
                 update_offer_status(tid, "cancelled")
@@ -2903,10 +2915,15 @@ class OfferManager:
                         # DB status alone — a later cancel reconcile or
                         # fill detection will catch the true state once
                         # the TX confirms (or times out in the mempool).
+                        # For Sage 404 ("already_gone_ambiguous") also drop
+                        # the local bot-cancel marker so fill_tracker does
+                        # not skip on-chain verification.
                         log_event("debug", "cancel_pending_mempool",
                                   f"Cancel for {tid[:16]}... submitted but "
                                   f"not yet confirmed (method={method}); "
                                   f"leaving DB status open")
+                        if method == "already_gone_ambiguous":
+                            self._bot_cancelled_ids.discard(tid)
                     else:
                         update_offer_status(tid, "cancelled")
                 else:
@@ -3439,9 +3456,49 @@ class OfferManager:
             info["attempts"] = attempts + 1
 
             if res and res.get("success"):
+                method = str(res.get("method") or "")
+                if method in CANCEL_PENDING_METHODS:
+                    # Submission accepted but not on-chain yet. Don't mark
+                    # DB cancelled — a later bot_health cancel reconcile or
+                    # fill_tracker sweep will settle the true state once
+                    # the TX confirms (or the mempool entry times out).
+                    log_event("debug", "cancel_retry_pending_mempool",
+                              f"Cancel retry for {trade_id[:16]}... submitted but "
+                              f"not yet confirmed (method={method}); leaving DB "
+                              f"status open for bot_health to verify")
+                    try:
+                        mark_cancel_attempted(trade_id)
+                    except Exception:
+                        pass
+                    # Keep in retry list but reset attempt counter so we
+                    # don't re-fire before the pending TX has a chance to
+                    # confirm. bot_health.check_pending_cancels will close
+                    # the loop when Dexie reports the final state.
+                    to_remove.append(trade_id)
+                    continue
+                if res.get("already_gone") or res.get("uncertain"):
+                    # Sage returned 404 "Missing offer" or an uncertain HTTP
+                    # status. "Missing offer" can mean filled, cancelled or
+                    # expired — we DO NOT know which. Leave DB status open
+                    # so fill_tracker (Spacescan golden gate) or bot_health
+                    # (Dexie reconcile) can decide. Keep _bot_cancelled_ids
+                    # cleared so fill_tracker doesn't short-circuit on it.
+                    log_event("warning", "cancel_retry_ambiguous",
+                              f"Cancel retry for {trade_id[:16]}... returned "
+                              f"ambiguous Sage response (already_gone={bool(res.get('already_gone'))}, "
+                              f"uncertain={bool(res.get('uncertain'))}); deferring "
+                              f"to fill/cancel reconcile",
+                              data={"trade_id": trade_id, "res_method": method})
+                    self._bot_cancelled_ids.discard(trade_id)
+                    try:
+                        mark_cancel_attempted(trade_id)
+                    except Exception:
+                        pass
+                    to_remove.append(trade_id)
+                    continue
                 log_event("info", "cancel_retry_success",
                           f"Cancel retry succeeded for {trade_id[:16]}... "
-                          f"(attempt {info['attempts']})")
+                          f"(attempt {info['attempts']}, method={method or 'unspecified'})")
                 update_offer_status(trade_id, "cancelled")
                 success_count += 1
                 to_remove.append(trade_id)

@@ -935,37 +935,85 @@ def _poll_tray_status(tray, interval: float = 3.0):
 
 
 def _wire_notifications(notifier):
+    """Bridge bot EventBus events to OS-level notifications.
+
+    EventBus.subscribe() returns a Queue of {"type", "data", "ts"} messages
+    for ALL event types — it is NOT a topic+callback subscription. The
+    previous implementation passed ("fill", on_fill) to subscribe(), which
+    raised TypeError and silently failed inside the try/except, leaving
+    OS notifications completely unwired for the entire session.
+
+    Here we subscribe once to get a queue, then spawn a daemon thread that
+    reads messages and dispatches them to the notifier by event type. The
+    thread is a daemon so it dies with the app; if EventBus is missing
+    (tests, headless mode) the function returns quietly.
     """
-    Wire the notification manager to bot events.
-    This hooks into the SSE EventBus so notifications fire on fills, errors, etc.
-    """
+    import threading as _threading
+
     try:
         import api_server
-        bus = getattr(api_server, "events", None)
-        if bus and hasattr(bus, "subscribe"):
-            # Subscribe to fill events
-            def on_fill(data):
-                side = data.get("side", "?")
-                amount = data.get("amount", "?")
-                price = data.get("price", "?")
-                notifier.notify(
-                    title="Offer Filled",
-                    message=f"{side.upper()}: {amount} at {price}",
-                    category="fill"
-                )
-            bus.subscribe("fill", on_fill)
-
-            # Subscribe to error events
-            def on_error(data):
-                msg = data.get("message", "Unknown error")
-                notifier.notify(
-                    title="Bot Error",
-                    message=msg,
-                    category="error"
-                )
-            bus.subscribe("critical", on_error)
     except Exception:
-        pass  # Non-critical â€” app works fine without notification wiring
+        return
+
+    bus = getattr(api_server, "events", None)
+    if not bus or not hasattr(bus, "subscribe"):
+        return
+
+    try:
+        q = bus.subscribe()
+    except Exception as _sub_err:
+        try:
+            from super_log import slog as _slog
+            _slog("DESKTOP", f"Notification subscribe failed: {_sub_err}",
+                  level="warn")
+        except Exception:
+            pass
+        return
+
+    def _dispatch():
+        while True:
+            try:
+                msg = q.get()
+            except Exception:
+                return
+            if not isinstance(msg, dict):
+                continue
+            ev_type = str(msg.get("type") or "")
+            data = msg.get("data") or {}
+            try:
+                if ev_type == "fill":
+                    side = str(data.get("side", "?"))
+                    amount = data.get("amount", "?")
+                    price = data.get("price", "?")
+                    notifier.notify(
+                        title="Offer Filled",
+                        message=f"{side.upper()}: {amount} at {price}",
+                        category="fill",
+                    )
+                elif ev_type in ("critical", "error"):
+                    notifier.notify(
+                        title="Bot Error",
+                        message=str(data.get("message") or data.get("msg")
+                                    or "Unknown error"),
+                        category="error",
+                    )
+                elif ev_type == "alert":
+                    severity = str(data.get("severity", "info")).lower()
+                    if severity in ("error", "warning", "critical"):
+                        notifier.notify(
+                            title=str(data.get("title") or "CATalyst alert"),
+                            message=str(data.get("message") or ""),
+                            category=severity,
+                        )
+            except Exception:
+                # A misbehaving notifier must never kill the dispatcher —
+                # swallow so other events keep flowing.
+                continue
+
+    t = _threading.Thread(target=_dispatch,
+                          name="catalyst-notifications",
+                          daemon=True)
+    t.start()
 
 
 # ---------------------------------------------------------------------------

@@ -379,7 +379,10 @@ class PriceEngine:
             # Check if we've had a good price recently; if the last accepted price is
             # too stale, refuse to quote from historical averages (thin/empty orderbook
             # during volatile periods is exactly when historical averages mislead most).
-            max_stale_secs = int(getattr(cfg, "TIBET_MAX_STALE_SECS", 300))
+            # Ceiling at PRICE_HARD_PAUSE_SECS so the Dexie historical fallback
+            # cannot outlive the hard-pause policy.
+            _hp = int(getattr(cfg, "PRICE_HARD_PAUSE_SECS", 120))
+            max_stale_secs = min(int(getattr(cfg, "TIBET_MAX_STALE_SECS", _hp)), _hp)
             last_price_age = time.time() - self._last_price_time
             if self._last_price_time > 0 and last_price_age > max_stale_secs:
                 log_event("warning", "dexie_fallback_too_stale",
@@ -511,8 +514,17 @@ class PriceEngine:
             log_event("warning", "tibet_parse_error",
                       f"TibetSwap returned unparseable response: {e}")
 
-        # Return stale cache only if within the maximum staleness bound
-        max_stale_secs = int(getattr(cfg, "TIBET_MAX_STALE_SECS", 300))
+        # Return stale cache only if within the maximum staleness bound.
+        # The ceiling is capped by PRICE_HARD_PAUSE_SECS (default 120s) so
+        # the cached fallback cannot outlive the oracle hard-pause policy.
+        # Operators can still tighten TIBET_MAX_STALE_SECS further via env
+        # but not past PRICE_HARD_PAUSE_SECS without reconfiguring the
+        # overall staleness policy in concert.
+        _hard_pause = int(getattr(cfg, "PRICE_HARD_PAUSE_SECS", 120))
+        max_stale_secs = min(
+            int(getattr(cfg, "TIBET_MAX_STALE_SECS", _hard_pause)),
+            _hard_pause,
+        )
         stale_age = time.time() - _tibet_cache["fetched_at"]
         if stale_pairs and stale_age <= max_stale_secs:
             log_event("warning", "tibet_stale_cache",

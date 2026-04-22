@@ -229,6 +229,17 @@ class Config:
         self.TIBET_WEIGHT = _decimal("TIBET_WEIGHT", "0.85")
         self.ARB_ALERT_THRESHOLD_BPS = _decimal("ARB_ALERT_THRESHOLD_BPS", "200")
 
+        # ----- Oracle Staleness Policy -----
+        # Soft threshold: how long the Dexie/Tibet pair can be unavailable
+        # before we alert the operator. Offers stay live until this point
+        # on the last-known mid — beyond it, the operator is told.
+        self.PRICE_STALE_ALERT_SECS = _int("PRICE_STALE_ALERT_SECS", 60)
+        # Hard threshold: once the outage reaches this age, the bot trips
+        # the price circuit breaker, cancels every live offer, and stops
+        # quoting until a price comes back. Prevents the book from sitting
+        # exposed on a stale mid while both oracles are down.
+        self.PRICE_HARD_PAUSE_SECS = _int("PRICE_HARD_PAUSE_SECS", 120)
+
         # ----- Price Safety Guards -----
         # Dynamic limits: auto-calculated as reference_price ± DYNAMIC_LIMIT_PCT%.
         # The reference price is set from the first live price on startup,

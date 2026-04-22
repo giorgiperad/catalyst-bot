@@ -707,7 +707,15 @@ def get_wallet_sync_status() -> dict:
                 "syncing": syncing,
                 "sync_state": sync_state,
             }
-        return {"reachable": True, "synced": False, "syncing": False, "sync_state": "unknown"}
+        # rpc() returned something but _rpc_succeeded() rejected it as a
+        # structured failure (HTTP non-200, error key, malformed payload).
+        # Treat this as "wallet RPC is not actually healthy" so the health
+        # monitor does not show a green tray while the RPC is silently
+        # failing. Previously we returned reachable=True which, combined
+        # with the bot_loop Sage service-ok shortcut, let operators miss
+        # wallet outages entirely.
+        return {"reachable": False, "synced": False, "syncing": False,
+                "sync_state": "rpc_failed"}
     except Exception:
         return {"reachable": False, "synced": False, "syncing": False, "sync_state": "offline"}
 
@@ -2376,13 +2384,19 @@ def cancel_offer(trade_id: str, secure: bool = True, timeout: int = 60,
         # the confirmation poll in cancel_offers_batch will verify.
         print(f"   [Sage] cancel_offer {trade_id[:16]}... HTTP error: {err_str[:200]}")
 
-        # V5 FIX: Sage returns 404 "Missing offer" when the offer is already
-        # gone (cancelled, filled, or expired). This IS a successful cancel
-        # from our perspective — the offer no longer exists. Don't retry.
+        # Sage returns 404 "Missing offer" when the offer is no longer in
+        # the wallet. That can mean CANCELLED, FILLED, or EXPIRED — we do
+        # not yet know which. Earlier versions returned success=True here,
+        # which caused the bot to confidently write `status=cancelled` in
+        # the DB even when the offer had actually filled. We now return a
+        # distinct "already_gone_ambiguous" method so the caller leaves
+        # DB status open and lets fill_tracker / bot_health decide the
+        # final state from on-chain evidence.
         if "404" in err_str or "Missing offer" in err_str or "not found" in err_str.lower():
-            print(f"   [Sage] cancel_offer {trade_id[:16]}... → offer already gone (404), treating as success")
+            print(f"   [Sage] cancel_offer {trade_id[:16]}... → offer already gone (404), deferring to on-chain verification")
             return {"success": True, "already_gone": True,
-                    "note": "Sage 404 — offer already gone"}
+                    "method": "already_gone_ambiguous",
+                    "note": "Sage 404 — offer gone, fill_tracker / bot_health will verify"}
 
         # HTTP 500/202 are NOT success — don't promote them.
         # The retry mechanism in cancel_offers will handle re-attempts.
@@ -3171,21 +3185,66 @@ def cancel_offers_batch(trade_ids: list, secure: bool = True, max_workers: int =
     # ── 5. Final result ──
     elapsed = int(time.time() - start_time)
     if not confirmed:
-        # Check one last time
+        # Sequential-phase entries already in `results` look success=True
+        # even though the cancel TX was only SUBMITTED, never verified on
+        # chain. If we leave them alone here, offer_manager sees method=""
+        # and writes status='cancelled' in the DB — corrupting state when
+        # the TX is actually still pending or has been displaced.
+        # Demote every unconfirmed success to submitted_pending_confirm
+        # so the CANCEL_PENDING_METHODS guard keeps DB status open until
+        # bot_health / fill_tracker observes the real on-chain outcome.
+        # Duplicated (not imported) to avoid a circular import with
+        # offer_manager. Keep in sync with offer_manager.CANCEL_PENDING_METHODS.
+        PENDING_METHODS = frozenset({
+            "submitted_pending_confirm",
+            "already_in_mempool",
+            "mempool_conflict_inflight",
+            "already_gone_ambiguous",
+        })
         try:
             final_coins = _total_spendable()
             final_delta = (final_coins - pre_coins) if (final_coins and pre_coins) else 0
             print(f"   ⏱️ [Sage] Timeout after {elapsed}s — spendable={final_coins}, "
                   f"delta=+{final_delta}")
-            # Even on timeout, if the RPC was accepted treat as "submitted"
-            # — the cancel TX is likely in the mempool and will confirm soon.
+            demoted = 0
             for tid in trade_ids:
-                if tid not in results:
+                existing = results.get(tid)
+                if existing is None:
+                    # Never made it into the sequential-phase dict: mark as
+                    # submitted_pending_confirm so DB stays open.
                     results[tid] = {"success": True,
                                     "method": "submitted_pending_confirm",
                                     "note": f"Cancel submitted, awaiting on-chain confirm "
                                             f"(timed out after {elapsed}s)"}
-        except Exception:
+                    demoted += 1
+                    continue
+                if not existing.get("success"):
+                    # Real failure from the sequential phase — leave alone
+                    # so the retry queue can re-attempt.
+                    continue
+                method = str(existing.get("method") or "")
+                if method in PENDING_METHODS:
+                    # Already flagged pending; nothing to do.
+                    continue
+                # An unconfirmed "success" with no pending tag. Demote it
+                # so downstream consumers do not mistake it for a verified
+                # on-chain cancel.
+                demoted_entry = dict(existing)
+                demoted_entry["method"] = "submitted_pending_confirm"
+                demoted_entry.setdefault(
+                    "previous_method", method or "unspecified"
+                )
+                demoted_entry["note"] = (
+                    f"Cancel submitted but not confirmed within {elapsed}s "
+                    f"— leaving DB open for verifier to settle."
+                )
+                results[tid] = demoted_entry
+                demoted += 1
+            if demoted:
+                print(f"   ⏱️ [Sage] Demoted {demoted} unconfirmed cancels to "
+                      f"submitted_pending_confirm")
+        except Exception as _final_err:
+            print(f"   ⚠️ [Sage] Timeout post-processing failed: {_final_err}")
             for tid in trade_ids:
                 if tid not in results:
                     results[tid] = {"success": False, "error": f"Timed out after {elapsed}s"}

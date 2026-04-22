@@ -3058,11 +3058,55 @@ class BotLoop:
                     try:
                         from wallet_sage import get_all_offers as sage_get_all
                         now_ts_cleanup = int(time.time())
-                        completed = sage_get_all(include_completed=True, start=0, end=500) or []
-                        completed_map = {
-                            (o.get("trade_id") or o.get("offer_id", "")): o
-                            for o in completed if isinstance(o, dict)
-                        }
+                        remaining_stale = set(stale_ids)
+                        completed_map: Dict[str, Dict] = {}
+                        # Previously this call capped at the first 500 Sage
+                        # completed offers; on a long live run, any stale
+                        # offer that drifted past that window was silently
+                        # classified as cancelled, erasing its P&L even
+                        # when it had actually filled. Paginate until we've
+                        # either resolved every stale_id or Sage returns an
+                        # empty page (authoritative end-of-history). Hard
+                        # cap at 40 pages / 20k offers so a pathological
+                        # Sage response can't stall startup forever.
+                        page_size = 500
+                        max_pages = 40
+                        page = 0
+                        while page < max_pages:
+                            start_idx = page * page_size
+                            end_idx = start_idx + page_size
+                            try:
+                                page_offers = sage_get_all(
+                                    include_completed=True,
+                                    start=start_idx,
+                                    end=end_idx,
+                                ) or []
+                            except Exception as _page_err:
+                                log_event("warning", "db_cleanup_page_failed",
+                                          f"Sage completed page {page} failed: "
+                                          f"{_page_err}")
+                                break
+                            if not page_offers:
+                                break
+                            for o in page_offers:
+                                if not isinstance(o, dict):
+                                    continue
+                                tid = o.get("trade_id") or o.get("offer_id", "")
+                                if tid:
+                                    completed_map[tid] = o
+                                    remaining_stale.discard(tid)
+                            page += 1
+                            if not remaining_stale:
+                                break  # all stale_ids resolved, done paginating
+                        if page >= max_pages and remaining_stale:
+                            log_event("warning", "db_cleanup_page_cap_hit",
+                                      f"Stale-offer pagination hit the "
+                                      f"{max_pages * page_size}-offer safety cap "
+                                      f"with {len(remaining_stale)} ids still "
+                                      f"unchecked; treating as cancelled "
+                                      f"(could be incorrect — manual review if "
+                                      f"P&L looks off).",
+                                      data={"unresolved_count": len(remaining_stale)})
                         for tid in stale_ids:
                             sage_offer = completed_map.get(tid)
                             if sage_offer:
@@ -3824,13 +3868,21 @@ class BotLoop:
         )
 
         if price_data is None:
-            # get_price() returns None when the price fails a safety guard
-            # (dynamic band, hard min/max, or step-change guard). Without
-            # any further action the cycle would return early and leave
-            # stale offers exposed at the now-wrong mid — easy money for
-            # arb takers if Tibet has spiked. Route the breach through
-            # the price CB so _safeguard_offers_for_circuit_breaker
-            # cancels everything before we skip.
+            # get_price() returns None for two different failure modes:
+            #   (a) a safety-guard rail breach (handled below via CB), or
+            #   (b) both oracles (Dexie + TibetSwap) failed to produce a
+            #       usable number. Case (b) is an oracle OUTAGE — if we
+            #       don't track how long it has lasted, stale offers sit
+            #       on the book at the old mid while the market may have
+            #       moved. The stale-age counter below escalates the
+            #       response from soft warn (>60s) to hard pause (>120s)
+            #       so the book cannot stay exposed indefinitely.
+            now_outage = time.time()
+            prev_success = float(self._last_pricing_success_ts or 0)
+            outage_age = (now_outage - prev_success) if prev_success > 0 else 0.0
+            stale_threshold = int(getattr(cfg, "PRICE_STALE_ALERT_SECS", 60))
+            hard_pause_threshold = int(getattr(cfg, "PRICE_HARD_PAUSE_SECS", 120))
+
             rail_dir = getattr(self.price_engine, "_last_rail_breach", None)
             rail_kind = getattr(self.price_engine, "_last_rail_breach_kind", None)
             rail_price = getattr(self.price_engine, "_last_rail_breach_price", None)
@@ -3870,6 +3922,71 @@ class BotLoop:
                 except Exception as _e:
                     log_event("error", "rail_breach_safeguard_failed",
                               f"Rail breach safeguard failed: {_e}")
+            # Oracle outage escalation (runs regardless of rail-breach path).
+            # Only escalate once we have a prior success timestamp to measure
+            # against — the first post-startup failure is not yet an outage.
+            if prev_success > 0 and rail_dir not in ("above", "below"):
+                if outage_age >= hard_pause_threshold:
+                    log_event("critical", "price_outage_hard_pause",
+                              f"Oracle outage has lasted {outage_age:.0f}s "
+                              f"(>= {hard_pause_threshold}s hard-pause threshold). "
+                              f"Cancelling all offers and tripping the price CB "
+                              f"so the book does not stay exposed on a stale mid.",
+                              data={"outage_age_secs": outage_age,
+                                    "hard_pause_threshold": hard_pause_threshold})
+                    try:
+                        self.risk_manager.trip_price_rail_breach(
+                            f"oracle outage >= {hard_pause_threshold}s")
+                        self._set_state(status="circuit_breaker")
+                        self._emit_alert(
+                            "circuit_breaker",
+                            "error",
+                            "Oracle Outage — Hard Pause",
+                            f"Price oracle has been unavailable for "
+                            f"{outage_age:.0f}s. All offers cancelled.",
+                            action="stop_bot",
+                            action_label="Stop Bot",
+                        )
+                        self._safeguard_offers_for_circuit_breaker()
+                    except Exception as _e:
+                        log_event("error", "price_outage_safeguard_failed",
+                                  f"Oracle-outage safeguard failed: {_e}")
+                elif outage_age >= stale_threshold:
+                    log_event("warning", "price_outage_stale",
+                              f"Oracle stale for {outage_age:.0f}s "
+                              f"(alert threshold {stale_threshold}s; hard pause "
+                              f"at {hard_pause_threshold}s). Offers still live "
+                              f"on last-known mid.",
+                              data={"outage_age_secs": outage_age,
+                                    "stale_threshold": stale_threshold})
+                    try:
+                        self._emit_alert(
+                            "price_stale",
+                            "warning",
+                            "Oracle Stale",
+                            f"Price sources have not responded for "
+                            f"{outage_age:.0f}s — offers still live. If this "
+                            f"reaches {hard_pause_threshold}s the bot will "
+                            f"hard-pause automatically.",
+                        )
+                    except Exception as _alert_err:
+                        log_event("debug", "price_outage_alert_failed",
+                                  f"Price-stale alert emit failed: {_alert_err}")
+
+            # Run self-heal / reconcile passes even when we can't trade.
+            # These are read/repair-only and do not create or requote offers,
+            # so they are safe during an oracle outage and — critically —
+            # prevent stuck pending-cancel rows, orphan coin locks, and
+            # phantom fills from piling up while pricing is unavailable.
+            # Each check has its own internal throttle (see bot_health.py)
+            # so calling it here does not create extra load.
+            try:
+                from bot_health import run_runtime_checks as _no_price_health
+                _no_price_health(auto_repair=True)
+            except Exception as _hc_err:
+                log_event("debug", "no_price_self_heal_failed",
+                          f"Self-heal during oracle outage failed: {_hc_err}")
+
             log_event("warning", "no_price",
                       "Price rejected by safety guard — skipping cycle. "
                       "Check HARD_MAX_PRICE_XCH / HARD_MIN_PRICE_XCH or dynamic band settings.")
@@ -8369,10 +8486,17 @@ class BotLoop:
                     or "sage"
                 ).strip().lower()
                 wallet_sync_state = str(wallet_info.get("sync_state") or "").strip().lower()
+                # Only treat Sage as "service ok" when the RPC explicitly
+                # says synced. Previously "unknown" was accepted which let
+                # a failing get_sync_status RPC look healthy — operators
+                # could miss wallet outages entirely. A Sage wallet that
+                # genuinely has nothing to sync (empty) will still flow
+                # through the node/peer/fill-tracker checks and is not
+                # relevant for live-operation health anyway.
                 sage_wallet_service_ok = (
                     wallet_type == "sage"
                     and bool(wallet_info.get("reachable"))
-                    and wallet_sync_state in ("", "unknown", "synced")
+                    and wallet_sync_state == "synced"
                 )
                 effective_status = health.get("status", "unknown")
                 effective_healthy = bool(health.get("healthy")) or sage_wallet_service_ok

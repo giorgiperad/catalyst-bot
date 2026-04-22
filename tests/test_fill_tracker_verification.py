@@ -71,7 +71,7 @@ class FillTrackerVerificationTests(unittest.TestCase):
         self.status_updates.append((trade_id, status))
         return True
 
-    def test_unverified_spacescan_result_does_not_record_fill(self):
+    def test_unverified_spacescan_result_parks_for_retry(self):
         tracker = self.fill_tracker.FillTracker()
         trade_id = "trade-unverified"
         tracker._previous_ids["buy"] = {trade_id}
@@ -88,14 +88,18 @@ class FillTrackerVerificationTests(unittest.TestCase):
 
         result = tracker.detect_fills(set(), set(), details_cache)
 
+        # New behaviour: an inconclusive Spacescan result does NOT immediately
+        # retire the offer as cancelled (that path silently erased real fills
+        # during Spacescan outages). Instead the trade is parked in
+        # _pending_reverify and retried on subsequent cycles; only after the
+        # retry budget is exhausted does it get a terminal status — and even
+        # then with an operator-visible error log.
         self.assertEqual(result["buy_fills"], [])
         self.assertEqual(self.recorded, [])
-        self.assertIn((trade_id, "cancelled"), self.status_updates)
-        self.assertTrue(any(evt == "fill_unverified" for _, evt, _, _ in self.logged))
-        self.assertTrue(any(evt == "offer_closed_unverified" for _, evt, _, _ in self.logged))
-        fill_msgs = [msg for _, evt, msg, _ in self.logged if evt == "fill_unverified"]
-        self.assertTrue(any("inconclusive" in msg.lower() for msg in fill_msgs))
-        self.assertFalse(any("spacescan unavailable" in msg.lower() for msg in fill_msgs))
+        self.assertNotIn((trade_id, "cancelled"), self.status_updates)
+        self.assertIn(trade_id, tracker._pending_reverify)
+        self.assertTrue(any(evt == "fill_verify_pending"
+                            for _, evt, _, _ in self.logged))
 
     def test_verified_spacescan_result_records_fill(self):
         self.fake_spacescan.verify_fill = lambda coin_id, our_address: True
@@ -165,7 +169,10 @@ class FillTrackerVerificationTests(unittest.TestCase):
         self.assertEqual(self.recorded, [])
         self.assertTrue(any(evt == "fill_dexie_still_open" for _, evt, _, _ in self.logged))
 
-    def test_dexie_trade_mismatch_blocks_fill_recording(self):
+    def test_dexie_trade_mismatch_defers_to_spacescan(self):
+        # New policy: Spacescan is the golden gate. A Dexie trade_id mismatch
+        # (likely stale Dexie data) must not veto a Spacescan-confirmed fill;
+        # it merely logs a defer message and lets Spacescan decide.
         self.db_offer = {"coin_id": "0xcoin123", "dexie_id": "dexie-mismatch"}
         self.fake_spacescan.verify_fill = lambda coin_id, our_address: True
         self.fake_dexie_manager.get_offer_detail = lambda dexie_id: {
@@ -175,14 +182,18 @@ class FillTrackerVerificationTests(unittest.TestCase):
         }
         tracker = self.fill_tracker.FillTracker()
         trade_id = "trade-mismatch"
+        fill_detail = {"trade_id": trade_id, "side": "sell", "price": "0.1"}
+        tracker._record_fill = lambda trade_id, side, details_cache: fill_detail
         tracker._previous_ids["sell"] = {trade_id}
         tracker._previous_ids["buy"] = set()
 
         result = tracker.detect_fills(set(), set(), {})
 
-        self.assertEqual(result["sell_fills"], [])
-        self.assertEqual(self.recorded, [])
-        self.assertTrue(any(evt == "fill_dexie_trade_mismatch" for _, evt, _, _ in self.logged))
+        self.assertEqual(result["sell_fills"], [fill_detail])
+        self.assertTrue(any(evt == "fill_dexie_trade_mismatch_defer"
+                            for _, evt, _, _ in self.logged))
+        self.assertTrue(any(evt == "fill_verified"
+                            for _, evt, _, _ in self.logged))
 
 
 if __name__ == "__main__":

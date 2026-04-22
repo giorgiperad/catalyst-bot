@@ -286,16 +286,85 @@ def check_pending_cancels(auto_repair: bool = True) -> HealthCheck:
                      f"Re-cancel exception for tid={tid[:16]}...: {e}",
                      level="warn")
 
-    # --- C: suspected fills — flag only, never auto-process ---
-    for off, dexie_off in suspected_fills:
-        tid = off.get("trade_id")
-        slog("BOT_HEALTH",
-             f"Offer tid={tid[:16]}... was marked pending-cancel but Dexie "
-             f"reports COMPLETED — likely the offer filled before cancel "
-             f"landed. Manual review recommended (fill_tracker should pick "
-             f"this up but flagging here for visibility).",
-             data={"trade_id": tid, "dexie_id": off.get("dexie_id")},
-             level="warn")
+    # --- C: suspected fills — attempt Spacescan-verified recovery ---
+    # A pending-cancel row with Dexie status COMPLETED means the offer
+    # was filled BEFORE our cancel landed. fill_tracker may have missed
+    # it because the trade_id no longer appears in a "disappeared" set
+    # (it's out of the _previous_ids window by now). Run Spacescan
+    # directly; if it confirms a real fill, commit the DB status change
+    # and clear the bot-cancel marker so downstream flows reconcile.
+    if auto_repair and suspected_fills:
+        try:
+            from spacescan import verify_fill as _spacescan_verify
+        except Exception:
+            _spacescan_verify = None
+        try:
+            from database import get_locked_coin_ids_for_trade as _get_locked
+        except Exception:
+            _get_locked = None
+        our_address = str(getattr(cfg, "WALLET_ADDRESS", "") or "")
+        for off, dexie_off in suspected_fills:
+            tid = off.get("trade_id")
+            coin_id = off.get("coin_id")
+            candidate_coins = []
+            if _get_locked:
+                try:
+                    candidate_coins = list(_get_locked(tid) or [])
+                except Exception:
+                    candidate_coins = []
+            if coin_id and coin_id not in candidate_coins:
+                candidate_coins.insert(0, coin_id)
+            candidate_coins = [c for c in candidate_coins if c]
+
+            verdict = None
+            if _spacescan_verify and candidate_coins and our_address:
+                for _c in candidate_coins:
+                    try:
+                        verdict = _spacescan_verify(_c, our_address)
+                    except Exception as _sve:
+                        slog("BOT_HEALTH",
+                             f"Spacescan verify raised for tid={tid[:16]}... "
+                             f"coin={_c[:16]}...: {_sve}",
+                             level="debug")
+                        verdict = None
+                    if verdict is not None:
+                        break
+
+            if verdict == "filled":
+                try:
+                    update_offer_status(tid, "filled")
+                    try:
+                        transition_offer(tid, "fill_verified")
+                    except Exception:
+                        pass
+                    msg = (f"recovered_fill tid={tid[:16]}... — Dexie COMPLETED + "
+                           f"Spacescan confirmed on-chain spend")
+                    repair_log.append(msg)
+                    slog("BOT_HEALTH", msg, level="info",
+                         data={"trade_id": tid, "dexie_id": off.get("dexie_id"),
+                               "source": "bot_health.suspected_fill_recovery"})
+                    repaired += 1
+                except Exception as e:
+                    slog("BOT_HEALTH",
+                         f"Failed to commit recovered fill for tid={tid[:16]}...: {e}",
+                         level="warn")
+            else:
+                verdict_str = verdict if verdict is not None else "unavailable"
+                slog("BOT_HEALTH",
+                     f"Offer tid={tid[:16]}... pending-cancel but Dexie reports "
+                     f"COMPLETED. Spacescan verdict={verdict_str}. Leaving for "
+                     f"next cycle; fill_tracker will retry and operator is notified.",
+                     data={"trade_id": tid, "dexie_id": off.get("dexie_id"),
+                           "spacescan_verdict": verdict_str},
+                     level="warn")
+    else:
+        for off, dexie_off in suspected_fills:
+            tid = off.get("trade_id")
+            slog("BOT_HEALTH",
+                 f"Offer tid={tid[:16]}... pending-cancel but Dexie reports "
+                 f"COMPLETED (auto-repair disabled — operator review required).",
+                 data={"trade_id": tid, "dexie_id": off.get("dexie_id")},
+                 level="warn")
 
     anomaly_count = (len(truly_zombie) + len(confirmed_cancelled)
                      + len(suspected_fills))

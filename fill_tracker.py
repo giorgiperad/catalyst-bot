@@ -67,10 +67,21 @@ class FillTracker:
         self._fill_history: List[Dict] = []
         self._max_history: int = 50
 
-        # Dexie detail cache: populated by _check_dexie_offer_state(), consumed
-        # by _record_fill().  Avoids making a second HTTP call for the same offer
-        # just to pass detail to the fill classifier.
+        # Dexie detail cache: populated by _check_dexie_offer_still_open(),
+        # consumed by _record_fill(). Avoids making a second HTTP call for
+        # the same offer just to pass detail to the fill classifier.
         self._last_dexie_details: Dict[str, Optional[Dict]] = {}
+
+        # Unverified-fill retry bookkeeping. A disappeared offer whose on-chain
+        # verification is "unverified" (Spacescan unreachable, coin data not
+        # yet indexed, etc.) used to be retired immediately as cancelled,
+        # which permanently erased any real fill that landed during the
+        # Spacescan outage. Instead, we now park the trade_id here, retry
+        # verification on subsequent cycles, and only retire the offer once
+        # we either get a decisive verdict or exhaust the retry budget.
+        # Map: trade_id → {"side": str, "attempts": int, "first_seen": float}.
+        self._pending_reverify: Dict[str, Dict] = {}
+        self._pending_reverify_max_attempts: int = 6  # ~6 cycles before giving up
 
     # -------------------------------------------------------------------
     # Core fill detection
@@ -96,6 +107,16 @@ class FillTracker:
             log_event("info", "fill_tracker_init",
                       f"Baseline set: {len(current_buy_ids)} buys, {len(current_sell_ids)} sells")
             return result
+
+        # Retry any previously-parked unverified offers before processing new
+        # disappearances. A delayed Spacescan success here will be surfaced as
+        # a fill on the current cycle exactly like a just-disappeared offer.
+        if self._pending_reverify:
+            retry_fills = self._retry_pending_reverify(offer_details_cache or {})
+            if retry_fills.get("buy_fills"):
+                result["buy_fills"].extend(retry_fills["buy_fills"])
+            if retry_fills.get("sell_fills"):
+                result["sell_fills"].extend(retry_fills["sell_fills"])
 
         # Calculate disappeared offers
         disappeared_buy = self._previous_ids["buy"] - current_buy_ids
@@ -269,6 +290,92 @@ class FillTracker:
                     results[tid] = (False, False, "")
         return results
 
+    def _retry_pending_reverify(self, details_cache: Dict[str, Dict]) -> Dict[str, List[Dict]]:
+        """Re-run Spacescan verification for offers parked as 'unverified'.
+
+        Each entry in ``_pending_reverify`` was a disappeared offer whose
+        Spacescan verdict was inconclusive. Here we retry:
+          - "filled" → record fill, clear entry.
+          - "rejected" → retire (expired if local clock says so, else
+            cancelled), clear entry.
+          - "unverified" → increment attempts; if the budget is exhausted,
+            retire conservatively and alert the operator with enough info
+            to resolve manually.
+        """
+        out = {"buy_fills": [], "sell_fills": []}
+        if not self._pending_reverify:
+            return out
+
+        for trade_id, meta in list(self._pending_reverify.items()):
+            side = str(meta.get("side") or "")
+            try:
+                verdict = self._verify_fill_on_chain(trade_id, side)
+            except Exception as _vre:
+                log_event("debug", "fill_reverify_error",
+                          f"Retry verify raised for {trade_id[:16]}...: {_vre}")
+                verdict = "unverified"
+
+            if verdict == "filled":
+                try:
+                    transition_offer(trade_id, "fill_verified")
+                except Exception:
+                    pass
+                fill_detail = self._record_fill(trade_id, side, details_cache)
+                if fill_detail:
+                    key = "buy_fills" if side == "buy" else "sell_fills"
+                    out[key].append(fill_detail)
+                self._pending_reverify.pop(trade_id, None)
+                log_event("warning", "fill_recovered_late",
+                          f"{side.upper()} offer {trade_id[:16]}... recovered "
+                          f"as fill after Spacescan retry (attempts="
+                          f"{meta.get('attempts', 0)})",
+                          data={"trade_id": trade_id, "side": side})
+            elif verdict == "rejected":
+                self._last_dexie_details.pop(trade_id, None)
+                status = "expired" if meta.get("local_clock_expired") else "cancelled"
+                self._retire_local_offer(
+                    trade_id,
+                    side,
+                    details_cache,
+                    status=status,
+                    event_type="offer_closed_nonfill",
+                    severity="info",
+                    suffix=("expired on-chain" if status == "expired"
+                            else "retired after Spacescan rejection"),
+                    data_extra={"verification_state": "rejected"},
+                )
+                self._pending_reverify.pop(trade_id, None)
+            else:
+                attempts = int(meta.get("attempts", 0)) + 1
+                meta["attempts"] = attempts
+                if attempts >= self._pending_reverify_max_attempts:
+                    # Budget exhausted. Retire conservatively but loud —
+                    # the operator needs to confirm fill vs. cancel in
+                    # the wallet / on Spacescan manually.
+                    status = "expired" if meta.get("local_clock_expired") else "cancelled"
+                    self._retire_local_offer(
+                        trade_id,
+                        side,
+                        details_cache,
+                        status=status,
+                        event_type="offer_closed_unverified",
+                        severity="error",
+                        suffix=("exhausted Spacescan retries — expired on local clock"
+                                if status == "expired" else
+                                "exhausted Spacescan retries — manual review"),
+                        data_extra={"verification_state": "exhausted",
+                                    "attempts": attempts},
+                    )
+                    log_event("error", "fill_verify_exhausted",
+                              f"{side.upper()} offer {trade_id[:16]}... failed "
+                              f"to verify after {attempts} Spacescan retries — "
+                              f"retired as {status}. MANUAL REVIEW RECOMMENDED.",
+                              data={"trade_id": trade_id, "side": side,
+                                    "attempts": attempts,
+                                    "final_status": status})
+                    self._pending_reverify.pop(trade_id, None)
+        return out
+
     def _process_disappeared(self, disappeared_ids: Set[str], side: str,
                              details_cache: Dict[str, Dict]) -> List[Dict]:
         """Process disappeared offers — classify as filled, cancelled, or expired.
@@ -314,8 +421,12 @@ class FillTracker:
         _verify_cache: Dict[str, str] = {}
         _verify_candidates: List[str] = []
         for _pv_tid in disappeared_ids:
-            if self._offer_manager and self._offer_manager.is_bot_cancelled(_pv_tid):
-                continue
+            # Do NOT skip bot-cancelled offers here. The in-memory flag is set
+            # BEFORE the cancel RPC lands, so a fill that races the cancel
+            # request would be silently discarded if we early-exit. Let the
+            # normal flow verify on-chain — when Sage/wallet confirms non-fill
+            # we short-circuit below, and when Spacescan confirms fill we
+            # record it correctly, overriding the cancel assumption.
             if _pv_tid in _wallet_status_cache:
                 _pv_still, _pv_closed, _ = _wallet_status_cache[_pv_tid]
                 if _pv_still or _pv_closed:
@@ -358,18 +469,25 @@ class FillTracker:
                           f"falling back to serial verification in main loop")
 
         for trade_id in disappeared_ids:
-            # Check if WE cancelled it (requote, cleanup, etc.)
+            # Do NOT early-exit on bot-cancelled here. The _bot_cancelled_ids
+            # flag is set BEFORE the cancel RPC lands (offer_manager._cancel
+            # path), so a fill that beats the cancel is silently lost if we
+            # trust the flag alone. Instead, let wallet status + Spacescan
+            # verification below decide fill vs. cancel. For offers that
+            # really did cancel cleanly, Sage returns a CANCELLED/EXPIRED
+            # wallet status and the offer_closed_nonfill branch retires
+            # them without a Spacescan round-trip.
             was_cancelled = False
             if self._offer_manager:
                 was_cancelled = self._offer_manager.is_bot_cancelled(trade_id)
 
-            if was_cancelled:
-                log_event("debug", "offer_cancelled_detected",
-                          f"{side.upper()} offer {trade_id[:16]}... was bot-cancelled")
-                continue
-
-            # Check if the offer expired on-chain (max_time passed).
-            # An expired offer's coins return to us — not a fill.
+            # Determine if the offer's max_time has passed according to our
+            # DB. We DO NOT retire as expired on this signal alone — a real
+            # fill can land in the same second that expiry elapses, and
+            # shortcircuiting here silently discards the fill. The flag is
+            # used below, AFTER wallet status and Spacescan verification,
+            # to choose the correct terminal state for a non-fill.
+            local_clock_expired = False
             try:
                 _db_rec = _db_records.get(trade_id)
                 if _db_rec is None:
@@ -386,21 +504,7 @@ class FillTracker:
                         # Handle both "+00:00" and "Z" suffix formats
                         _exp_str = _expires.replace("Z", "+00:00")
                         _exp_ts = _dt.datetime.fromisoformat(_exp_str).timestamp()
-                        if time.time() > _exp_ts:
-                            self._retire_local_offer(
-                                trade_id,
-                                side,
-                                details_cache,
-                                status="expired",
-                                event_type="offer_closed_nonfill",
-                                severity="info",
-                                suffix="expired on-chain",
-                                data_extra={"wallet_status": "EXPIRED"},
-                            )
-                            log_event("debug", "offer_expired_detected",
-                                      f"{side.upper()} offer {trade_id[:16]}... expired "
-                                      f"on-chain — not a fill")
-                            continue
+                        local_clock_expired = time.time() > _exp_ts
             except Exception as _expiry_err:
                 log_event("debug", "expiry_check_error",
                           f"Expiry check failed for {trade_id[:16]}...: {_expiry_err}")
@@ -492,6 +596,16 @@ class FillTracker:
                     transition_offer(trade_id, "fill_verified")
                 except Exception:
                     pass
+                if was_cancelled:
+                    # Cancel/fill race: the bot issued a cancel but the
+                    # counterparty took the offer first. Spacescan confirmed
+                    # the on-chain spend as a fill, so we record it and the
+                    # local cancel assumption is overridden.
+                    log_event("warning", "fill_beat_cancel",
+                              f"{side.upper()} offer {trade_id[:16]}... was marked "
+                              f"bot-cancelled but Spacescan confirms a fill — "
+                              f"recording fill and overriding local cancel state.",
+                              data={"trade_id": trade_id, "side": side})
                 fill_detail = self._record_fill(trade_id, side, details_cache)
                 if fill_detail:
                     fills.append(fill_detail)
@@ -506,17 +620,47 @@ class FillTracker:
                 # Clear any cached Dexie detail — _record_fill() won't run to consume it
                 self._last_dexie_details.pop(trade_id, None)
             elif verification == "unverified":
-                self._last_dexie_details.pop(trade_id, None)  # won't be consumed
-                self._retire_local_offer(
-                    trade_id,
-                    side,
-                    details_cache,
-                    status="cancelled",
-                    event_type="offer_closed_unverified",
-                    severity="warning",
-                    suffix="left wallet — verification pending",
-                    data_extra={"verification_state": "pending"},
-                )
+                # Spacescan couldn't decisively classify the on-chain spend.
+                # Instead of retiring immediately (which used to misclassify
+                # a real fill as cancelled and give the operator no reset
+                # route), park the offer for re-verification across the next
+                # few cycles. A retry path at the top of detect_fills()
+                # re-runs _verify_fill_on_chain for parked entries until
+                # they resolve or the attempt budget is exhausted.
+                existing = self._pending_reverify.get(trade_id)
+                if existing is None:
+                    self._pending_reverify[trade_id] = {
+                        "side": side,
+                        "attempts": 1,
+                        "first_seen": time.time(),
+                        "local_clock_expired": local_clock_expired,
+                    }
+                    log_event("warning", "fill_verify_pending",
+                              f"{side.upper()} offer {trade_id[:16]}... disappeared "
+                              f"but Spacescan unverified — parked for retry "
+                              f"(1/{self._pending_reverify_max_attempts})",
+                              data={"trade_id": trade_id,
+                                    "local_clock_expired": local_clock_expired})
+                else:
+                    existing["attempts"] = int(existing.get("attempts", 0)) + 1
+                    existing["local_clock_expired"] = (
+                        existing.get("local_clock_expired") or local_clock_expired
+                    )
+                    log_event("debug", "fill_verify_pending_retry",
+                              f"{side.upper()} offer {trade_id[:16]}... still "
+                              f"unverified ({existing['attempts']}/"
+                              f"{self._pending_reverify_max_attempts})")
+                # Mark lifecycle_state for operator visibility; do NOT
+                # collapse to a terminal state yet.
+                try:
+                    from offer_lifecycle import OfferState
+                    from database import update_offer_lifecycle_state as _uls
+                    _uls(trade_id, str(getattr(OfferState, "MEMPOOL_OBSERVED", "mempool_observed")))
+                except Exception:
+                    pass
+                # Hold off on clearing cached Dexie details — they'll be
+                # consumed if the retry flips to "filled" before the budget
+                # exhausts.
             # If verification is unavailable, we retire the stale local row
             # conservatively and let later wallet/Sage cleanup upgrade it.
 
@@ -680,10 +824,21 @@ class FillTracker:
                       f"for old offers without coin tracking.")
             return "rejected"
 
-        # Use the primary candidate for Dexie state guard
+        # Use the primary candidate to pre-fetch Dexie detail (for the
+        # _record_fill cache) and to honour ONE narrow Dexie veto: if
+        # Dexie still shows the offer as OPEN, the disappearance is most
+        # likely an RPC/cache blip rather than a real on-chain event, so
+        # we short-circuit before spending a Spacescan call. All other
+        # Dexie states (mismatches, expired-without-completion, etc.)
+        # used to veto here but that let stale Dexie data reject real
+        # fills before Spacescan (the agreed golden gate) could weigh in.
+        # Those cases now fall through to Spacescan for the authoritative
+        # answer; the Dexie detail is still cached for _record_fill().
         primary_coin_id = candidate_coin_ids[0]
-        dexie_guard = self._check_dexie_offer_state(trade_id, db_offer, primary_coin_id)
-        if dexie_guard is False:
+        dexie_still_open = self._check_dexie_offer_still_open(
+            trade_id, db_offer, primary_coin_id
+        )
+        if dexie_still_open is True:
             return "rejected"
 
         # Get our wallet address for self-spend detection
@@ -757,9 +912,13 @@ class FillTracker:
                           f"{trade_id[:16]}... — rejected (likely a cancel).")
                 return "rejected"
 
-            # SAGE_SET_CHANGE_ADDRESS not active — Spacescan false-positive is
-            # still possible (e.g. CAT change back to own address in offer settlement).
-            # Give Dexie a chance to override before hard-rejecting.
+            # SAGE_SET_CHANGE_ADDRESS not active — Spacescan is authoritative.
+            # Per agreed source-of-truth policy (Spacescan golden gate →
+            # Sage → Dexie), Dexie CANNOT override an explicit Spacescan
+            # rejection: that inversion caused phantom fills from stale
+            # Dexie completions. We still surface the disagreement loudly
+            # so the operator can manually reconcile if Dexie turns out
+            # to be right — but we do NOT book the fill automatically.
             try:
                 _dexie_id_rej = (db_offer or {}).get("dexie_id")
                 if _dexie_id_rej:
@@ -770,10 +929,17 @@ class FillTracker:
                         _our_trade_r = str(trade_id).lower().replace("0x", "")
                         _match_r = (_dexie_trade_r == _our_trade_r or not _dexie_trade_r)
                         if _detail_r.get("status") == 4 and _match_r:
-                            log_event("success", "fill_dexie_override_rejected_path",
-                                      f"Spacescan REJECTED but Dexie status=4 confirms "
-                                      f"FILL for {trade_id[:16]}... — recording fill.")
-                            return "filled"
+                            log_event("warning", "fill_spacescan_dexie_disagree",
+                                      f"Spacescan REJECTED {side} fill for "
+                                      f"{trade_id[:16]}... but Dexie status=4 "
+                                      f"suggests COMPLETED. Spacescan is "
+                                      f"authoritative — NOT recording fill. "
+                                      f"Operator should reconcile manually if "
+                                      f"Dexie turns out to be right.",
+                                      data={"trade_id": trade_id, "side": side,
+                                            "dexie_id": _dexie_id_rej,
+                                            "dexie_status": 4,
+                                            "spacescan_verdict": "rejected"})
             except Exception as _dexie_err_r:
                 log_event("debug", "fill_dexie_fallback_failed_rejected_path",
                           f"Dexie fallback (rejected path) failed for "
@@ -925,9 +1091,25 @@ class FillTracker:
                   f"treating as non-fill.")
         return False
 
-    def _check_dexie_offer_state(self, trade_id: str, db_offer: Optional[Dict],
-                                 coin_id: str) -> Optional[bool]:
-        """Use Dexie detail as a veto-only cross-check before fill booking."""
+    def _check_dexie_offer_still_open(self, trade_id: str, db_offer: Optional[Dict],
+                                      coin_id: str) -> Optional[bool]:
+        """Narrow pre-Spacescan check: is Dexie still showing this offer as OPEN?
+
+        Returns True ONLY when Dexie unambiguously reports status=0 (ACTIVE)
+        for the trade_id/coin we were tracking. In that case the "offer
+        disappeared from wallet" signal was almost certainly a Sage/RPC
+        cache blip and not a fill, so we short-circuit.
+
+        All other Dexie signals (trade_id mismatch, coin mismatch, expired,
+        completed, errored, API failure) return None — we defer to the
+        Spacescan golden-gate verification for the authoritative verdict,
+        and Dexie is only used later as a tiebreaker when Spacescan cannot
+        decide.
+
+        The Dexie detail dict (when successfully fetched) is still cached
+        into ``self._last_dexie_details[trade_id]`` so ``_record_fill`` can
+        enrich the fill record without a second HTTP call.
+        """
         if not db_offer:
             return None
 
@@ -950,19 +1132,20 @@ class FillTracker:
         norm_trade_id = str(trade_id).lower().replace("0x", "")
         detail_trade_id = str(detail.get("trade_id") or "").lower().replace("0x", "")
         if detail_trade_id and detail_trade_id != norm_trade_id:
-            log_event("warning", "fill_dexie_trade_mismatch",
+            # Mismatch: log for operator visibility but DO NOT veto.
+            log_event("debug", "fill_dexie_trade_mismatch_defer",
                       f"Dexie detail {dexie_id[:16]}... maps to trade "
                       f"{detail_trade_id[:16]}..., not {norm_trade_id[:16]}... "
-                      f"Treating closure as non-fill.")
-            return False
+                      f"Deferring to Spacescan for authoritative verdict.")
+            return None
 
         tracked_coin = str(coin_id or "").lower().replace("0x", "")
         detail_coin_ids = self._extract_dexie_coin_ids(detail)
         if tracked_coin and detail_coin_ids and tracked_coin not in detail_coin_ids:
-            log_event("warning", "fill_dexie_coin_mismatch",
+            log_event("debug", "fill_dexie_coin_mismatch_defer",
                       f"Dexie detail {dexie_id[:16]}... does not reference coin "
-                      f"{tracked_coin[:16]}... Treating closure as non-fill.")
-            return False
+                      f"{tracked_coin[:16]}... Deferring to Spacescan.")
+            return None
 
         try:
             status_num = int(detail.get("status"))
@@ -971,19 +1154,11 @@ class FillTracker:
 
         if status_num == 0:
             log_event("info", "fill_dexie_still_open",
-                      f"Dexie still shows {trade_id[:16]}... as OPEN — not a fill.")
-            return False
+                      f"Dexie still shows {trade_id[:16]}... as OPEN — "
+                      f"disappearance is likely a Sage cache blip, not a fill.")
+            return True
 
-        completed = detail.get("date_completed")
-        spent_block = detail.get("spent_block_index")
-        expiry_ts = self._parse_iso_ts(detail.get("date_expiry"))
-        if expiry_ts and expiry_ts <= time.time() and not completed and not spent_block:
-            log_event("info", "fill_dexie_expired",
-                      f"Dexie shows {trade_id[:16]}... as expired/closed without "
-                      f"completion metadata — not a fill.")
-            return False
-
-        return True
+        return None
 
     @staticmethod
     def _parse_iso_ts(value: Optional[str]) -> Optional[float]:
@@ -1176,7 +1351,7 @@ class FillTracker:
             from fill_classifier import classify_and_store_fill
             from sweep_coordinator import get_coordinator as _get_sweep_coordinator
 
-            # Use the Dexie detail already fetched by _check_dexie_offer_state()
+            # Use the Dexie detail already fetched by _check_dexie_offer_still_open()
             # (cached in self._last_dexie_details during verification).
             # This avoids a second blocking HTTP call on every fill.
             _dexie_detail = self._last_dexie_details.pop(trade_id, None)
