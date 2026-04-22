@@ -10385,8 +10385,9 @@
     <!-- Keep-history vs Start-fresh confirmation, shown ONLY when the user
          has existing fills / round-trips / non-zero realised PnL before a
          coin-prep run. For a clean wallet this overlay never appears and
-         coin prep starts straight away. -->
-    <div class="modal" id="prepHistoryChoiceModal">
+         coin prep starts straight away. z-index must beat .coin-prep-overlay
+         (9999) because this modal is opened from on top of it. -->
+    <div class="modal" id="prepHistoryChoiceModal" style="z-index: 10001;">
         <div class="v4-modal-shell v4-modal-shell--warning">
             <div class="v4-modal-inner">
                 <div class="v4-modal-hero">
