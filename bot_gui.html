@@ -22613,7 +22613,9 @@
             wallet_unhealthy: '⚠️', wallet_recovery: '💚',
             connectivity_recovery: '💚', startup_wallet_sync: '🔗',
             startup_wallet_result: '🔗', startup_offer_recovery: '🛠️',
-            config_update: '⚙️', config_reload: '⚙️',
+            config_update: '⚙️', config_reload: '⚙️', config_live: '⚙️',
+            deposit_advisory_allocated: '💰',
+            recovery_mode_enter: '🛠️', recovery_mode_exit: '💚',
             startup_sync_done: '🔧',
             gap_closer_start: '📈', gap_closer_stop: '📈',
             gap_closer_step: '📈', gap_closer_arbed: '⚠️',
@@ -23349,6 +23351,63 @@
             // --- Config ---
             if (eventType === 'config_update' || eventType === 'config_reload')
                 return { icon: '⚙️', msg: 'Settings updated', cls: 'la-info' };
+
+            // config_live is emitted when the user (or a recommendation button)
+            // changes a live-tunable setting via /api/config/live. The raw message
+            // is "Live control: KEY = VALUE" — unwrap common keys into friendly
+            // activity-feed entries so users see their button presses land.
+            if (eventType === 'config_live') {
+                const mLive = m.match(/Live control:\s*([A-Z_]+)\s*=\s*(.+?)\s*$/);
+                if (!mLive) return { icon: '⚙️', msg: 'Settings updated', cls: 'la-info' };
+                const liveKey = mLive[1];
+                const liveVal = mLive[2];
+                const toPct = (bps) => {
+                    const n = parseInt(bps, 10);
+                    return Number.isFinite(n) ? (n / 100).toFixed(1) + '%' : bps;
+                };
+                const isOn = (s) => String(s || '').toLowerCase() === 'true';
+                switch (liveKey) {
+                    case 'BASE_SPREAD_BPS':
+                        return { icon: '📐', msg: 'Base spread set to ' + toPct(liveVal), cls: 'la-info' };
+                    case 'MAX_SPREAD_BPS':
+                        return { icon: '📐', msg: 'Max spread ceiling set to ' + toPct(liveVal), cls: 'la-info' };
+                    case 'MIN_SPREAD_BPS':
+                        return { icon: '📐', msg: 'Min spread floor set to ' + toPct(liveVal), cls: 'la-info' };
+                    case 'MIN_EDGE_BPS':
+                        return { icon: '📐', msg: 'Inner edge set to ' + toPct(liveVal), cls: 'la-info' };
+                    case 'INVENTORY_ENABLED': {
+                        const on = isOn(liveVal);
+                        return { icon: '⚖️', msg: on ? 'Inventory management enabled' : 'Inventory management disabled',
+                                 cls: on ? 'la-success' : 'la-info' };
+                    }
+                    case 'DYNAMIC_SPREAD_ENABLED': {
+                        const on = isOn(liveVal);
+                        return { icon: '⚙️', msg: on ? 'Dynamic spreads enabled' : 'Dynamic spreads disabled', cls: 'la-info' };
+                    }
+                    case 'COMPETITOR_AWARE_ENABLED': {
+                        const on = isOn(liveVal);
+                        return { icon: '⚙️', msg: on ? 'Competitor-aware spreads enabled' : 'Competitor-aware spreads disabled', cls: 'la-info' };
+                    }
+                    case 'SKEW_INTENSITY':
+                        return { icon: '⚖️', msg: 'Skew intensity set to ' + liveVal, cls: 'la-info' };
+                    case 'REQUOTE_BPS':
+                        return { icon: '🔄', msg: 'Requote threshold set to ' + toPct(liveVal), cls: 'la-info' };
+                    default:
+                        return { icon: '⚙️', msg: liveKey + ' → ' + liveVal, cls: 'la-info' };
+                }
+            }
+
+            // Deposit-advisory: user allocated an external deposit between
+            // topup budget and hard reserve. High-signal event, surface it.
+            if (eventType === 'deposit_advisory_allocated') {
+                return { icon: '💰', msg: 'Deposit allocated between pool and reserve', cls: 'la-success' };
+            }
+
+            // Recovery mode: user-visible state change — ladder rebuild in progress.
+            if (eventType === 'recovery_mode_enter')
+                return { icon: '🛠️', msg: 'Recovery mode — rebuilding ladder', cls: 'la-warning' };
+            if (eventType === 'recovery_mode_exit')
+                return { icon: '💚', msg: 'Recovery complete — back to normal', cls: 'la-success' };
 
             // --- Splash ---
             if (eventType === 'splash_node_started')
