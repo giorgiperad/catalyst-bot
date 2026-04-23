@@ -29,6 +29,16 @@ import logging
 import threading
 import secrets
 import webbrowser
+
+# When run as the entry point (`python api_server.py`), Python loads this file
+# as the `__main__` module — `sys.modules` has no `api_server` key. Any
+# blueprint that does `import api_server` later in this file would then trigger
+# a second load of this file under the `api_server` name, re-running every
+# side effect and crashing mid-blueprint-import with a circular-import error.
+# Aliasing `sys.modules['api_server']` to the running `__main__` module makes
+# subsequent `import api_server` calls return the already-initialized object.
+if __name__ == "__main__":
+    sys.modules.setdefault("api_server", sys.modules[__name__])
 from decimal import Decimal
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -5243,37 +5253,7 @@ def api_deposit_advisory_allocate():
         return _api_error(e, request.path)
 
 
-@app.route("/api/session/fresh-start", methods=["POST"])
-def api_session_fresh_start():
-    """Begin a brand new run without carrying forward old session state."""
-    try:
-        payload = _reset_fresh_run_session(
-            clear_coins=False,
-            clear_price_history=False,
-            clear_inventory=False,
-            cancel_open_offers=False,
-            reason="session_fresh_start",
-        )
-        # Persist the choice so check-resume returns can_resume=False on the
-        # next page load, even though the old live offers are still in Sage.
-        # Cleared automatically when the bot starts a new run.
-        _fresh_start_set()
-        return jsonify({
-            "success": True,
-            "message": "Fresh run session started",
-            **_serialize_dict(payload),
-        })
-    except Exception as e:
-        log_event("warning", "session_fresh_start_failed",
-                  f"Failed to reset fresh run session: {e}")
-        return _api_error(e, request.path)
-
-
-@app.route("/api/session/resume-chosen", methods=["POST"])
-def api_session_resume_chosen():
-    """User explicitly chose 'Load Previous Session' — clear the fresh-start flag."""
-    _fresh_start_clear()
-    return jsonify({"success": True})
+# Session routes moved to blueprints/session.py
 
 
 @app.route("/api/pnl")
@@ -12143,114 +12123,7 @@ def api_coin_prep_reset():
     return jsonify({"success": True})
 
 
-# ---------------------------------------------------------------------------
-# Console & System Routes
-# ---------------------------------------------------------------------------
-
-_console_state = {"main_visible": False, "coin_prep_visible": False}
-
-
-@app.route("/api/console/status")
-def api_console_status():
-    """Legacy — the external console popup was removed 2026-04-06.
-
-    The GUI now uses the in-app Logs view (sidebar → Logs) instead of
-    toggling a separate console window. Kept as a stable-shaped no-op
-    so any stale clients don't error out.
-    """
-    return jsonify({
-        "main_visible": False,
-        "coin_prep_visible": False,
-        "coin_prep_running": _coin_prep_state.get("running", False),
-        "platform": sys.platform,
-        "deprecated": True,
-    })
-
-
-@app.route("/api/console/toggle", methods=["POST"])
-def api_console_toggle():
-    """Legacy — external console popup was eliminated to remove the
-    'closing the console kills the bot' footgun. Clients should use
-    the in-app Logs view instead."""
-    return jsonify({
-        "success": False,
-        "deprecated": True,
-        "error": "The external console has been removed — use the in-app Logs view (sidebar → Logs)",
-    })
-
-
-
-# ---------------------------------------------------------------------------
-# Wallet Detection & Switching
-# ---------------------------------------------------------------------------
-
-@app.route("/api/wallets/detect")
-def api_wallets_detect():
-    """Probe both Chia and Sage wallets using their own RPC modules.
-
-    Uses the actual wallet modules (wallet_chia.py and wallet_sage.py)
-    which already have all the connection logic, certs, and retry handling.
-    """
-    detected = []
-
-    # --- Probe Chia wallet using wallet_chia module ---
-    try:
-        from wallet_chia import rpc as chia_rpc
-        result = chia_rpc("get_sync_status", {}, timeout=3)
-        if result and result.get("success"):
-            detected.append({
-                "type": "chia",
-                "label": "Chia Wallet",
-                "icon": "🌿",
-                "port": 9256,
-                "reachable": True,
-                "synced": result.get("synced", False),
-                "syncing": result.get("syncing", False),
-            })
-    except Exception:
-        pass
-
-    # --- Sage wallet detection disabled for now ---
-    # Sage RPC requires specific SSL certs that aren't easily auto-detected.
-    # Re-enable once Sage publishes docs on cert setup for third-party clients.
-
-    current = get_wallet_type()
-    return jsonify({
-        "success": True,
-        "current": current,
-        "detected": detected,
-    })
-
-
-@app.route("/api/wallets/switch", methods=["POST"])
-def api_wallets_switch():
-    """Switch the active wallet backend (requires restart to take effect)."""
-    data = request.get_json(silent=True)
-
-    if not isinstance(data, dict):
-
-        return jsonify({"success": False, "error": "Invalid request body"}), 400
-    new_type = data.get("wallet_type", "").strip().lower()
-    if new_type not in ("chia", "sage"):
-        return jsonify({"success": False, "error": "Invalid wallet type. Use 'chia' or 'sage'."})
-
-    try:
-        # WALLET_TYPE is intentionally excluded from _UPDATABLE_KEYS because hot-reloading it
-        # mid-run would break all wallet operations. This endpoint only persists it for the
-        # next restart, so we write to .env directly without triggering a live reload.
-        from dotenv import set_key as _set_key
-        from config import _ENV_PATH
-        _set_key(_ENV_PATH, "WALLET_TYPE", new_type)
-        log_event("info", "wallet_switch", f"Wallet switched to {new_type} — restart required")
-        return jsonify({
-            "success": True,
-            "wallet_type": new_type,
-            "message": f"Switched to {new_type}. Please restart the bot for the change to take effect.",
-            "restart_required": True,
-        })
-    except Exception as e:
-        return _api_error(e, request.path)
-
+# Console + wallet detect/switch routes moved to blueprints/system.py
 
 # ---------------------------------------------------------------------------
 # Data Export Routes
@@ -12493,18 +12366,7 @@ def api_logs_download():
 # blueprints/diagnostics.py (registered at bottom of file)
 
 
-@app.route("/api/reservations")
-def api_reservations():
-    """List active capacity reservations (diagnostics)."""
-    try:
-        from reservation_manager import ReservationManager
-        rm = ReservationManager()
-        return jsonify({
-            "totals": rm.get_reserved_totals(),
-            "active": rm.list_active(),
-        })
-    except Exception as e:
-        return _api_error(e, request.path)
+# Reservations route moved to blueprints/spacescan.py
 
 
 # ---------------------------------------------------------------------------
@@ -12772,99 +12634,7 @@ def api_sage_setup_certs():
         return _api_error(e, request.path)
 
 
-# ============================================================
-# Spacescan API Setup
-# ============================================================
-
-@app.route("/api/spacescan/status")
-def api_spacescan_status():
-    """Check current Spacescan configuration and tier.
-
-    Returns whether an API key is configured, the detected tier,
-    and current usage stats.  Used by the first-run setup modal.
-    """
-    has_key = bool(getattr(cfg, "SPACESCAN_API_KEY", ""))
-    enabled = getattr(cfg, "SPACESCAN_ENABLED", True)
-
-    result = {
-        "configured": has_key,
-        "enabled": enabled,
-        "tier": "pro" if has_key else "free",
-    }
-    result["advice"] = _get_spacescan_plan_advice()
-
-    # Try to get live stats from spacescan module
-    try:
-        from spacescan import get_api_stats
-        result["stats"] = get_api_stats()
-    except ImportError:
-        result["stats"] = None
-
-    return jsonify(result)
-
-
-@app.route("/api/spacescan/setup", methods=["POST"])
-def api_spacescan_setup():
-    """Save or clear the Spacescan API key.
-
-    POST {"api_key": "xxx"}  → saves key, enables Pro tier
-    POST {"api_key": ""}     → clears key, falls back to Free tier
-    POST {"skip": true}      → marks setup as seen, stays on Free tier
-    """
-    data = request.get_json(silent=True)
-
-    if not isinstance(data, dict):
-
-        return jsonify({"success": False, "error": "Invalid request body"}), 400
-
-    # "Skip" — user chose Free tier knowingly
-    if data.get("skip"):
-        cfg.update("SPACESCAN_ENABLED", "true")
-        log_event("info", "spacescan_setup", "User chose Free tier (no API key)")
-        return jsonify({"success": True, "tier": "free", "message": "Free tier active"})
-
-    api_key = data.get("api_key", "").strip()
-
-    if api_key:
-        # Validate the key by making a test call.
-        # Uses the well-known Chia null address so we never disclose any
-        # real user address to Spacescan during key verification.
-        _NULL_XCH_ADDRESS = "xch1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqs0wd5zg"
-        try:
-            import requests as _req
-            test_resp = _req.get(
-                f"https://pro-api.spacescan.io/address/xch-balance/{_NULL_XCH_ADDRESS}",
-                headers={"Accept": "application/json", "x-api-key": api_key},
-                timeout=10,
-            )
-            if test_resp.status_code == 403:
-                return jsonify({"success": False, "error": "Invalid API key — Spacescan rejected it (403)"}), 400
-            if test_resp.status_code == 429:
-                return jsonify({"success": False, "error": "Rate limited — try again in 60 seconds"}), 429
-            if test_resp.status_code >= 500:
-                return jsonify({"success": False, "error": f"Spacescan server error ({test_resp.status_code}) — try again shortly"}), 502
-            # 200 or 400 both mean the key passed authentication (400 = key accepted
-            # but the null-address probe returned "not found" — that is fine).
-        except Exception as e:
-            return jsonify({"success": False, "error": f"Could not reach Spacescan: {e}"}), 502
-
-        # Key is valid — persist in user-local secrets (NOT .env) and apply in-memory.
-        # user_secrets stores the key in %APPDATA%\ChiaMarketMaker\user_secrets.json
-        # so it survives restarts on this machine but cannot travel to another PC.
-        import user_secrets as _user_secrets
-        _user_secrets.set_secret("SPACESCAN_API_KEY", api_key)
-        cfg.SPACESCAN_API_KEY = api_key  # apply in-memory without writing to .env
-        cfg.update("SPACESCAN_ENABLED", "true")
-        log_event("info", "spacescan_setup", "Pro API key configured and validated")
-        return jsonify({"success": True, "tier": "pro", "message": "Pro API key saved and verified"})
-    else:
-        # Clear key — remove from user secrets and fall back to free
-        import user_secrets as _user_secrets
-        _user_secrets.set_secret("SPACESCAN_API_KEY", "")
-        cfg.SPACESCAN_API_KEY = ""  # clear in-memory
-        cfg.update("SPACESCAN_ENABLED", "true")
-        log_event("info", "spacescan_setup", "API key cleared — using Free tier")
-        return jsonify({"success": True, "tier": "free", "message": "Switched to Free tier"})
+# Spacescan routes moved to blueprints/spacescan.py
 
 
 # ---------------------------------------------------------------------------
@@ -12971,12 +12741,33 @@ from blueprints.boost import (
     api_boost_deactivate,
     api_boost_state,
 )
+from blueprints.session import (
+    bp as _session_bp,
+    api_session_fresh_start,
+    api_session_resume_chosen,
+)
+from blueprints.system import (
+    bp as _system_bp,
+    api_console_status,
+    api_console_toggle,
+    api_wallets_detect,
+    api_wallets_switch,
+)
+from blueprints.spacescan import (
+    bp as _spacescan_bp,
+    api_spacescan_status,
+    api_spacescan_setup,
+    api_reservations,
+)
 
 app.register_blueprint(_splash_bp)
 app.register_blueprint(_diagnostics_bp)
 app.register_blueprint(_superlog_bp)
 app.register_blueprint(_watchdog_bp)
 app.register_blueprint(_boost_bp)
+app.register_blueprint(_session_bp)
+app.register_blueprint(_system_bp)
+app.register_blueprint(_spacescan_bp)
 
 
 if __name__ == "__main__":
