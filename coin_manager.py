@@ -3096,11 +3096,12 @@ class CoinManager:
 
         Idempotent — writes nothing when labels already match sizes.
         """
-        # Debug breadcrumb — if this doesn't fire, the method isn't
-        # being invoked from update_coin_counts. If it fires but
+        # Temporary INFO breadcrumb — if this doesn't fire, the method
+        # isn't being invoked from update_coin_counts. If it fires but
         # tier_labels_normalized doesn't, then labels are already
-        # correct (total_changes=0).
-        log_event("debug", "tier_normalize_entry",
+        # correct (total_changes=0). Will be demoted to debug once
+        # verified in production.
+        log_event("info", "tier_normalize_entry",
                   "Running tier label normalisation pass")
         try:
             from coin_classifier import classify_coin, CoinDesignation as _CD
