@@ -3098,15 +3098,10 @@ class CoinManager:
 
         Idempotent — writes nothing when labels already match sizes.
         """
-        # Temporary INFO breadcrumb — if this doesn't fire, the method
-        # isn't being invoked from update_coin_counts. If it fires but
-        # tier_labels_normalized doesn't, then labels are already
-        # correct (total_changes=0). Will be demoted to debug once
-        # verified in production.
-        log_event("info", "tier_normalize_entry",
+        log_event("debug", "tier_normalize_entry",
                   "Running tier label normalisation pass")
         try:
-            from coin_classifier import classify_coin, CoinDesignation as _CD
+            from coin_classifier import classify_coin, CoinDesignation as _CD  # noqa: F401
         except Exception as _imp_err:
             log_event("debug", "tier_normalize_import_failed",
                       f"classify_coin import failed: {_imp_err}")
@@ -3141,9 +3136,6 @@ class CoinManager:
                 (wt,),
             ).fetchall()
             scanned[wt] = len(rows)
-            log_event("info", "tier_normalize_scan",
-                      f"{wt} free tier_spare coins in scan: {len(rows)}, "
-                      f"tier_sizes_mojos keys: {list(tier_sizes.keys())}")
 
             for r in rows:
                 amt = int(r["amount_mojos"] or 0)
@@ -3157,31 +3149,12 @@ class CoinManager:
                 current = (r["assigned_tier"] or "").lower()
                 best = (cls.best_tier or "").lower() if cls.best_tier else ""
 
-                # Diagnostic log: shows first mismatch per wallet so we
-                # can confirm the comparison logic is working.
-                if best != current and scanned[wt] > 0 and summary["relabeled"] + summary["demoted_reserve"] + summary["demoted_unknown"] < 2:
-                    log_event("info", "tier_normalize_mismatch_sample",
-                              f"{wt} coin amt={amt/1e12 if wt=='xch' else amt} "
-                              f"label={current} classifier_best={best} "
-                              f"designation={getattr(cls.designation, 'value', cls.designation)}")
-
                 # Compare by VALUE (strings) not identity — enum
-                # identity comparison can fail if coin_classifier gets
-                # imported twice via different paths (e.g. once at cold
-                # start via super_log hooks, once lazily in this method),
-                # even though sys.modules normally dedupes. Belt-and-
-                # braces with .value keeps this working regardless.
+                # identity comparison fails in the bot's running process
+                # even though sys.modules normally dedupes (root cause
+                # not fully understood, observed during 2026-04-23
+                # session — .value-based comparison is the robust fix).
                 _des_val = getattr(cls.designation, "value", str(cls.designation))
-
-                # One-off debug: log the exact types/values at the
-                # branch decision so we can see why it doesn't match.
-                if best != current and summary["relabeled"] + summary["demoted_reserve"] + summary["demoted_unknown"] < 1:
-                    log_event("info", "tier_normalize_branch_debug",
-                              f"_des_val type={type(_des_val).__name__} "
-                              f"value={_des_val!r} "
-                              f"eq_check={_des_val == 'tier_spare'} "
-                              f"best={best!r} current={current!r} "
-                              f"best_ne_current={best != current}")
 
                 if _des_val == "tier_spare" and best and best != current:
                     conn.execute(
@@ -3209,9 +3182,7 @@ class CoinManager:
 
         total_changes = (summary["relabeled"] + summary["demoted_reserve"]
                          + summary["demoted_unknown"])
-        # Always-log exit breadcrumb so we can see exactly what the pass
-        # computed, even when total_changes=0.
-        log_event("info", "tier_normalize_exit",
+        log_event("debug", "tier_normalize_exit",
                   f"scanned xch={scanned['xch']} cat={scanned['cat']} "
                   f"relabeled={summary['relabeled']} "
                   f"→reserve={summary['demoted_reserve']} "
