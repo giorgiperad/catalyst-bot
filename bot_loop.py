@@ -2290,13 +2290,12 @@ class BotLoop:
                 "Splash incoming listener auto-enabled alongside outbound broadcast",
             )
 
-        # Splash incoming watcher thread (classifies inbound P2P offers)
-        self._splash_receive_thread = threading.Thread(
-            target=self._splash_receive_thread_run,
-            daemon=True,
-            name="splash-receive"
-        )
-        self._splash_receive_thread.start()
+        # Splash incoming watcher thread (classifies inbound P2P offers).
+        # Extracted into _start_splash_receive() so the liveness watchdog
+        # can restart this daemon if it dies mid-session — without that,
+        # a crashed Splash receive thread silently stopped classifying
+        # inbound P2P offers while the bot happily kept quoting.
+        self._start_splash_receive()
 
         # V3: Auto-start Splash P2P node if enabled
         if getattr(cfg, "SPLASH_ENABLED", False) and getattr(cfg, "SPLASH_AUTO_START", True):
@@ -2545,6 +2544,23 @@ class BotLoop:
             payload = self.get_splash_receive_stats()
             payload["relevant_found"] = relevant_found
             self._emit("splash_incoming", payload)
+
+    def _start_splash_receive(self):
+        """Start (or restart) the Splash incoming watcher thread.
+
+        Extracted so the liveness watchdog (_restart_dead_threads) can
+        re-invoke this if the daemon dies. Safe to call multiple times:
+        if the current thread is still alive it is left alone.
+        """
+        existing = getattr(self, "_splash_receive_thread", None)
+        if existing is not None and existing.is_alive():
+            return
+        self._splash_receive_thread = threading.Thread(
+            target=self._splash_receive_thread_run,
+            daemon=True,
+            name="splash-receive",
+        )
+        self._splash_receive_thread.start()
 
     def _splash_receive_thread_run(self):
         """Background classifier for inbound Splash offers."""
@@ -7579,11 +7595,20 @@ class BotLoop:
           - coin-watcher (DB↔wallet coin diff)
           - splash-receive (Splash incoming offer poller)
         """
-        critical_threads = (
+        critical_threads = [
             ("health-monitor", "_health_thread", self._start_health_monitor),
             ("price-watcher", "_watcher_thread", self._start_price_watcher),
             ("coin-watcher", "_coin_watcher_thread", self._start_coin_watcher),
-        )
+        ]
+        # Splash incoming watcher classifies inbound P2P offers. Previously
+        # the watchdog named it in the docstring but never actually checked
+        # it, so a crash left Splash receive silently dead while the bot
+        # kept quoting. Include it here — only when Splash is enabled, so
+        # we don't "restart" a thread that was intentionally not started.
+        if getattr(cfg, "SPLASH_ENABLED", False):
+            critical_threads.append(
+                ("splash-receive", "_splash_receive_thread", self._start_splash_receive)
+            )
         # During shutdown the watchers exit cleanly as they observe
         # self._running == False. Treating those clean exits as "thread
         # crashed" spams ERROR logs and triggers futile restarts that

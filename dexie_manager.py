@@ -93,6 +93,36 @@ class DexieManager:
                 "trade_id": trade_id,
                 "force": force,
             })
+            # Bounded queue. Without a cap, operators who disable
+            # DEXIE_AUTO_POST (or who pause posting during an outage)
+            # would see offer blobs accumulate indefinitely — each
+            # offer1... bech32 is multi-KB of memory, so a long run
+            # can hold onto 100+ MB of stale offers that will never
+            # be flushed. Drop the OLDEST entries once the cap is
+            # reached; trade_ids stay tracked via offer_manager so
+            # Dexie visibility comes back on the next successful
+            # repost cycle when auto-post re-enables.
+            _max_queue = 500
+            if len(self._queue) > _max_queue:
+                overflow = len(self._queue) - _max_queue
+                self._queue = self._queue[-_max_queue:]
+                if not hasattr(self, "_queue_cap_logged"):
+                    self._queue_cap_logged = False
+                if not self._queue_cap_logged:
+                    self._queue_cap_logged = True
+                    log_event(
+                        "warning",
+                        "dexie_queue_cap_hit",
+                        f"Dexie post queue exceeded {_max_queue} entries "
+                        f"(dropped {overflow} oldest). DEXIE_AUTO_POST may "
+                        f"be off or the API has been unreachable for a "
+                        f"while. Oldest offers will be reposted on the "
+                        f"next successful flush via the startup-repost "
+                        f"path.",
+                        data={"cap": _max_queue,
+                              "dropped": overflow,
+                              "queue_len_after": len(self._queue)},
+                    )
 
     def purge_trade_ids(self, trade_ids):
         """Remove queued (not-yet-posted) entries for specific trade IDs.
