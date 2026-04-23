@@ -3058,9 +3058,118 @@ class CoinManager:
             self._xch_total_coins = len(xch_spendable) + self._xch_locked_coins
             self._cat_total_coins = len(cat_spendable) + self._cat_locked_coins
 
+            # Fix label drift caused by the serial-mode selector
+            # fallback (offer_manager._create_one). When Sage picks a
+            # mismatched-size coin to back a slot, the coin retains its
+            # old tier label even though its ACTUAL size now matches a
+            # different tier. Over successive fill bursts this starves
+            # the topup splitter (which reads labels) even when the
+            # wallet has plenty of XCH to re-split. Normalising labels
+            # to match actual sizes here means topup's view matches
+            # reality so it can move XCH back into under-stocked tiers.
+            try:
+                self._normalize_tier_labels()
+            except Exception as _norm_err:
+                log_event("debug", "tier_normalize_failed",
+                          f"Tier label normalisation pass failed: {_norm_err}")
+
         except Exception as e:
             log_event("warning", "locked_coin_count_failed",
                       f"Failed to count locked coins: {e}")
+
+    def _normalize_tier_labels(self) -> Dict[str, int]:
+        """Re-classify free tier_spare coins by SIZE and fix label drift.
+
+        The serial-mode offer-selector fallback lets Sage pick any free
+        coin when pre-selection fails. That picked coin may be sized for
+        a DIFFERENT tier than the slot. The offer works, but when the
+        coin returns to the wallet (fill change or cancel) the DB still
+        carries the old label. Over time labels desynchronise from sizes
+        and topup starves despite plentiful XCH.
+
+        For each free tier_spare coin:
+          - classify by actual size via ``classify_coin``
+          - if best_tier is set but differs from assigned_tier, relabel
+          - if classifier says reserve / dust / misfit, demote to
+            ``designation='reserve'`` (reserve) or ``'unknown'`` (others)
+            so topup can use it as raw split material.
+
+        Idempotent — writes nothing when labels already match sizes.
+        """
+        try:
+            from coin_classifier import classify_coin, CoinDesignation as _CD
+        except Exception:
+            return {"relabeled": 0, "demoted": 0}
+        from database import get_connection
+
+        summary = {"relabeled": 0, "demoted_reserve": 0,
+                   "demoted_unknown": 0}
+        conn = get_connection()
+
+        for wt in ("xch", "cat"):
+            try:
+                tier_sizes = get_tier_sizes_mojos_from_cfg(is_cat=(wt == "cat"))
+            except Exception:
+                tier_sizes = {}
+            if not tier_sizes:
+                continue
+            rows = conn.execute(
+                "SELECT coin_id, amount_mojos, assigned_tier "
+                "FROM coins "
+                "WHERE wallet_type=? "
+                "  AND status='free' "
+                "  AND designation='tier_spare' "
+                "  AND assigned_tier IN ('inner','mid','outer','extreme')",
+                (wt,),
+            ).fetchall()
+
+            for r in rows:
+                amt = int(r["amount_mojos"] or 0)
+                if amt <= 0:
+                    continue
+                try:
+                    cls = classify_coin(amt, tier_sizes)
+                except Exception:
+                    continue
+
+                current = (r["assigned_tier"] or "").lower()
+                best = (cls.best_tier or "").lower() if cls.best_tier else ""
+
+                if cls.designation == _CD.TIER_SPARE and best and best != current:
+                    conn.execute(
+                        "UPDATE coins SET assigned_tier=?, last_seen=? "
+                        "WHERE coin_id=?",
+                        (best, _now(), r["coin_id"]),
+                    )
+                    summary["relabeled"] += 1
+                elif cls.designation == _CD.RESERVE:
+                    conn.execute(
+                        "UPDATE coins SET designation='reserve', "
+                        "assigned_tier='none', last_seen=? "
+                        "WHERE coin_id=?",
+                        (_now(), r["coin_id"]),
+                    )
+                    summary["demoted_reserve"] += 1
+                elif cls.designation in (_CD.DUST, _CD.UNKNOWN):
+                    conn.execute(
+                        "UPDATE coins SET designation='unknown', "
+                        "assigned_tier='none', last_seen=? "
+                        "WHERE coin_id=?",
+                        (_now(), r["coin_id"]),
+                    )
+                    summary["demoted_unknown"] += 1
+
+        total_changes = (summary["relabeled"] + summary["demoted_reserve"]
+                         + summary["demoted_unknown"])
+        if total_changes > 0:
+            conn.commit()
+            log_event("info", "tier_labels_normalized",
+                      f"Tier label normalisation: "
+                      f"relabeled={summary['relabeled']} "
+                      f"→reserve={summary['demoted_reserve']} "
+                      f"→unknown={summary['demoted_unknown']}",
+                      data=summary)
+        return summary
 
     def get_inventory_summary(self) -> Dict:
         """Get a human-readable summary of the coin inventory."""
