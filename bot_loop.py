@@ -5194,7 +5194,15 @@ class BotLoop:
                         price_floor=price_floor,
                         live_offer_ids=_live_ids,
                     )
-                    self._requoted_this_cycle.add(eq_side)
+                    # Note: do NOT add to _requoted_this_cycle until we
+                    # know progress was made. Previously we stamped this
+                    # unconditionally, which caused Step 10 to skip the
+                    # side even when the emergency requote produced zero
+                    # new offers — the side could stay underfilled for an
+                    # entire cycle while the book was still exposed on a
+                    # sharp move. The `any_progress`-gated stamp below
+                    # keeps Step 10 eligible to refill on a failed
+                    # emergency.
                     # During an emergency requote we ONLY advance the
                     # baseline when we actually made progress. Previously
                     # the else-branch always stamped `requote_mid` "on
@@ -5248,6 +5256,7 @@ class BotLoop:
                     else:
                         # Legacy return format (list)
                         new_offers = requote_result if isinstance(requote_result, list) else []
+                        any_progress = bool(new_offers)
                         if new_offers:
                             self._last_quoted_price[eq_side] = requote_mid
                             self._last_quoted_plain_mid[eq_side] = mid_price  # F67
@@ -5261,16 +5270,30 @@ class BotLoop:
                     self._emit_coin_update("emergency_requote")
                     self._last_bulk_create_time = time.time()
 
-                    # Clear the force_requote flag for this side — we just
-                    # requoted it. Without this, Step 9's _handle_requoting
-                    # would re-requote the same side, doubling the work and
-                    # causing coin exhaustion + cycle blocking.
-                    self._force_requote[eq_side] = False
-
-                    done_msg = (f"[OK] Emergency requote {eq_side}: "
-                                f"{len(new_offers)} new offers at {requote_mid:.8f}")
-                    print(done_msg, flush=True)  # Terminal-visible
-                    log_event("info", "emergency_requote_done", done_msg)
+                    # Only mark the cycle-requoted flag + clear the force
+                    # flag when we actually made progress. If the emergency
+                    # produced zero new offers (no spare coins, create
+                    # failures, tier-filter drained) we want BOTH Step 10's
+                    # ladder-fill AND Step 9's drift retry to remain
+                    # eligible on this cycle — setting these unconditionally
+                    # caused the side to sit underfilled for a full cycle
+                    # while the book was still exposed on a sharp move.
+                    if any_progress:
+                        self._requoted_this_cycle.add(eq_side)
+                        self._force_requote[eq_side] = False
+                        done_msg = (f"[OK] Emergency requote {eq_side}: "
+                                    f"{len(new_offers)} new offers at {requote_mid:.8f}")
+                        print(done_msg, flush=True)  # Terminal-visible
+                        log_event("info", "emergency_requote_done", done_msg)
+                    else:
+                        skipped_msg = (f"[WARN] Emergency requote {eq_side}: "
+                                       f"0 new offers produced — leaving "
+                                       f"force_requote set and allowing Step 10 "
+                                       f"ladder-fill to retry this cycle")
+                        print(skipped_msg, flush=True)
+                        log_event("warning", "emergency_requote_retry_eligible",
+                                  skipped_msg,
+                                  data={"side": eq_side})
 
         # ---- Step 8c-pre: Monitor confirmed probes — do not auto re-fire ----
         # Once discovery is done, the main ladder should take over. If an edge

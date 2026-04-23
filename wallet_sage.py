@@ -2633,10 +2633,19 @@ def get_all_offers(include_completed: bool = True, start: int = 0, end: int = 50
     # If that happens and the count keeps growing, open offers could get
     # pushed out of the end=500 window — the exact truncation bug from V1.
     # Fix: filter completed offers ourselves when include_completed=False.
+    #
+    # IMPORTANT: PENDING_CANCEL (int 2) is included here because it is
+    # STILL fillable — the cancel TX is in the mempool but a counterparty
+    # can still take the offer until that TX confirms on-chain. The
+    # cancel_offers_batch success check uses _is_still_fillable() to
+    # count remaining take-able offers; if we stripped PENDING_CANCEL
+    # upstream, that counter would fire "open_remaining == 0" prematurely
+    # and declare a batch cancel successful while fills could still land,
+    # letting adverse fills stack into a fast move.
     if not include_completed:
         before_count = len(normalized)
-        OPEN_STATUS_STRINGS = {"PENDING_ACCEPT", "PENDING_CONFIRM", "PENDING",
-                               "IN_PROGRESS", "OPEN", "ACTIVE"}
+        FILLABLE_STATUS_STRINGS = {"PENDING_ACCEPT", "PENDING_CONFIRM", "PENDING",
+                                   "PENDING_CANCEL", "IN_PROGRESS", "OPEN", "ACTIVE"}
         filtered = []
         for offer in normalized:
             status_val = offer.get("status")
@@ -2644,17 +2653,17 @@ def get_all_offers(include_completed: bool = True, start: int = 0, end: int = 50
                 filtered.append(offer)  # keep unknowns for classification to handle
                 continue
             if isinstance(status_val, int):
-                if status_val <= 1:  # PENDING_ACCEPT or PENDING_CONFIRM
+                if status_val <= 2:  # PENDING_ACCEPT, PENDING_CONFIRM, PENDING_CANCEL
                     filtered.append(offer)
             else:
-                if str(status_val).upper() in OPEN_STATUS_STRINGS:
+                if str(status_val).upper() in FILLABLE_STATUS_STRINGS:
                     filtered.append(offer)
 
         if before_count != len(filtered):
             if not hasattr(get_all_offers, '_filter_logged'):
                 get_all_offers._filter_logged = True
                 print(f"  [Sage] Client-side filter: {before_count} raw → "
-                      f"{len(filtered)} open (Sage ignored include_completed=False)",
+                      f"{len(filtered)} fillable (Sage ignored include_completed=False)",
                       flush=True)
         normalized = filtered
 
