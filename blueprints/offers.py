@@ -1066,7 +1066,7 @@ def api_pnl_reset_preview():
             # Same data sources as /api/pnl — get_stats aggregates fills
             # to realised_pnl, risk_manager.get_inventory_state reports
             # the live net position.
-            stats = get_stats(cfg.CAT_ASSET_ID, since=api_server._get_run_history_cutoff())
+            stats = api_server.get_stats(cfg.CAT_ASSET_ID, since=api_server._get_run_history_cutoff())
             realised_pnl_xch = Decimal(str(stats.get("realised_pnl_xch", 0) or 0))
         except Exception:
             realised_pnl_xch = Decimal("0")
@@ -1342,7 +1342,7 @@ def api_pnl():
         return jsonify({"error": "Bot not initialised"}), 500
 
     try:
-        stats = get_stats(cfg.CAT_ASSET_ID, since=api_server._get_run_history_cutoff())
+        stats = api_server.get_stats(cfg.CAT_ASSET_ID, since=api_server._get_run_history_cutoff())
         inventory = bot.risk_manager.get_inventory_state()
         sniper_stats = bot.sniper.get_stats() if getattr(bot, "sniper", None) else {}
 

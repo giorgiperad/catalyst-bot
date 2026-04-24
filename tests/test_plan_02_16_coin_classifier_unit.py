@@ -86,7 +86,9 @@ class TestClassifyCoinDust(unittest.TestCase):
 @unittest.skipIf(_SKIP is not None, f"coin_classifier unavailable: {_SKIP}")
 class TestClassifyCoinReserve(unittest.TestCase):
     def test_above_reserve_threshold_is_reserve(self):
-        cls = classify_coin(_RESERVE_THRESH, _TIERS)
+        # Strict `>` in classifier: exactly at threshold stays OVERSIZE_FIT,
+        # strictly above falls into RESERVE.
+        cls = classify_coin(_RESERVE_THRESH + 1, _TIERS)
         self.assertEqual(cls.designation, CoinDesignation.RESERVE)
         self.assertFalse(cls.is_misfit)
         self.assertIsNone(cls.best_tier)
@@ -229,7 +231,7 @@ class TestInferDesignationBySize(unittest.TestCase):
         self.assertEqual(tier, "none")
 
     def test_reserve_returns_reserve_none(self):
-        desig, tier = infer_designation_by_size(_RESERVE_THRESH, _TIERS)
+        desig, tier = infer_designation_by_size(_RESERVE_THRESH + 1, _TIERS)
         self.assertEqual(desig, "reserve")
         self.assertEqual(tier, "none")
 

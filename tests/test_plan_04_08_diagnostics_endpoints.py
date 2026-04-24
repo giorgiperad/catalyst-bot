@@ -28,13 +28,24 @@ def _make_bot():
         "mode": "coinset", "total_calls": 0, "hit_rate": 0,
         "fallback_count": 0, "session_hits": 0, "session_misses": 0,
     }
+    # Route calls getattr(bot.coinset_client, "_rate_limited_until", 0.0).
+    # MagicMock auto-creates attributes, so pin this to a real float.
+    bot.coinset_client._rate_limited_until = 0.0
     bot.dexie_manager.get_stats.return_value = {
         "total_posted": 0, "total_failed": 0, "total_skipped": 0,
         "queue_size": 0, "tracked_mappings": 0, "fingerprints_cached": 0,
         "session_posted": 0, "session_failed": 0, "session_skipped": 0,
         "known_mappings": 0, "hydrated_from_db": False,
     }
+    bot.dexie_manager._rate_limited_until = 0.0
+    bot.dexie_manager._v3_trades_cache = {}
+    bot.dexie_manager._v3_pairs_cache = None
     bot.amm_monitor.get_stats.return_value = {}
+    # /api/diagnostics/api-stats inspects splash + price_engine + bot._bot_state
+    # — set them to None so the truthy-check short-circuits past MagicMock.
+    bot.splash_manager = None
+    bot.price_engine = None
+    bot._bot_state = {}
     return bot
 
 

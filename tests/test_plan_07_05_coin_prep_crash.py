@@ -251,11 +251,13 @@ class TestCoinPrepTriggerAfterCrash(unittest.TestCase):
         api_server._coin_prep_proc = None
 
     def _trigger(self, bot_mock):
-        # Patch threading.Thread so do_prep() never actually launches
+        # Patch threading.Thread so do_prep() never actually launches.
+        # Route lives in blueprints.coin_prep since the api_server split;
+        # patch threading/log_event there so the blueprint sees the mock.
         mock_thread = MagicMock()
         with patch.object(api_server, "bot", bot_mock), \
-             patch("api_server.threading") as mock_threading, \
-             patch("api_server.log_event"), \
+             patch("blueprints.coin_prep.threading") as mock_threading, \
+             patch("blueprints.coin_prep.log_event"), \
              patch("os.path.exists", return_value=True), \
              patch("builtins.open", unittest.mock.mock_open()):
             mock_threading.Thread.return_value = mock_thread

@@ -10,6 +10,15 @@ class CoinManagerExactSelectableTests(unittest.TestCase):
         self._saved_wallet_type = os.environ.get("WALLET_TYPE")
         os.environ["WALLET_TYPE"] = "chia"
 
+        # Save originals so tearDown can restore them — popping without
+        # restoring leaves sys.modules dirty for subsequent test files
+        # (they re-import fresh, but coin_manager's import-time bindings
+        # to wallet.* functions can break if the wallet stub survives).
+        self._saved_modules = {
+            name: sys.modules.get(name)
+            for name in ("coin_manager", "wallet", "wallet_sage", "database", "config")
+        }
+
         fake_config = types.ModuleType("config")
         fake_config.cfg = types.SimpleNamespace(
             COINSET_ENABLED=False,
@@ -72,8 +81,10 @@ class CoinManagerExactSelectableTests(unittest.TestCase):
         self.selectable_coin_id = selectable_coin_id
 
     def tearDown(self):
-        for name in ["coin_manager", "wallet", "database", "config"]:
+        for name, saved in self._saved_modules.items():
             sys.modules.pop(name, None)
+            if saved is not None:
+                sys.modules[name] = saved
 
         if self._saved_wallet_type is None:
             os.environ.pop("WALLET_TYPE", None)

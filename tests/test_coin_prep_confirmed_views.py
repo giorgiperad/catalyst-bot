@@ -5,12 +5,18 @@ import types
 import unittest
 
 
+_MODS_TO_RESTORE = ("coin_prep_worker", "wallet_sage", "database", "wallet", "dotenv")
+
+
 class CoinPrepConfirmedViewTests(unittest.TestCase):
     def setUp(self):
         self._saved_env = {
             "WALLET_TYPE": os.environ.get("WALLET_TYPE"),
             "DEFAULT_TRADE_XCH": os.environ.get("DEFAULT_TRADE_XCH"),
             "CAT_COIN_SIZE": os.environ.get("CAT_COIN_SIZE"),
+        }
+        self._saved_modules = {
+            name: sys.modules.get(name) for name in _MODS_TO_RESTORE
         }
         os.environ["WALLET_TYPE"] = "sage"
         os.environ["DEFAULT_TRADE_XCH"] = ""
@@ -79,8 +85,10 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
         self.worker = self.coin_prep_worker.CoinPrepWorker()
 
     def tearDown(self):
-        for name in ["coin_prep_worker", "wallet_sage", "database", "wallet", "dotenv"]:
+        for name, saved in self._saved_modules.items():
             sys.modules.pop(name, None)
+            if saved is not None:
+                sys.modules[name] = saved
 
         for key, value in self._saved_env.items():
             if value is None:

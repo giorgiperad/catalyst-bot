@@ -26,10 +26,17 @@ def _make_fill(fill_id, side, size_xch, price_xch, size_cat, tier="inner",
     }
 
 
+_MODS_TO_RESTORE = ("fill_tracker", "spacescan", "wallet_sage", "wallet",
+                    "database", "config", "dexie_manager")
+
+
 class FillPnlMatchingTests(unittest.TestCase):
     """Tests for multi-pass buy↔sell round-trip matching in FillTracker."""
 
     def setUp(self):
+        self._saved_modules = {
+            name: sys.modules.get(name) for name in _MODS_TO_RESTORE
+        }
         self.round_trips_recorded = []
         self.logged = []
         self._rt_id_counter = [0]
@@ -79,11 +86,10 @@ class FillPnlMatchingTests(unittest.TestCase):
         self.ft_mod = importlib.import_module("fill_tracker")
 
     def tearDown(self):
-        for name in [
-            "fill_tracker", "spacescan", "wallet_sage", "wallet",
-            "database", "config", "dexie_manager",
-        ]:
+        for name, saved in self._saved_modules.items():
             sys.modules.pop(name, None)
+            if saved is not None:
+                sys.modules[name] = saved
 
     def _make_tracker(self):
         return self.ft_mod.FillTracker(offer_manager=None)

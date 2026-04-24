@@ -62,3 +62,50 @@ if sys.platform == "win32":
                 setattr(sys, _stream_name, _wrapped)
             except Exception:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# sys.modules isolation between test files.
+#
+# Several test files install stub `sys.modules` entries for `database`,
+# `wallet`, `wallet_sage`, `coin_manager`, etc. to isolate the module
+# under test from the real bot dependencies. A few had buggy tearDowns
+# that popped those entries instead of restoring the originals — leaving
+# later files to re-import fresh copies of those modules which then broke
+# `patch(...)` calls that assume sys.modules still holds the original.
+#
+# This autouse fixture snapshots `sys.modules` before each test module is
+# loaded and restores the snapshot after, so file-level leaks can't reach
+# the next file even if individual teardowns are sloppy.
+# ---------------------------------------------------------------------------
+import pytest
+
+
+# Snapshot these at first conftest load — these are the real modules the
+# bot ships, and the ones tests most commonly stub.
+_ISOLATION_GUARDED = (
+    "database", "wallet", "wallet_sage", "wallet_chia",
+    "coin_manager", "coin_prep_worker", "bot_health", "bot_loop",
+    "fill_tracker", "offer_manager", "price_engine",
+    "dexie_manager", "spacescan", "amm_monitor", "tx_fees",
+    "config",
+)
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _restore_isolation_guarded_modules():
+    """Restore stubbed bot modules between test files.
+
+    If a test file replaces `sys.modules["database"]` with a stub and
+    forgets to restore it, this fixture catches the damage at the end
+    of the module so the next file starts clean.
+    """
+    saved = {name: sys.modules.get(name) for name in _ISOLATION_GUARDED}
+    yield
+    for name, original in saved.items():
+        current = sys.modules.get(name)
+        if original is None:
+            # Wasn't loaded before this file; drop any stub installed.
+            sys.modules.pop(name, None)
+        elif current is not original:
+            sys.modules[name] = original

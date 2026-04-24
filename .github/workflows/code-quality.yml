@@ -78,17 +78,14 @@ jobs:
         run: pip install -r requirements.txt -r requirements-dev.txt
 
       # pytest-xdist's --dist=loadfile runs each test file in its own worker
-      # process. Some older test files share module-level state (monkeypatched
-      # sys.modules entries, global caches) that leaks between tests when they
-      # run in the same process. Per-file isolation makes the suite reliable
-      # without forcing a cleanup pass on every preexisting test.
-      #
-      # continue-on-error is temporary: ~16 tests in coin-prep-adjacent files
-      # have within-file ordering bugs that predate this plan. Tracked as
-      # follow-up work; flipping to blocking once those stabilise.
+      # process. Combined with the module-scoped sys.modules restore fixture
+      # in tests/conftest.py, this gives us reliable isolation between
+      # files that stub out `database` / `wallet` / `coin_manager` etc.
+      # for unit testing. The ignored test files are intentional: they're
+      # integration scripts that require a live Sage wallet or can't run
+      # under the xdist coordinator.
       - name: Run pytest
         working-directory: tests
-        continue-on-error: true
         run: pytest -n 2 --dist=loadfile --tb=short --ignore=test_coin_prep.py --ignore=test_coin_prep_v2.py --ignore=test_offer_create.py
 
   security-scan:

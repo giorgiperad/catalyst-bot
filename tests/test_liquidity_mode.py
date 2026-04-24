@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 
 class LiquidityModeConfigTests(unittest.TestCase):
@@ -92,14 +93,21 @@ class ConfigDerivationAtLoadTests(unittest.TestCase):
             sys.path.insert(0, os.getcwd())
 
     def _build(self, mode, *, enable_buy="true", enable_sell="true"):
-        """Build a fresh Config instance with the given env state."""
+        """Build a fresh Config instance with the given env state.
+
+        ``Config.reload()`` calls ``load_dotenv(..., override=True)`` which
+        overwrites os.environ from the real .env file and defeats a naive
+        os.environ patch. Stub load_dotenv for the duration of the build so
+        our env vars stick.
+        """
         prev = {k: os.environ.get(k) for k in ("LIQUIDITY_MODE", "ENABLE_BUY", "ENABLE_SELL")}
         os.environ["LIQUIDITY_MODE"] = mode
         os.environ["ENABLE_BUY"] = enable_buy
         os.environ["ENABLE_SELL"] = enable_sell
         try:
             import config
-            c = config.Config()
+            with patch("config.load_dotenv", lambda *a, **kw: None):
+                c = config.Config()
         finally:
             for k, v in prev.items():
                 if v is None:

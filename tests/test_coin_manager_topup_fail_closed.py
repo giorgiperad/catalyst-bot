@@ -71,20 +71,37 @@ def _record(coin_id: str, amount: int) -> dict:
     }
 
 
+_CACHED_MODS = ("amm_monitor", "coin_manager", "wallet_sage",
+                "wallet_chia", "wallet", "price_engine", "tx_fees",
+                "win_subprocess", "config", "database")
+
+
 class CoinManagerTopupFailClosedTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Save originals of modules we will replace/evict so tearDownClass
+        # can restore them and later test files see the real modules, not
+        # stubs we installed at module-load time.
+        cls._saved_modules = {
+            name: sys.modules.get(name)
+            for name in list(_INSTALLED_STUBS) + list(_CACHED_MODS)
+        }
+
     @classmethod
     def tearDownClass(cls):
         # Remove stub modules installed at module-load time so they don't
-        # pollute sys.modules for test files that run later (e.g. test_amm_monitor).
+        # pollute sys.modules for test files that run later.
         for name in _INSTALLED_STUBS:
             sys.modules.pop(name, None)
-        # Also evict any modules that may have been cached with the stub
-        # requests/urllib3 so they get a fresh import in later test files.
-        for name in list(sys.modules):
-            if name in ("amm_monitor", "coin_manager", "wallet_sage",
-                        "wallet_chia", "wallet", "price_engine", "tx_fees",
-                        "win_subprocess", "config", "database"):
-                sys.modules.pop(name, None)
+        # Evict modules that may have been cached against stub requests/
+        # urllib3 at import time so later test files re-import fresh.
+        for name in _CACHED_MODS:
+            sys.modules.pop(name, None)
+        # Restore any originals we saved so later files that imported
+        # these modules before we loaded keep the same instance.
+        for name, saved in cls._saved_modules.items():
+            if saved is not None:
+                sys.modules[name] = saved
 
     def _make_manager(self):
         with patch.object(coin_manager.CoinManager, "_resolve_fingerprint", return_value="123456789"):

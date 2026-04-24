@@ -120,6 +120,20 @@ class TestCancelAllStatus(_FlaskBase):
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestOpenOfferCount(_FlaskBase):
+    """Stub database.get_open_offers to a clean empty list so the route's
+    real DB fetch doesn't intermittently fail under parallel xdist
+    workers competing for the same sqlite write-lock."""
+
+    def setUp(self):
+        super().setUp()
+        import database
+        self._orig_get_open_offers = database.get_open_offers
+        database.get_open_offers = lambda *a, **kw: []
+
+    def tearDown(self):
+        import database
+        database.get_open_offers = self._orig_get_open_offers
+        super().tearDown()
 
     def test_returns_200(self):
         resp = self.client.get("/api/offers/open_count",

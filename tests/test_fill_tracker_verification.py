@@ -9,8 +9,15 @@ class _FakeCfg:
     WALLET_ADDRESS = "xch1ourwalletaddress"
 
 
+_MODS_TO_RESTORE = ("fill_tracker", "spacescan", "wallet_sage", "wallet",
+                    "database", "config", "dexie_manager")
+
+
 class FillTrackerVerificationTests(unittest.TestCase):
     def setUp(self):
+        self._saved_modules = {
+            name: sys.modules.get(name) for name in _MODS_TO_RESTORE
+        }
         self.logged = []
         self.recorded = []
         self.status_updates = []
@@ -56,9 +63,10 @@ class FillTrackerVerificationTests(unittest.TestCase):
         self.fill_tracker = importlib.import_module("fill_tracker")
 
     def tearDown(self):
-        for name in ["fill_tracker", "spacescan", "wallet_sage", "wallet",
-                     "database", "config", "dexie_manager"]:
+        for name, saved in self._saved_modules.items():
             sys.modules.pop(name, None)
+            if saved is not None:
+                sys.modules[name] = saved
 
     def _log_event(self, severity, event_type, message, data=None):
         self.logged.append((severity, event_type, message, data))

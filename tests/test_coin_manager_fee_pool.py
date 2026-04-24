@@ -6,10 +6,17 @@ import unittest
 from decimal import Decimal
 
 
+_MODS_TO_RESTORE = ("coin_manager", "tx_fees", "wallet", "wallet_sage",
+                    "database", "config")
+
+
 class CoinManagerFeePoolTests(unittest.TestCase):
     def setUp(self):
         self._saved_wallet_type = os.environ.get("WALLET_TYPE")
         os.environ["WALLET_TYPE"] = "chia"
+        self._saved_modules = {
+            name: sys.modules.get(name) for name in _MODS_TO_RESTORE
+        }
 
         _TIER_SIZES = {
             "inner":   Decimal("1.0"),
@@ -85,8 +92,10 @@ class CoinManagerFeePoolTests(unittest.TestCase):
         self.manager = self.coin_manager.CoinManager()
 
     def tearDown(self):
-        for name in ["coin_manager", "tx_fees", "wallet", "database", "config"]:
+        for name, saved in self._saved_modules.items():
             sys.modules.pop(name, None)
+            if saved is not None:
+                sys.modules[name] = saved
 
         if self._saved_wallet_type is None:
             os.environ.pop("WALLET_TYPE", None)

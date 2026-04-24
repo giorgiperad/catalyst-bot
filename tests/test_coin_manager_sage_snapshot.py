@@ -7,10 +7,16 @@ from decimal import Decimal
 from unittest.mock import patch
 
 
+_MODS_TO_RESTORE = ("coin_manager", "wallet", "wallet_sage", "database", "config")
+
+
 class CoinManagerSageSnapshotTests(unittest.TestCase):
     def setUp(self):
         self._saved_wallet_type = os.environ.get("WALLET_TYPE")
         os.environ["WALLET_TYPE"] = "sage"
+        self._saved_modules = {
+            name: sys.modules.get(name) for name in _MODS_TO_RESTORE
+        }
         self.calls = {"detailed": 0, "upserts": []}
 
         fake_config = types.ModuleType("config")
@@ -79,8 +85,10 @@ class CoinManagerSageSnapshotTests(unittest.TestCase):
             self.manager = self.coin_manager.CoinManager()
 
     def tearDown(self):
-        for name in ["coin_manager", "wallet", "database", "config"]:
+        for name, saved in self._saved_modules.items():
             sys.modules.pop(name, None)
+            if saved is not None:
+                sys.modules[name] = saved
 
         if self._saved_wallet_type is None:
             os.environ.pop("WALLET_TYPE", None)
