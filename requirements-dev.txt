@@ -1,4 +1,4 @@
 -r requirements.txt
-pytest>=8,<9
+pytest>=9.0.3,<10
 pytest-xdist>=3.5,<4
 vulture>=2.11,<3
