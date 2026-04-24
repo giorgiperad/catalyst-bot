@@ -10,8 +10,8 @@ the subset that matches a recent commit.
 > * Launch: `python desktop_app.py --flask` (or the desktop shortcut)
 > * Open `http://127.0.0.1:5000` in a browser (or via the Preview MCP:
 >   `preview_start` with the `bot-gui` config in `.claude/launch.json`)
-> * Click through: **Continue** → **Connect to Sage** → pick Test Wallet 6
->   (fingerprint `2981073251`) → **Skip** the Splash P2P prompt → **Continue with
+> * Click through: **Continue** → **Connect to Sage** → pick your test wallet
+>   → **Skip** the Splash P2P prompt → **Continue with
 >   Configured Key** on the Spacescan prompt
 > * You should land on the Dashboard
 

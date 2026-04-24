@@ -129,3 +129,12 @@ version_info.txt
 # --- Claude Code agent scratch ---
 .claude/
 
+# --- Internal dev notes (stay local, kept out of GitHub) ---
+# Claude-session handoff prompts, internal audit plans, and other
+# material that would confuse external contributors or leak workflow
+# details.  Files still exist on disk; they just aren't tracked.
+NEXT_SESSION.md
+tests/master_test_plan/
+docs/COIN_FSM_DESIGN.md
+docs/tech_debt.md
+
