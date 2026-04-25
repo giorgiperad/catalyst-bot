@@ -625,7 +625,7 @@ class Config:
         # Adaptive gap-closing strategy
         self.GAP_CLOSE_START_PCT = _int("GAP_CLOSE_START_PCT", 75)  # Start at 75% of main spread
         self.GAP_CLOSE_STEP_PCT = _int("GAP_CLOSE_STEP_PCT", 30)  # Tighten 30% per stable period (bigger jumps = faster floor discovery)
-        self.GAP_CLOSE_SAFETY_BUFFER_BPS = _int("GAP_CLOSE_SAFETY_BUFFER_BPS", 20)  # Buffer above arb gap
+        self.GAP_CLOSE_SAFETY_BUFFER_BPS = _int("GAP_CLOSE_SAFETY_BUFFER_BPS", 5)  # Buffer above arb gap (tight — empirical test showed Dexie watchers take any +EV offer, so sub-probe needs room to actually push past the real arb threshold)
         self.GAP_CLOSE_STEP_COOLDOWN_SECS = _int("GAP_CLOSE_STEP_COOLDOWN_SECS", 60)  # 1 min between steps
         self.GAP_CLOSE_CONVERGENCE_SECS = _int("GAP_CLOSE_CONVERGENCE_SECS", 120)  # 2 min between main book convergence steps
         self.GAP_CLOSE_CONVERGENCE_STEP_PCT = _int("GAP_CLOSE_CONVERGENCE_STEP_PCT", 20)  # Main book tightens 20% per step

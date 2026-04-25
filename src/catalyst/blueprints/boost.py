@@ -134,7 +134,7 @@ def api_boost_activate():
         # floor was calculated correctly, the probe survives and we drop
         # below it to find the *true* floor (see GAP_CLOSE_BELOW_FLOOR_MULT).
         floor_mult = float(getattr(cfg, "GAP_CLOSE_FLOOR_MULT", 1.0))
-        min_initial = int(getattr(cfg, "GAP_CLOSE_MIN_INITIAL_BPS", 20))
+        min_initial = int(getattr(cfg, "GAP_CLOSE_MIN_INITIAL_BPS", 5))
         expected_spread = max(int(expected_floor * floor_mult), min_initial)
         # Translate to a start_pct so BoostManager's existing math reproduces
         # this spread (it computes spread = main_spread * pct / 100).

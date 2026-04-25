@@ -512,7 +512,11 @@ class BoostManager:
         # real floor is below us and we can keep going. If it gets arbed, we
         # bounce back up to the calculated floor and hand off there.
         if self._gap_spread_bps <= self._arb_floor_bps:
-            below_mult = float(getattr(cfg, "GAP_CLOSE_BELOW_FLOOR_MULT", 0.5))
+            # Sub-probe goes much deeper than the calculated floor. The
+            # 2026-04-25 giveaway test proved that Dexie watchers take ANY
+            # +EV offer regardless of size — so the calculated floor can
+            # be wildly conservative. The sub-probe needs to push hard.
+            below_mult = float(getattr(cfg, "GAP_CLOSE_BELOW_FLOOR_MULT", 0.25))
             below_spread = max(1, int(self._arb_floor_bps * below_mult))
             already_subprobed = getattr(self, "_subprobe_attempted", False)
 
