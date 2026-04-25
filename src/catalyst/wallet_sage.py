@@ -397,6 +397,21 @@ def _sage_post(path: str, payload: dict, timeout: int = 10):
         resp = conn.getresponse()
         data = resp.read().decode("utf-8")
 
+    def _log_sage_error(kind: str, snippet: str):
+        """Always-on structured logger for sage transaction errors so we
+        can grep / display them in the GUI. Fail-open."""
+        try:
+            from database import log_event as _le
+            # Capture which thread raised this so we can correlate with
+            # boost_step/cancel/create activity in the same window.
+            import threading as _t
+            _le("warning", f"sage_{kind.lower()}",
+                f"⚠️ Sage {kind} on {path}: {snippet[:200]}",
+                data={"endpoint": path, "kind": kind, "snippet": snippet[:500],
+                      "thread": _t.current_thread().name})
+        except Exception:
+            pass
+
     if resp.status == 200:
         parsed = _json.loads(data)
         # Check for transaction errors in the response body
@@ -406,24 +421,30 @@ def _sage_post(path: str, payload: dict, timeout: int = 10):
             status = parsed.get("status") or ""
             combined = str(error_msg) + str(status)
             if "MEMPOOL_CONFLICT" in combined:
+                _log_sage_error("MEMPOOL_CONFLICT", combined)
                 raise SageMempoolConflict(
                     f"MEMPOOL_CONFLICT on {path}: another transaction already spent one of these coins")
             if "UNKNOWN_UNSPENT" in combined:
+                _log_sage_error("UNKNOWN_UNSPENT", combined)
                 raise SageUnknownUnspent(
                     f"UNKNOWN_UNSPENT on {path}: coin not in UTXO set (not confirmed or already spent)")
             if "ALREADY_INCLUDING_TRANSACTION" in combined:
+                _log_sage_error("ALREADY_INCLUDING", combined)
                 raise SageAlreadyIncluding(
                     f"ALREADY_INCLUDING_TRANSACTION on {path}: cancel TX already in mempool")
         return parsed
     else:
         # Check for specific error types in non-200 responses
         if "MEMPOOL_CONFLICT" in data:
+            _log_sage_error("MEMPOOL_CONFLICT", data)
             raise SageMempoolConflict(
                 f"MEMPOOL_CONFLICT on {path}: {data[:200]}")
         if "UNKNOWN_UNSPENT" in data:
+            _log_sage_error("UNKNOWN_UNSPENT", data)
             raise SageUnknownUnspent(
                 f"UNKNOWN_UNSPENT on {path}: {data[:200]}")
         if "ALREADY_INCLUDING_TRANSACTION" in data:
+            _log_sage_error("ALREADY_INCLUDING", data)
             raise SageAlreadyIncluding(
                 f"ALREADY_INCLUDING_TRANSACTION on {path}: {data[:200]}")
         raise ConnectionError(f"Sage HTTP {resp.status}: {data[:300]}")
@@ -469,6 +490,22 @@ def rpc(endpoint: str, payload: dict, timeout: int = 10):
     except SageMempoolConflict as e:
         elapsed = time.time() - start
         print(f"⚠️  [Sage] MEMPOOL_CONFLICT on {endpoint} (after {elapsed:.2f}s): {e}")
+        # Structured event so we can query/display these in the GUI and
+        # diagnose root cause. Includes payload key summary so we know
+        # which coin/offer triggered it (without dumping full payloads).
+        try:
+            from database import log_event as _le
+            _payload_summary = {
+                k: (str(v)[:80] if not isinstance(v, (int, float, bool)) else v)
+                for k, v in (payload or {}).items() if k != "puzzle_reveal"
+            }
+            _le("warning", "sage_mempool_conflict",
+                f"⚠️ Sage MEMPOOL_CONFLICT on {endpoint} after {elapsed:.2f}s: {str(e)[:200]}",
+                data={"endpoint": endpoint, "elapsed_secs": round(elapsed, 2),
+                      "error_message": str(e)[:500],
+                      "payload_summary": _payload_summary})
+        except Exception:
+            pass  # additive — never block on logging failure
         # Return a structured error so callers can detect this specific failure
         return {"error": "MEMPOOL_CONFLICT", "success": False,
                 "message": str(e), "endpoint": endpoint}
