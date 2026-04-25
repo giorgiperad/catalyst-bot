@@ -15059,7 +15059,10 @@
             const mhMetrics = mh.metrics || {};
             const perf = dashboard.performance || {};
             const spreads = s.spreads || {};
-            const sc = dashboard.spacescan_context || {};
+            // The backend's market-intel response uses key `spacescan` while
+            // the dashboard's market-health response uses `spacescan_context`.
+            // Read both so the renderer works for either endpoint.
+            const sc = dashboard.spacescan_context || dashboard.spacescan || {};
             const trading = s.trading || {};
             const safety = s.safety || {};
 
