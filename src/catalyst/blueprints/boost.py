@@ -115,13 +115,34 @@ def api_boost_activate():
     except (ValueError, TypeError):
         pass
 
-    if start_pct_override is None and start_pct_override_dexie is not None:
-        start_pct_override = start_pct_override_dexie
-
-    start_pct = start_pct_override or getattr(cfg, "GAP_CLOSE_START_PCT", 75)
-    expected_spread = max(1, int(main_spread_bps * start_pct / 100)) if main_spread_bps > 0 else getattr(cfg, "BOOST_SPREAD_BPS", 200)
     buffer = getattr(cfg, "GAP_CLOSE_SAFETY_BUFFER_BPS", 20)
     expected_floor = max(1, int(arb_gap) + buffer)
+
+    # New default behavior (2026-04-25): start the first probe NEAR THE FLOOR,
+    # not just inside the tightest competitor on Dexie. The probes are sniper-
+    # sized and disposable — the goal is to discover the real arb floor quickly,
+    # not to ease into it from far above. The Dexie best-prices override
+    # (start_pct_override_dexie = 100) is now treated as a hint, not a default.
+    # Only an explicit user start_pct overrides the aggressive default.
+    if start_pct_override is not None:
+        start_pct = start_pct_override
+        expected_spread = max(1, int(main_spread_bps * start_pct / 100)) if main_spread_bps > 0 else getattr(cfg, "BOOST_SPREAD_BPS", 200)
+    else:
+        # AGGRESSIVE DEFAULT: start AT the calculated arb floor (1.0x). The
+        # probes are sniper-sized — getting arbed on the first probe is the
+        # cheapest possible way to confirm whether the floor is real. If the
+        # floor was calculated correctly, the probe survives and we drop
+        # below it to find the *true* floor (see GAP_CLOSE_BELOW_FLOOR_MULT).
+        floor_mult = float(getattr(cfg, "GAP_CLOSE_FLOOR_MULT", 1.0))
+        min_initial = int(getattr(cfg, "GAP_CLOSE_MIN_INITIAL_BPS", 20))
+        expected_spread = max(int(expected_floor * floor_mult), min_initial)
+        # Translate to a start_pct so BoostManager's existing math reproduces
+        # this spread (it computes spread = main_spread * pct / 100).
+        if main_spread_bps > 0:
+            start_pct_override = max(1, int(round(expected_spread * 100 / main_spread_bps)))
+        else:
+            start_pct_override = 100  # fallback path doesn't use main_spread anyway
+
     expected_spread = max(expected_spread, expected_floor)
 
     def _activate_bg():

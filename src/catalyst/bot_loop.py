@@ -4269,25 +4269,28 @@ class BotLoop:
         # Compute DB-open subsets for cap check (wallet set may include zombie
         # offers: cancelled in DB but still active in Sage after a failed cancel
         # attempt).  Fill detection and requote still use the full wallet sets.
-        # Sniper-tier offers are excluded from cap counts (mirroring trim_excess_offers),
-        # so snipers never inflate the main ladder count and trigger a false trim-create cycle.
+        # Sniper-tier and boost-tier offers are excluded from cap counts
+        # (mirroring trim_excess_offers), so neither inflates the main ladder
+        # count and triggers a false trim-create cycle. Boost = Close the Gap
+        # probes, sniper = arb snipes — both live in their own pools.
         try:
             from database import get_open_offers as _db_get_open
             _db_buy_all  = [o for o in _db_get_open(side="buy")  if o.get("trade_id")]
             _db_sell_all = [o for o in _db_get_open(side="sell") if o.get("trade_id")]
             _db_open_buy_ids = {
                 o["trade_id"] for o in _db_buy_all
-                if (o.get("tier") or "").lower() != "sniper"
+                if (o.get("tier") or "").lower() not in ("sniper", "boost")
             }
             _db_open_sell_ids = {
                 o["trade_id"] for o in _db_sell_all
-                if (o.get("tier") or "").lower() != "sniper"
+                if (o.get("tier") or "").lower() not in ("sniper", "boost")
             }
-            # Sniper offer IDs (DB-tracked) — exclude from wallet sets so snipers
-            # don't appear as zombies and don't consume main-ladder cap slots.
+            # Sniper / boost offer IDs (DB-tracked) — exclude from wallet sets
+            # so they don't appear as zombies and don't consume main-ladder
+            # cap slots.
             _db_sniper_ids = {
                 o["trade_id"] for o in _db_buy_all + _db_sell_all
-                if (o.get("tier") or "").lower() == "sniper"
+                if (o.get("tier") or "").lower() in ("sniper", "boost")
             }
             _main_wallet_buy_ids  = current_buy_ids  - _db_sniper_ids
             _main_wallet_sell_ids = current_sell_ids - _db_sniper_ids

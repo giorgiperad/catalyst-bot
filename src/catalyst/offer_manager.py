@@ -3435,12 +3435,30 @@ class OfferManager:
                               f"trim_excess_offers: could not query open {side} offers: {e}")
                     continue
 
-            # Exclude sniper-tier offers from the ladder cap check — snipers
-            # are a separate pool and must not cause ladder offers to be
-            # cancelled.
+            # Exclude sniper-tier and boost-tier offers from the ladder cap
+            # check — both are separate pools (sniper for arb snipes, boost
+            # for Close the Gap probes) and must not cause ladder offers to
+            # be cancelled. Without this, activating Close the Gap pushes
+            # the count to ladder+1 each side and the trimmer cancels two
+            # ladder offers per cycle, churning the book.
+            #
+            # Subtle: when wallet_buys/wallet_sells are passed in (the common
+            # path), the offer dicts come from the WALLET and don't carry the
+            # `tier` field — that's a DB-only label. We have to look up the
+            # boost/sniper trade_ids from the DB and exclude them by id.
+            try:
+                _db_open = get_open_offers(side=side, cat_asset_id=cfg.CAT_ASSET_ID) or []
+                _excluded_ids = {
+                    o.get("trade_id") for o in _db_open
+                    if (o.get("tier") or "").lower() in ("sniper", "boost")
+                    and o.get("trade_id")
+                }
+            except Exception:
+                _excluded_ids = set()
             open_offers = [
                 o for o in open_offers_all
-                if (o.get("tier") or "").lower() != "sniper"
+                if (o.get("tier") or "").lower() not in ("sniper", "boost")
+                and o.get("trade_id") not in _excluded_ids
             ]
 
             # Exclude offers already pending cancel (fire-and-forget from

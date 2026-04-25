@@ -11181,9 +11181,10 @@
                         <div class="v4-modal-field">
                             <label for="gapStartPctInput">Starting aggression</label>
                             <select id="gapStartPctInput">
-                                <option value="90">Cautious (90% of main)</option>
-                                <option value="75" selected>Balanced (75% of main)</option>
-                                <option value="50">Aggressive (50% of main)</option>
+                                <option value="">Find floor (default — start near arb floor)</option>
+                                <option value="50">Balanced (50% of main book)</option>
+                                <option value="75">Cautious (75% of main book)</option>
+                                <option value="90">Very cautious (90% of main book)</option>
                             </select>
                         </div>
                         <div class="v4-modal-field">
@@ -21434,7 +21435,22 @@
                         || !(mainSelector.options?.length)
                         || selectorHasAssetId(mainSelector, data.current_cat.asset_id);
                     if (!statusCatInSelector) {
-                        console.log('[SYNC] Ignoring status current_cat that is not present in the current wallet CAT list:', data.current_cat.asset_id);
+                        // Self-healing: the bot is trading a CAT that isn't in
+                        // the dropdown — usually because loadCATs() ran before
+                        // Sage finished registering wallets. Trigger a one-shot
+                        // refresh so the GUI catches up without needing a page
+                        // reload. Guard with a flag so we only retry once per
+                        // missing asset_id (no infinite loop if the CAT really
+                        // isn't in the wallet).
+                        const _missingId = data.current_cat.asset_id;
+                        if (window._catReloadAttempted !== _missingId) {
+                            window._catReloadAttempted = _missingId;
+                            console.log('[SYNC] current_cat missing from dropdown — triggering loadCATs() refresh:', _missingId);
+                            (typeof loadCATs === 'function' ? loadCATs() : Promise.resolve())
+                                .catch(e => console.warn('[SYNC] loadCATs() retry failed:', e?.message || e));
+                        } else {
+                            console.log('[SYNC] Ignoring status current_cat that is not present in the current wallet CAT list:', _missingId);
+                        }
                     } else {
                     // Merge server CAT data — don't overwrite fields we already have
                     // (loadCATs may have set wallet_id etc. that the server omits)
@@ -28010,12 +28026,22 @@
             const selectEl = document.getElementById('gapStartPctInput');
             const infoEl = document.getElementById('gapSettingsInfo');
             const updateInfo = () => {
-                const pct = selectEl ? parseInt(selectEl.value) : 75;
-                const startBps = Math.round(mainSpreadNum * pct / 100);
+                const raw = selectEl ? selectEl.value : '';
                 const floorBps = Math.max(1, Math.ceil(arbNum) + 20);
-                const effectiveStart = Math.max(startBps, floorBps);
+                let effectiveStart;
+                let modeNote;
+                if (raw === '') {
+                    // Find-floor default — start at 1.5x arb floor (clamped to 30bps min)
+                    effectiveStart = Math.max(Math.round(floorBps * 1.5), 30);
+                    modeNote = ' (anchored to arb floor — most aggressive)';
+                } else {
+                    const pct = parseInt(raw);
+                    const startBps = Math.round(mainSpreadNum * pct / 100);
+                    effectiveStart = Math.max(startBps, floorBps);
+                    modeNote = ` (${pct}% of main book)`;
+                }
                 if (infoEl) {
-                    infoEl.innerHTML = `Will start at <strong>${bps2pct(effectiveStart)}</strong> ` +
+                    infoEl.innerHTML = `Will start at <strong>${bps2pct(effectiveStart)}</strong>${modeNote} ` +
                         `and tighten 10% every 60s.`;
                 }
             };
@@ -28046,7 +28072,11 @@
         async function confirmGapCloserActivate() {
             const selectEl = document.getElementById('gapStartPctInput');
             const sizeInput = document.getElementById('gapSizeInput');
-            const startPct = selectEl ? parseInt(selectEl.value) : 75;
+            // Empty value ("Find floor") means: omit start_pct so the backend
+            // uses its aggressive floor-anchored default. Numeric value means
+            // user picked a "% of main book" override.
+            const rawPct = selectEl ? selectEl.value : '';
+            const startPct = rawPct === '' ? null : parseInt(rawPct);
             const sizeXch = sizeInput ? parseFloat(sizeInput.value) : 0.001;
 
             closeGapCloserConfirm();
@@ -28058,13 +28088,12 @@
             }
             if (statusEl) statusEl.textContent = `Starting manual probe pair at ${sizeXch} XCH per side...`;
             try {
+                const body = { size_xch: sizeXch };
+                if (startPct !== null) body.start_pct = startPct;
                 const resp = await apiFetch(`${API_URL}/boost/activate`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        start_pct: startPct,
-                        size_xch: sizeXch,
-                    }),
+                    body: JSON.stringify(body),
                 });
                 const result = await resp.json();
                 if (resp.status === 503) {

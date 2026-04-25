@@ -151,7 +151,15 @@ class BoostManager:
             # Fallback if no main spread available
             self._gap_spread_bps = getattr(cfg, "BOOST_SPREAD_BPS", 200)
 
-        self._start_spread_bps = self._gap_spread_bps  # Remember ceiling
+        self._start_spread_bps = self._gap_spread_bps  # Remember initial spread
+
+        # Widen ceiling — when probes get arbed, the spread widens by 20% per
+        # arb. Capped at the LARGER of (start spread) and (main book spread)
+        # so an aggressive find-floor start (e.g. 30bps) can still widen up
+        # toward the original ladder spread (e.g. 480bps) if every probe
+        # gets eaten. Without this, an aggressive start gets stuck at the
+        # initial value because each arb-widen is clamped back down to 30bps.
+        self._widen_ceiling_bps = max(self._start_spread_bps, max(1, int(main_spread_bps)))
 
         # Calculate arb floor (never go tighter than this)
         buffer = getattr(cfg, "GAP_CLOSE_SAFETY_BUFFER_BPS", 20)
@@ -179,6 +187,7 @@ class BoostManager:
             self._steps_taken = 0
             self._arb_count = 0
             self._last_step_time = time.time()
+            self._subprobe_attempted = False  # reset for this run
             # Reset convergence
             self._convergence_factor = Decimal("1.0")
 
@@ -268,7 +277,8 @@ class BoostManager:
             for tid in to_cancel:
                 offer_mgr._bot_cancelled_ids.add(tid)
             result = offer_mgr.cancel_offers(
-                to_cancel, reason="gap_closer_deactivate"
+                to_cancel, reason="gap_closer_deactivate",
+                skip_confirmation=True,
             )
             # cancel_offers returns {trade_id: {"success": bool, ...}, ...}
             # — NOT {"cancelled": N, "failed": N}. Count by iterating values.
@@ -417,7 +427,8 @@ class BoostManager:
                 cancel_tid = furthest.get("trade_id")
                 if cancel_tid:
                     om._bot_cancelled_ids.add(cancel_tid)
-                    om.cancel_offers([cancel_tid], reason="gap_closer_handoff_swap")
+                    om.cancel_offers([cancel_tid], reason="gap_closer_handoff_swap",
+                                     skip_confirmation=True)
                     log_event("info", "gap_closer_handoff_swap",
                               f"📈 Handoff {side}: planted inner offer at "
                               f"{_bps_to_pct(proven_spread_bps)}, "
@@ -489,12 +500,57 @@ class BoostManager:
         # Already at or below the arb floor?
         # If we've also passed both cooldown guards to get here, that means
         # offers have been sitting at the floor for a full cooldown with no arb.
-        # Job done — hand off the proven price to the inner tier, then stop.
+        # Try ONE below-floor sub-probe to discover the *real* floor — the
+        # calculated floor is just (arb_gap + buffer), which may overestimate
+        # what the market actually punishes. If the sub-probe survives, the
+        # real floor is below us and we can keep going. If it gets arbed, we
+        # bounce back up to the calculated floor and hand off there.
         if self._gap_spread_bps <= self._arb_floor_bps:
+            below_mult = float(getattr(cfg, "GAP_CLOSE_BELOW_FLOOR_MULT", 0.5))
+            below_spread = max(1, int(self._arb_floor_bps * below_mult))
+            already_subprobed = getattr(self, "_subprobe_attempted", False)
+
+            if not already_subprobed and below_spread < self._gap_spread_bps:
+                # Fire one sub-probe below the calculated floor
+                self._subprobe_attempted = True
+                old_spread = self._gap_spread_bps
+                self._gap_spread_bps = below_spread
+                self._steps_taken += 1
+                self._last_step_time = now
+
+                if self._active_boost_ids and self._offer_manager:
+                    for tid in self._active_boost_ids:
+                        self._offer_manager._bot_cancelled_ids.add(tid)
+                    self._offer_manager.cancel_offers(
+                        self._active_boost_ids,
+                        reason="gap_closer_subprobe",
+                        skip_confirmation=True,
+                    )
+                self._active_boost_ids.clear()
+                self._create_gap_closer_pair(self._boost_mid_price)
+                self._stable_since = time.time()
+
+                log_event("info", "gap_closer_subprobe",
+                          f"📈 Below-floor sub-probe: {_bps_to_pct(old_spread)} "
+                          f"→ {_bps_to_pct(below_spread)} (calculated floor was "
+                          f"{_bps_to_pct(self._arb_floor_bps)} — testing whether "
+                          f"the market actually punishes this price)",
+                          data={"spread_bps": below_spread,
+                                "arb_floor_bps": self._arb_floor_bps,
+                                "steps_taken": self._steps_taken})
+                print(f"📈 Sub-probe below floor: {_bps_to_pct(old_spread)} → "
+                      f"{_bps_to_pct(below_spread)}", flush=True)
+                return True  # acted this cycle
+
+            # Already attempted sub-probe (or it would be no tighter) —
+            # complete the test. If the sub-probe got arbed, _on_arbed()
+            # has already widened us back above the floor; if it survived,
+            # we're sitting at sub-probe spread and that's our new known-
+            # safe price. Either way, hand off and stop.
             stable_secs = int(now - self._stable_since)
             log_event("info", "gap_closer_auto_stop",
                       f"📈 Close the Gap complete — held floor at "
-                      f"{_bps_to_pct(self._arb_floor_bps)} for {stable_secs}s "
+                      f"{_bps_to_pct(self._gap_spread_bps)} for {stable_secs}s "
                       f"with no arb after {self._steps_taken} step(s). "
                       f"Handing off to inner tier.",
                       data={"spread_bps": self._gap_spread_bps,
@@ -530,23 +586,24 @@ class BoostManager:
         self._steps_taken += 1
         self._last_step_time = now
 
-        # Explicitly cancel old offers before creating new ones.
-        # We tried 60-second expiry but it caused two problems:
-        #   1. Offers expired mid-proof, triggering refresh + step on same cycle
-        #      → duplicate offers at the same price on Dexie
-        #   2. refresh_if_needed would recreate at old spread immediately before
-        #      step fired, wasting a coin pair at the wrong price
-        # Explicit cancel is cleaner — coins free within 1-2 seconds.
+        # Fire-and-forget cancel old offers, then immediately create the new
+        # probe pair using DIFFERENT sniper coins. Why fire-and-forget:
+        # Sage's cancel-confirm path waits up to 90s for the cancel tx to
+        # confirm and the original coin to return — during that window the
+        # inside of the book is EMPTY because the new probes haven't been
+        # placed yet. Probes are sniper-tier (we have 25 in the pool) so the
+        # selector picks a fresh coin for the new probe; the old coin is
+        # still mid-cancel but we don't need it. The cancel will confirm in
+        # the background and free its coin back into the pool.
         if self._active_boost_ids and self._offer_manager:
             for tid in self._active_boost_ids:
                 self._offer_manager._bot_cancelled_ids.add(tid)
             self._offer_manager.cancel_offers(
-                self._active_boost_ids, reason="gap_closer_step"
+                self._active_boost_ids,
+                reason="gap_closer_step",
+                skip_confirmation=True,
             )
         self._active_boost_ids.clear()
-
-        # Brief wait for wallet to process the cancel before creating new offers
-        time.sleep(0.5)
 
         # Recreate at new tighter spread
         self._create_gap_closer_pair(self._boost_mid_price)
@@ -638,7 +695,8 @@ class BoostManager:
             for tid in old_ids:
                 self._offer_manager._bot_cancelled_ids.add(tid)
             self._offer_manager.cancel_offers(
-                old_ids, reason="gap_closer_refresh"
+                old_ids, reason="gap_closer_refresh",
+                skip_confirmation=True,
             )
 
         if created:
@@ -798,10 +856,18 @@ class BoostManager:
         # Previously used cooldown+60 (120s) which was too fragile — offers
         # could expire mid-proof if the bot loop was busy with other work.
         offer_expiry = getattr(cfg, "SNIPER_EXPIRY_SECS", 600)
+        # Pin coin selection to the sniper pool. Probes are sniper-sized
+        # (SNIPER_SIZE_XCH) so without this hint the closest-fit selector
+        # would *usually* pick a sniper coin, but could silently spill into
+        # an inner-tier coin if the sniper pool is empty — burning a much
+        # larger coin to back a 0.001 XCH probe. strict=True fails the
+        # creation cleanly instead so the GUI surfaces the depleted pool.
         res = self._offer_manager.create_offer_with_retry(
             offer_dict,
             coin_ids_enabled=cfg.COIN_IDS_ENABLED,
-            expiry_secs=offer_expiry
+            expiry_secs=offer_expiry,
+            preferred_tier="sniper",
+            strict_preferred_tier=True,
         )
 
         if not res or not res.get("success"):
@@ -891,8 +957,13 @@ class BoostManager:
             # Widen gap-closer spread by 20%
             new_spread = int(self._gap_spread_bps * 1.2)
 
-            # Never widen beyond where we started
-            new_spread = min(new_spread, self._start_spread_bps)
+            # Cap widening at widen_ceiling (max of start spread or main book
+            # spread at activation time). With aggressive find-floor starts
+            # near the floor, widening must be allowed to climb above the
+            # initial spread or we'd be permanently stuck just above the
+            # floor with offers getting eaten every cycle.
+            ceiling = getattr(self, "_widen_ceiling_bps", self._start_spread_bps)
+            new_spread = min(new_spread, ceiling)
             self._gap_spread_bps = new_spread
 
             # Reset stability timer — need to prove stability again
