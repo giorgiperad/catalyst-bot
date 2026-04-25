@@ -28,6 +28,10 @@ bot_backup_*.db
 bot_backup_*/
 tmp_db_*
 
+# --- E2E test isolated data dir (per-session DB + state) ---
+.e2e_data/
+tests/.e2e_data/
+
 # --- Log files ---
 *.log
 coin_prep_output.log

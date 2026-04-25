@@ -11725,6 +11725,7 @@
                     <p>Shows the ratio of your trade size to the TibetSwap pool. If your trade is large relative to the pool, the bot widens spreads to account for slippage.</p>
                     <h3 style="color: var(--accent-primary-hover);">Where Spacescan helps</h3>
                     <p>Spacescan is used in this app as an on-chain helper rather than a live orderbook feed. It assists with fill verification, balance discrepancy checks, and token-health inputs used by Smart Settings and safety checks. It also provides the <strong>holder count</strong> shown in the Market Health panel (e.g. 3,948 holders for MZ), and the <strong>token icon</strong> displayed throughout the app. Spacescan data is cached for 24 hours due to API rate limits — it won't update every cycle.</p>
+                    <p><strong>Free tier vs Pro tier.</strong> If you skipped the API-key step during setup you're on the <em>free tier</em>, which only returns the token icon and basic price/supply data. The <strong>Activity Level</strong>, <strong>On-Chain Risk</strong>, and <strong>Holders</strong> panels will show "Free tier" instead of a value — that's expected, not a fault. Adding a Spacescan Pro API key (Settings → Spacescan → Save &amp; Verify) unlocks all three fields and improves the Smart Settings risk estimate.</p>
                     <h3 style="color: var(--accent-primary-hover);">Token icons</h3>
                     <p>When you select a trading pair, the app automatically fetches the token's logo from the <strong>Dexie icon CDN</strong> and shows it next to the token name in the titlebar, pair selector, and wallet balance labels. If no icon exists for a token, the space is simply left blank — no broken images.</p>
                     <h3 style="color: var(--accent-primary-hover);">Splash incoming offers</h3>
@@ -23422,40 +23423,67 @@
                 cbEl.style.opacity = '1';
             }
 
+            // Spacescan tier — when no API key is set we're on the free tier,
+            // which can't return holder/activity/risk data. Show that explicitly
+            // so operators don't read "Unknown" as "still loading".
+            const _scFreeTier = (String(m.spacescan_tier || 'free').toLowerCase() === 'free');
+            const _scNoData = !_scFreeTier && !m.spacescan_has_data;
+            const _setProUnavailable = (node, label) => {
+                node.textContent = label;
+                node.style.color = 'var(--slate-400)';
+                node.style.opacity = '0.55';
+                node.title = 'Spacescan free tier does not provide this data. Add a Pro API key in setup to enable.';
+            };
+
             // Spacescan activity
             const actEl = el('ccSpacescanActivity');
-            if (actEl && m.spacescan_activity_level !== undefined) {
+            if (actEl && !m.spacescan_enabled) {
+                actEl.textContent = 'Disabled';
+                actEl.style.opacity = '0.35';
+            } else if (actEl && _scFreeTier) {
+                _setProUnavailable(actEl, 'Free tier');
+            } else if (actEl && _scNoData) {
+                actEl.textContent = 'Loading…';
+                actEl.style.opacity = '0.35';
+            } else if (actEl && m.spacescan_activity_level !== undefined) {
                 const act = String(m.spacescan_activity_level);
                 actEl.textContent = act.charAt(0).toUpperCase() + act.slice(1);
                 actEl.style.color = act === 'high' ? 'var(--status-warning)' : (act === 'very_high' ? 'var(--status-danger)' : (act === 'low' ? 'var(--slate-400)' : 'var(--slate-200)'));
                 actEl.style.opacity = '1';
-            } else if (actEl && !m.spacescan_enabled) {
-                actEl.textContent = 'Disabled';
-                actEl.style.opacity = '0.35';
             }
 
             // Spacescan risk
             const riskEl = el('ccSpacescanRisk');
-            if (riskEl && m.spacescan_risk_level !== undefined) {
+            if (riskEl && !m.spacescan_enabled) {
+                riskEl.textContent = 'Disabled';
+                riskEl.style.opacity = '0.35';
+            } else if (riskEl && _scFreeTier) {
+                _setProUnavailable(riskEl, 'Free tier');
+            } else if (riskEl && _scNoData) {
+                riskEl.textContent = 'Loading…';
+                riskEl.style.opacity = '0.35';
+            } else if (riskEl && m.spacescan_risk_level !== undefined) {
                 const risk = String(m.spacescan_risk_level);
                 riskEl.textContent = risk.charAt(0).toUpperCase() + risk.slice(1);
                 riskEl.style.color = risk === 'high' ? 'var(--status-danger)' : (risk === 'medium' ? 'var(--status-warning)' : (risk === 'low' ? 'var(--success-400)' : 'var(--slate-400)'));
                 riskEl.style.opacity = '1';
-            } else if (riskEl && !m.spacescan_enabled) {
-                riskEl.textContent = 'Disabled';
-                riskEl.style.opacity = '0.35';
             }
 
             // Holders
             const holdersEl = el('ccHolders');
-            if (holdersEl && m.spacescan_holder_count !== undefined) {
+            if (holdersEl && !m.spacescan_enabled) {
+                holdersEl.textContent = 'Disabled';
+                holdersEl.style.opacity = '0.35';
+            } else if (holdersEl && _scFreeTier) {
+                _setProUnavailable(holdersEl, 'Free tier — add API key for holder count');
+            } else if (holdersEl && _scNoData) {
+                holdersEl.textContent = 'Loading…';
+                holdersEl.style.opacity = '0.35';
+            } else if (holdersEl && m.spacescan_holder_count !== undefined) {
                 const hc = parseInt(m.spacescan_holder_count, 10);
                 holdersEl.textContent = isNaN(hc) || hc === 0 ? '—' : hc.toLocaleString() + ' holders';
                 holdersEl.style.color = 'var(--slate-200)';
                 holdersEl.style.opacity = '1';
-            } else if (holdersEl && !m.spacescan_enabled) {
-                holdersEl.textContent = 'Disabled';
-                holdersEl.style.opacity = '0.35';
             }
         }
 

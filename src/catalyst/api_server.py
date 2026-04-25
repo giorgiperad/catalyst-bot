@@ -432,8 +432,15 @@ def _get_spacescan_market_context(asset_id: str = "", ticker_id: str = "",
     executable market sources. Spacescan contributes token health, activity,
     supply, and explorer-price sanity checks.
     """
+    # Tier reflects whether a Spacescan API key is configured. The free tier
+    # endpoint doesn't return holder/activity/risk fields, so the UI uses
+    # this flag to show "Not available (Free tier)" instead of a generic
+    # "Unknown" — that wording is misleading when the data is genuinely
+    # unreachable rather than just not yet fetched.
+    _api_key = (getattr(cfg, "SPACESCAN_API_KEY", "") or "").strip()
     context = {
         "enabled": bool(getattr(cfg, "SPACESCAN_ENABLED", True)),
+        "tier": "pro" if _api_key else "free",
         "has_data": False,
         "holder_count": 0,
         "activity_count": 0,

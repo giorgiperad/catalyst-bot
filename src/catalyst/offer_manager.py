@@ -1309,9 +1309,16 @@ class OfferManager:
                     time.sleep(2)
                     continue
 
-                # Non-retryable error or out of retries
+                # Non-retryable error or out of retries.
+                # NOTE: log at debug — the calling ladder loop fires
+                # `offer_create_failed` with side+index context (and includes
+                # this same error string), so re-logging at error level here
+                # doubles every failure in the operator log. Keep this as a
+                # debug breadcrumb so the raw Sage error is still captured in
+                # the structured events table for forensics, but don't count
+                # it twice in the visible error stream.
                 error_detail = error_msg or "Unknown error"
-                log_event("error", "offer_failed", f"Offer creation failed: {error_detail}")
+                log_event("debug", "offer_failed", f"Offer creation failed: {error_detail}")
                 return res
 
             return None
@@ -2859,7 +2866,11 @@ class OfferManager:
                   f"Cancel results: {successes} succeeded, {failures} failed "
                   f"(reason: {reason})")
 
-        # Update database status + coin tracking
+        # Update database status + coin tracking. Per-offer failures
+        # accumulate into a single rolled-up warning at the end so we don't
+        # spam the operator with N near-identical "cancel failed for X"
+        # warnings when one Sage outage knocks out an entire ladder.
+        newly_queued_failures: list[tuple[str, str]] = []
         for tid, result in results.items():
             if result and result.get("success"):
                 method = str(result.get("method") or "")
@@ -2893,8 +2904,22 @@ class OfferManager:
                         "attempts": 1,
                         "first_failed": time.time(),
                     }
-                    log_event("warning", "cancel_failed_queued",
-                              f"Cancel failed for {tid[:16]}... — queued for retry")
+                    err = str((result or {}).get("error") or "unknown")
+                    log_event("debug", "cancel_failed_queued",
+                              f"Cancel failed for {tid[:16]}... ({err[:80]}) — queued for retry")
+                    newly_queued_failures.append((tid, err))
+
+        if newly_queued_failures:
+            # One warning summarising the batch. Include a sample of the
+            # first error so operators can see the cause without expanding
+            # the debug breadcrumbs.
+            sample_err = newly_queued_failures[0][1][:120]
+            log_event(
+                "warning",
+                "cancel_failed_queued",
+                f"{len(newly_queued_failures)} offer cancel(s) failed and queued "
+                f"for retry (reason: {reason}; first error: {sample_err})",
+            )
 
         if successes > 0:
             log_event("info", "offers_cancelled",

@@ -52,6 +52,10 @@ if "urllib3" not in sys.modules:
 
 import coin_manager
 
+# Sentinel for "attribute did not exist on the original module" so tearDown
+# can distinguish "restore to None" from "delete the attribute we added".
+_MISSING = object()
+
 
 def _rec(coin_id: str, amount: int) -> dict:
     return {"coin_id": coin_id, "coin": {"amount": amount}}
@@ -68,6 +72,40 @@ _TIER_SIZES = {
 
 
 class SSOTFallbackTests(unittest.TestCase):
+
+    # Attributes patched onto sys.modules["database"] inside _classify().
+    # Without this restore step, the lambdas leak into every later test that
+    # uses real database functions — e.g. test_plan_02_30_database_unit fails
+    # with RuntimeError("db down") because get_free_coins is still the stub.
+    _PATCHED_DB_ATTRS = (
+        "get_free_coins",
+        "get_locked_coins",
+        "set_coin_designation",
+        "get_tier_spare_counts",
+        "log_event",
+    )
+
+    def setUp(self):
+        db_mod = sys.modules.get("database")
+        self._db_snapshot = None
+        if db_mod is not None:
+            self._db_snapshot = {
+                attr: getattr(db_mod, attr, _MISSING)
+                for attr in self._PATCHED_DB_ATTRS
+            }
+
+    def tearDown(self):
+        if self._db_snapshot is None:
+            return
+        db_mod = sys.modules.get("database")
+        if db_mod is None:
+            return
+        for attr, original in self._db_snapshot.items():
+            if original is _MISSING:
+                if hasattr(db_mod, attr):
+                    delattr(db_mod, attr)
+            else:
+                setattr(db_mod, attr, original)
 
     def _make_manager(self):
         with patch.object(coin_manager.CoinManager, "_resolve_fingerprint", return_value="123"):

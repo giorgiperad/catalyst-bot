@@ -100,6 +100,12 @@ _BLOCKED_KEYS = {
     "SPACESCAN_PRO_URL", "SPACESCAN_FREE_URL",
     "WALLET_TYPE",
     "CAT_ASSET_ID",
+    # CAT_WALLET_ID is derived at runtime from CAT_ASSET_ID via Sage's
+    # get_cats RPC (see wallet_sage.get_wallets). Persisting it to .env
+    # makes it stale every time the user switches fingerprints, which then
+    # causes a 10-second window at startup where _active_cat points at the
+    # wrong wallet_id before the resolver overwrites it.
+    "CAT_WALLET_ID",
 }
 
 

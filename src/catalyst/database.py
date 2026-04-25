@@ -1926,26 +1926,21 @@ def mark_coins_gone(coin_ids: List[str]) -> int:
         return 0
 
 
-def get_free_coins(wallet_type: str, tier: str = None) -> List[Dict]:
-    """Get all free (available) coins, optionally filtered by tier.
+def get_free_coins(wallet_type: str) -> List[Dict]:
+    """Get all free (available) coins for a wallet type.
 
-    Args:
-        wallet_type: 'xch' or 'cat'
-        tier: Optional tier filter (inner/mid/outer/extreme/reserve/small)
-
-    Returns:
-        List of coin dicts with coin_id, amount_mojos, tier, etc.
+    Returns every row from `coins` where status='free', largest first. Callers
+    that want tier/designation filtering should inspect the returned dicts'
+    `designation` and `assigned_tier` fields — the legacy `tier` column is
+    always 'unknown' in current writes (see upsert_coin) and is retained only
+    for schema compatibility with older DBs.
     """
     conn = get_connection()
-    query = "SELECT * FROM coins WHERE status='free' AND wallet_type=?"
-    params = [wallet_type]
-
-    if tier:
-        query += " AND tier=?"
-        params.append(tier)
-
-    query += " ORDER BY amount_mojos DESC"
-    rows = conn.execute(query, params).fetchall()
+    rows = conn.execute(
+        "SELECT * FROM coins WHERE status='free' AND wallet_type=? "
+        "ORDER BY amount_mojos DESC",
+        [wallet_type],
+    ).fetchall()
     return [dict(row) for row in rows]
 
 

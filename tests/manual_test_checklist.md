@@ -9,16 +9,17 @@ the subset that matches a recent commit.
 > * Make sure Sage wallet is open with RPC enabled (`Settings → Advanced → Start RPC Client`)
 > * Launch: `python desktop_app.py --flask` (or the desktop shortcut)
 > * Open `http://127.0.0.1:5000` in a browser (or via the Preview MCP:
->   `preview_start` with the `bot-gui` config in `.claude/launch.json`)
+>   `preview_start` with the `api-server` config in `.claude/launch.json`)
 > * Click through: **Continue** → **Connect to Sage** → pick your test wallet
->   → **Skip** the Splash P2P prompt → **Continue with
->   Configured Key** on the Spacescan prompt
+>   **by fingerprint** (see §0 gotcha 1) → **Skip** the Splash P2P prompt → **Use Free Tier**
+>   on the Spacescan prompt (or **Save & Verify** with a Pro key)
 > * You should land on the Dashboard
 
 ---
 
 ## Table of contents
 
+0. [Test environment — how Claude runs these tests](#test-env)
 1. [Dashboard tab](#dashboard)
 2. [Settings tab](#settings)
 3. [Liquidity Mode feature](#liquidity-mode)
@@ -31,7 +32,104 @@ the subset that matches a recent commit.
 10. [Reserve + topup behaviour](#reserves)
 11. [Shutdown and restart](#shutdown)
 12. [API smoke tests (curl)](#api-smoke)
-13. [Feature-specific smoke tests](#feature-smokes)
+13. [Reconciliation snippets](#reconcile)
+14. [Automated test suites](#auto-tests)
+15. [Feature-specific smoke tests](#feature-smokes)
+16. [Setup gotchas — read before every session](#gotchas)
+
+---
+
+<a id="test-env"></a>
+## 0. Test environment — how Claude runs these tests
+
+This is the toolchain Claude uses to drive the app autonomously. Replicate
+this setup if you want to take over a session or reproduce a result.
+
+### 0.1 Process layout
+
+| Component | Where it runs | How to start |
+|---|---|---|
+| **Sage wallet** | User's machine, separate process | Manual — must be open with RPC on, port 9257 |
+| **Flask API server** | `python desktop_app.py --flask` (no PyWebView window) | Started via Preview MCP using `.claude/launch.json` config name `api-server` |
+| **Browser** | Headless Chromium driven by the Preview MCP | `preview_start({name: "api-server"})` returns a `serverId` |
+| **Splash node** | Spawned by CATalyst on demand (`splash.exe` subprocess) | "Start Splash Node" button OR auto-spawn via env |
+
+### 0.2 Preview MCP cheat-sheet
+
+The Preview MCP is the headless browser. Tools:
+
+| Tool | Purpose | Notes |
+|---|---|---|
+| `preview_start({name})` | Boot a server from `.claude/launch.json` | Returns `serverId` used by every other call |
+| `preview_eval({serverId, expression})` | Run JS in the page | Best for snapshotting state, calling internal functions |
+| `preview_click({serverId, selector})` | CSS-selector click | Use for `#stableId` buttons |
+| `preview_fill({serverId, selector, value})` | Set `<input>` value | Triggers `change` automatically |
+| `preview_logs({serverId, search, lines})` | Tail Flask stdout/stderr | Use `level: "error"` to filter |
+| `preview_console_logs({serverId, level})` | Tail browser console | Filter by `error`/`warn` |
+| `preview_screenshot({serverId})` | Visual snapshot | JPEG; use sparingly |
+| `preview_snapshot({serverId})` | Accessibility tree | More structured than screenshot — good for asserting state |
+| `preview_stop({serverId})` | Kill the server | Use before restarts to pick up Python code changes |
+
+### 0.3 Browser is headless from your perspective
+
+The Preview MCP runs Chromium without a visible window — you don't see the
+browser drive. To prove what's happening, take a `preview_screenshot` and
+attach it. For state inspection, prefer `preview_eval` (returns JSON) over
+screenshots.
+
+### 0.4 Standard test flow Claude follows
+
+```
+1. preview_start({name: "api-server"})        → server up
+2. preview_eval(navigate to localhost:5000)
+3. preview_eval / preview_click               → dismiss disclaimer + connect Sage
+4. preview_eval                               → select fingerprint by ID (NOT name)
+5. preview_eval / preview_click               → walk through gates
+6. preview_fill                               → set reserves
+7. preview_eval(handleSaveClick())            → save settings
+8. preview_click("#cpConfirmBtn")             → start coin prep
+9. (5–10 min wait while monitoring logs)
+10. preview_click("#startBtn")                → start bot
+11. preview_logs (search="cycle_complete")    → confirm ladder built
+```
+
+### 0.5 Where data lives during tests
+
+| Path | Contents | Reset by |
+|---|---|---|
+| `%APPDATA%\Catalyst\bot.db` | DB: coins, offers, fills, settings | Data Reset tab → Wipe All |
+| `%APPDATA%\Catalyst\.env` | User config including `SPACESCAN_API_KEY`, `CAT_WALLET_ID` | Manual edit or settings UI |
+| `%APPDATA%\Catalyst\bot_superlog_*.log` | Full structured log per session | Auto-rotated at 10MB / 5 files |
+| `%APPDATA%\Catalyst\user_secrets.json` | Pro Spacescan key (if set via Save & Verify) | `clear_secret()` in spacescan.py |
+| `tests/.e2e_data/` | Isolated DB for e2e Playwright tests | Auto, doesn't touch user data |
+
+The repo's `C:\catalyst\.env` is **NOT** the active config — only the per-user
+copy at `%APPDATA%\Catalyst\.env` is loaded at runtime.
+
+### 0.6 Verification commands Claude reaches for first
+
+Always-safe one-liners. Copy-paste, no setup.
+
+```bash
+# Active offer count straight from Sage (bypasses the bot's view)
+cd C:/catalyst/src/catalyst && python -c "
+import wallet_sage as ws
+r = ws.rpc('get_offers', {'offset':0,'limit':100,'include_completed':True}, timeout=10)
+from collections import Counter
+print(Counter(o.get('status') for o in (r or {}).get('offers', [])))"
+
+# Splash daemon's own view of broadcasts/peers
+curl -s --max-time 3 http://127.0.0.1:4001/metrics
+
+# Bot's API view of coin counts
+curl -s http://127.0.0.1:5000/api/coins | python -c "import json,sys; d=json.load(sys.stdin)['inventory']; print({k:v for k,v in d.items() if 'total' in k or 'reserve' in k})"
+
+# Cancel-all progress
+curl -s http://127.0.0.1:5000/api/offers/cancel_all/status | python -m json.tool
+
+# Live cfg flags
+cd C:/catalyst/src/catalyst && python -c "from config import cfg; print({k:getattr(cfg,k,None) for k in ['SPACESCAN_API_KEY','SPACESCAN_ENABLED','CAT_WALLET_ID','XCH_RESERVE','CAT_RESERVE','SPLASH_ENABLED']})"
+```
 
 ---
 
@@ -46,6 +144,8 @@ the subset that matches a recent commit.
 | 1.4 | Trading Pair selector lists all MZ_XCH and other CAT pools from TibetSwap | refresh button works |
 | 1.5 | After picking a pair, Mid Price chart starts filling | ~5 s per sample, 240-point history |
 | 1.6 | Start Bot button enabled when: wallet synced + trading pair picked + settings saved + coins prepped | red disabled states with tooltips when not |
+| 1.7 | **Spacescan tier** — Activity Level / On-Chain Risk show "Free tier" (dimmed) when no API key; "Disabled" when SPACESCAN_ENABLED=false; actual value when Pro key set | (shipped 2026-04-25) |
+| 1.8 | **Holders** card shows "Free tier — add API key for holder count" on free tier | tooltip explains the cause |
 
 <a id="settings"></a>
 ## 2. Settings tab
@@ -63,6 +163,7 @@ the subset that matches a recent commit.
 | 2.9 | Save button writes to `.env` + shows toast | ~200 ms round trip |
 | 2.10 | Export .env dumps a timestamped file | downloads as attachment |
 | 2.11 | Pending-changes banner appears when any field is dirty | clears after Save |
+| 2.12 | **CAT_WALLET_ID is NOT writable** via bulk-config-update (blocked) | stale values from earlier sessions can't be re-introduced |
 
 <a id="liquidity-mode"></a>
 ## 3. Liquidity Mode feature *(shipped 2026-04-19, commits `1192045` + `0dbbcf3`)*
@@ -95,6 +196,7 @@ Located at the top of Settings, just under Trading Pair.
 | 4.6 | **Liquidity Mode: Sell Only** + Smart Settings → `max_active_buy=0`, all `buy_*_size_xch=null`, `sniper_enabled=false`, `topup_pool_xch=0`, `buy_ladder_reversed=false` | similar |
 | 4.7 | Under Reverse Buy Ladder + Two-Sided, tier sizes follow the reverse orientation (inner smaller than extreme) | (per 2026-04-19 ea0d1b5 fix) |
 | 4.8 | Clicking Smart Settings twice in a row with same inputs → same output | idempotent |
+| 4.9 | **Reserve % matrix** — Smart Settings adjusts trade size + slot count inversely with reserve %: 25%→1.40 XCH × 24 slots, 50%→0.73 XCH × 36 slots (verified 2026-04-25) | bigger reserve = smaller trades, more slots |
 
 <a id="coin-prep"></a>
 ## 5. Coin Prep flow
@@ -112,6 +214,7 @@ Located at the top of Settings, just under Trading Pair.
 | 5.9 | Progress view: percentage bar, phase label, XCH/CAT coin counts live-update | worker emits phase transitions |
 | 5.10 | If worker fails: Coin Prep Failed modal shows specific reason (e.g. "pool_exceeds_avail"), not just "❌ failed" | (shipped 2026-04-19 in `46f7844`) |
 | 5.11 | After success: Done button → returns to Dashboard, Start Bot is enabled | |
+| 5.12 | **Pool-coin retry warnings** ("XCH inner pool coin still intact after 45s") are non-fatal — auto-retry succeeds within 1 cycle | typically 5–10 such warnings per prep, all auto-recover |
 
 <a id="pnl"></a>
 ## 6. PnL tab
@@ -138,8 +241,9 @@ Located at the top of Settings, just under Trading Pair.
 | 7.3 | Dexie link opens in external browser frame | not in-tab |
 | 7.4 | Filter-by-side (Buy only / Sell only / All) works | |
 | 7.5 | Cancel button on a single row → confirm → offer disappears from list within ~3 s | Sage logs show cancel |
-| 7.6 | Cancel All button (when bot is stopped) | shows bulk-cancel confirm |
+| 7.6 | Cancel All button (when bot is stopped) | shows bulk-cancel confirm; verify via `curl -s http://127.0.0.1:5000/api/offers/cancel_all/status` |
 | 7.7 | Recently Filled section below shows last ~20 fills | filled_at timestamp + Dexie link |
+| 7.8 | **Cancel All progress endpoint** stays at `phase: "running"` even after backend logs `cancel_all_complete`. **Known stale state — confirm via Sage instead** (`include_completed=False` returns 0 active) | (bug discovered 2026-04-25, status payload not updated on completion) |
 
 <a id="logs"></a>
 ## 8. Logs tab
@@ -177,17 +281,21 @@ requires **stop first**.
 | 10.2 | Topup pool reserve = residual of (balance − tiers − reserve − headroom) | Inventory Position panel shows it |
 | 10.3 | In buy_only, only XCH topup pool is tracked | CAT topup = 0 |
 | 10.4 | In sell_only, only CAT topup pool is tracked | XCH topup = 0 |
+| 10.5 | **Reserve floor guard** — when XCH or CAT balance ≤ reserve, bot cancels all open offers and pauses creation. **Must require successful balance read** (don't trigger on RPC failure) | (fix shipped 2026-04-25 — see `_extract_wallet_balance_or_defer`); covered by `tests/test_bot_loop_reserve_floor_guard.py` |
 
 <a id="shutdown"></a>
 ## 11. Shutdown and restart
 
 | # | Test | Expected |
 |---|---|---|
-| 11.1 | Stop Bot button → cancels all open offers with confirm modal | offers go to "Cancelling" state then disappear |
-| 11.2 | If cancel takes >60 s, `position_hard_guard_blocked` warning is rate-limited to 1/min | (shipped 2026-04-18 in `f083abe`) |
-| 11.3 | Close app button → triggers shutdown sequence | PyWebView quits; Flask server also terminates |
-| 11.4 | Restart app → previous settings load; offers state is respected (resumes without duplicate-creating) | |
-| 11.5 | On next restart, Liquidity Mode loads from env correctly (checkbox / card matches) | (shipped 2026-04-19 in `0826ba2`) |
+| 11.1 | **Stop Bot** button stops the trading loop only — does **NOT** auto-cancel open offers | offers stay live on Dexie/Splash; bot just stops managing them |
+| 11.2 | **Cancel All** button (separate from Stop): confirm modal → bulk-cancel via Sage → all offers reach `status=cancelled` on-chain | only enabled while bot is stopped; verify via Sage RPC, not the GUI counter (see 7.8) |
+| 11.3 | **Shutdown App** modal explicitly states *"If you want a clean stop, cancel active offers before shutdown"* — does **NOT** auto-cancel either | clean-stop pattern: Stop → Cancel All → Shutdown |
+| 11.4 | If cancel takes >60 s, `position_hard_guard_blocked` warning is rate-limited to 1/min | (shipped 2026-04-18 in `f083abe`) |
+| 11.5 | Close-app sequence terminates Flask + PyWebView cleanly | both processes exit |
+| 11.6 | Restart app → previous settings load; offers state is respected (resumes without duplicate-creating) | Session Recovery modal offers "Load Previous Session" |
+| 11.7 | On next restart, Liquidity Mode loads from env correctly | (shipped 2026-04-19 in `0826ba2`) |
+| 11.8 | **External Sage fingerprint switch** (user changes wallet inside Sage while CATalyst is running) → bot's health monitor fires `sage_fingerprint_changed_externally` warning + persistent banner within 15 s | (shipped 2026-04-25); banner clears when user switches back |
 
 <a id="api-smoke"></a>
 ## 12. API smoke tests (curl / devtools console)
@@ -213,10 +321,129 @@ curl -s http://127.0.0.1:5000/api/pnl/reset-preview | jq .
 
 # PnL — live stats
 curl -s http://127.0.0.1:5000/api/pnl | jq '{realised_pnl_xch, total_fills, round_trips, net_position_cat}'
+
+# Spacescan tier — verify "free" vs "pro" surfaces correctly
+curl -s http://127.0.0.1:5000/api/dashboard | jq '.market_health.metrics | {spacescan_tier, spacescan_enabled, spacescan_has_data}'
+
+# Cancel-all background-job state
+curl -s http://127.0.0.1:5000/api/offers/cancel_all/status | jq .
 ```
 
+<a id="reconcile"></a>
+## 13. Reconciliation snippets — DB ↔ Sage ↔ chain
+
+When you're chasing a phantom mismatch ("the GUI says X but I think it's
+actually Y"), these scripts are the source of truth comparison.
+
+### 13.1 Coin reconciliation — DB vs Sage
+
+```bash
+cd C:/catalyst/src/catalyst && python -c "
+import sys, os, sqlite3
+sys.path.insert(0, '.')
+import wallet_sage as ws
+
+def pull(asset_id):
+    out=[]; offset=0
+    while True:
+        r = ws.rpc('get_coins', {'asset_id': asset_id, 'offset': offset, 'limit': 200,
+                                  'sort_mode': 'amount', 'filter_mode': 'all', 'ascending': False}, timeout=15)
+        c = (r or {}).get('coins', [])
+        if not c: break
+        out.extend(c)
+        if len(c) < 200: break
+        offset += 200
+    return out
+
+xch = [c for c in pull(None) if not c.get('spent_height')]
+cat = [c for c in pull('b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105') if not c.get('spent_height')]
+print(f'Sage XCH unspent: {len(xch)} / {sum(int(c[\"amount\"]) for c in xch)} mojos')
+print(f'Sage CAT unspent: {len(cat)} / {sum(int(c[\"amount\"]) for c in cat)} mojos')
+
+db = os.path.expandvars(r'%APPDATA%\Catalyst\bot.db')
+con = sqlite3.connect(db)
+def db_coins(wt):
+    return {r[0].lower().replace('0x',''): r[1] for r in
+            con.execute(\"SELECT coin_id, amount_mojos FROM coins WHERE wallet_type=? AND status!='gone'\", (wt,)).fetchall()}
+db_xch = db_coins('xch'); db_cat = db_coins('cat')
+sage_xch = {c['coin_id'].lower().replace('0x',''): int(c['amount']) for c in xch}
+sage_cat = {c['coin_id'].lower().replace('0x',''): int(c['amount']) for c in cat}
+print(f'XCH | DB has, Sage missing: {len(set(db_xch)-set(sage_xch))} | Sage has, DB missing: {len(set(sage_xch)-set(db_xch))}')
+print(f'CAT | DB has, Sage missing: {len(set(db_cat)-set(sage_cat))} | Sage has, DB missing: {len(set(sage_cat)-set(db_cat))}')"
+```
+
+A healthy bot returns `0 / 0` on both wallet types.
+
+### 13.2 Splash daemon vs bot view
+
+The bot's panel shows "Broadcast N" (POSTs the bot made). Splash's own
+counter shows what was actually relayed to peers. They normally diverge
+because Splash deduplicates against offers it already knows from other channels.
+
+```bash
+# Splash internal counter (source of truth for the wire)
+curl -s --max-time 3 http://127.0.0.1:4001/metrics
+
+# Bot's count (source of truth for what we attempted)
+curl -s http://127.0.0.1:5000/api/dashboard | jq '.splash // {}'
+```
+
+### 13.3 Reserve cascade reproduction (regression check)
+
+If you suspect the reserve-floor guard is triggering on RPC failure:
+
+```bash
+# Watch for the new debug-level "skipped" event vs the legacy error
+tail -f %APPDATA%\Catalyst\bot_superlog_*.log | grep -E "reserve_floor_breached|reserve_check_skipped"
+```
+
+**Healthy:** `reserve_check_skipped` warnings during Sage outages.
+**Regression:** any `reserve_floor_breached` error fires while wallet RPC was unhealthy.
+
+<a id="auto-tests"></a>
+## 14. Automated test suites
+
+### 14.1 pytest unit suite
+
+```bash
+cd C:/catalyst/tests
+python -m pytest -q --tb=line
+```
+
+Expected: ~1650 passed in ~80 s. The known-good baseline is 0 failures
+after the test-pollution fix shipped 2026-04-25.
+
+### 14.2 Playwright e2e suite (opt-in)
+
+```bash
+# One-time setup
+pip install -r requirements-dev.txt
+python -m playwright install chromium
+
+# Run (against a temporary Flask server on its own data dir)
+cd C:/catalyst/tests
+python -m pytest e2e/ --e2e -v
+# Add --headed to watch the browser drive
+```
+
+Currently covers: app boot, disclaimer dismiss, wallet-connect screen, all 7 nav
+tabs present, no spurious console errors. Auto-skipped without `--e2e` so it
+doesn't slow normal test runs.
+
+Stable-selector convention (in `tests/e2e/conftest.py` docstring):
+1. element ID, 2. ARIA role + name, 3. `data-view` / `data-action`, 4. `data-testid` (only when needed).
+
+### 14.3 What to run after each commit
+
+| Change scope | Run |
+|---|---|
+| Pure Python (bot_loop, offer_manager, etc.) | `pytest -q` |
+| HTML / JS / CSS | `pytest e2e/ --e2e` |
+| Schema migrations | `pytest test_plan_02_30_database_unit.py test_coin_manager_ssot_fallback.py` |
+| Anything affecting Sage interactions | `pytest test_bot_loop_*` + manual coin reconciliation (§13.1) |
+
 <a id="feature-smokes"></a>
-## 13. Feature-specific smoke tests
+## 15. Feature-specific smoke tests
 
 Use when verifying a specific recent commit:
 
@@ -234,16 +461,113 @@ Use when verifying a specific recent commit:
 ### Reverse-buy storage revert (`ea0d1b5` + `0826ba2`)
 - 2.7 (toggle swap)
 - 4.7 (Smart Settings reverse-buy math)
-- 11.5 (env round-trip)
+- 11.7 (env round-trip)
 
 ### Coin prep failure surfacing (`46f7844`)
 - 5.10 (specific reason in failed modal)
 
 ### Position-hard-guard rate limit (`f083abe`)
-- 11.2 (once-per-60s log rate)
+- 11.4 (once-per-60s log rate)
 
 ### Sage RPC startup hint (`5206ef6`)
 - Startup flow step 4 (on wallet-not-detected path)
+
+### Reserve-floor RPC-failure guard (2026-04-25)
+- 10.5 (reserve check defers on bad balance read)
+- Run `pytest test_bot_loop_reserve_floor_guard.py` (14 cases)
+
+### Sage fingerprint drift detection (2026-04-25)
+- 11.8 (external switch fires warning + banner within 15 s)
+- Manually: change Sage's active key while bot is running → watch log for `sage_fingerprint_changed_externally`
+
+### Spacescan tier display (2026-04-25)
+- 1.7, 1.8 (Free tier label vs Disabled vs actual data)
+
+### Stale CAT_WALLET_ID block (2026-04-25)
+- 2.12 (bulk-config-update can no longer persist `CAT_WALLET_ID`)
+- Verify `_active_cat initialized from .env` log shows resolved wallet_id, not stale value
+
+---
+
+<a id="gotchas"></a>
+## 16. Setup gotchas — read before every session
+
+These will silently waste 30 minutes if you don't know about them.
+
+### G1. Two TEST-named wallets — pick by fingerprint
+
+The wallet selection list contains both `"6"` (fingerprint 418341895) and
+`"TEST 6"` (fingerprint 2981073251). Selecting by visible text is ambiguous.
+**Always select by fingerprint** in the wallet card click.
+
+```js
+// Correct selector pattern
+Array.from(document.querySelectorAll('.fp-card'))
+     .filter(el => el.offsetParent && el.innerText.includes('2981073251'))[0]
+     ?.click();
+```
+
+### G2. Sage's offer DB persists across fingerprint switches
+
+If you switch from wallet A → wallet B inside Sage, Sage's `get_offers` call
+will still return wallet A's offers (now uncancellable from B because the
+signature is invalid). The bot will report `bulk cancel: 7 succeeded, 0 failed`
+but the offers won't actually go away. Verify via:
+
+```bash
+cd C:/catalyst/src/catalyst && python -c "
+import wallet_sage as ws
+r = ws.rpc('get_offers', {'offset':0,'limit':100,'include_completed':False}, timeout=10)
+print(len([o for o in (r or {}).get('offers', []) if o.get('status')=='active']), 'active')"
+```
+
+### G3. The active `.env` is in `%APPDATA%`, NOT the repo
+
+`C:\catalyst\.env` is read for `dotenv` defaults during local dev runs but
+gets **overridden** by `%APPDATA%\Catalyst\.env` (loaded by `user_paths.env_file()`
+in `config.py:36`). When something looks misconfigured, check the user-data
+copy first.
+
+### G4. `Use Free Tier` does not clear an existing API key
+
+Clicking "Use Free Tier" on the Spacescan gate only sets `SPACESCAN_ENABLED=true`;
+it does NOT clear `SPACESCAN_API_KEY`. So if Pro fields show "Unknown" it's
+because no key was ever stored, not because Free Tier nuked it. To verify:
+
+```bash
+cd C:/catalyst/src/catalyst && python -c "
+from config import cfg
+print('API key set?', bool((cfg.SPACESCAN_API_KEY or '').strip()))"
+```
+
+### G5. Modals can stack and absorb your clicks
+
+Common stacking on first run: Disclaimer → Wallet pick → Change Address gate →
+Splash gate → Spacescan gate → Session Recovery → Settings/Coin Prep.
+A `preview_click` against a button **underneath** a stacked modal silently
+no-ops. Always check `getCommandCentreDashboardState()` or count visible
+modals before asserting a click landed:
+
+```js
+Array.from(document.querySelectorAll('[class*="modal"]'))
+     .filter(el => el.offsetParent && el.getBoundingClientRect().width > 200)
+     .length
+```
+
+If > 0, dismiss via the modal's own button OR `dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape'}))`.
+
+### G6. Coin prep takes 5–10 minutes even on a tiny wallet
+
+Each split is one on-chain transaction with confirmation. `Step 4/4: Waiting
+for confirmations` typically sits at 72% for 1–2 minutes — don't assume it's
+hung. Check `coin_prep_ungate` event for true completion.
+
+### G7. Long-running Sage sessions can 401
+
+Sage's session token expires after some idle period. The bot's reserve-floor
+guard now defers on this (see 10.5), but you may still see `cancel_failed`
+warnings on stale offers. Restarting the wallet selection (preview MCP:
+`POST /api/sage/start-with-fingerprint`) re-issues the session.
 
 ---
 
@@ -251,11 +575,11 @@ Use when verifying a specific recent commit:
 
 If you only have 5 minutes, run this minimum viable set:
 
-1. Startup flow → Dashboard renders
-2. Settings → Liquidity Mode cards render, switching updates body class
-3. Settings → Smart Settings → form populates
-4. Click "Prepare Coins" → confirm modal shows coin plan
-5. `/api/status` returns a `liquidity` block
-6. `/api/smart-defaults?liquidity_mode=buy_only` zeroes sell fields
+1. `pytest -q` → 0 failures
+2. `pytest e2e/ --e2e -q` → 4/4 passed (or current count)
+3. Startup flow → Dashboard renders
+4. `/api/status` returns a `liquidity` block + `running` field
+5. Coin reconciliation script (§13.1) returns `0 / 0` mismatches
+6. `curl -s /api/dashboard | jq '.market_health.metrics | {spacescan_tier, spacescan_enabled}'` returns the new tier field
 
 If any of those six fail, dig into the corresponding section above.

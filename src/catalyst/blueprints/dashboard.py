@@ -171,6 +171,7 @@ def api_dashboard():
         try:
             metrics = market_health.setdefault("metrics", {})
             metrics["spacescan_enabled"] = spacescan_context.get("enabled", False)
+            metrics["spacescan_tier"] = spacescan_context.get("tier", "free")
             metrics["spacescan_has_data"] = spacescan_context.get("has_data", False)
             metrics["spacescan_holder_count"] = spacescan_context.get("holder_count", 0)
             metrics["spacescan_activity_level"] = spacescan_context.get("activity_level", "unknown")

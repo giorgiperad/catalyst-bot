@@ -147,6 +147,38 @@ def map_sage_terminal_offer_status(status_val, sage_offer=None, local_offer=None
     return None
 
 
+class _ReserveCheckDeferred(Exception):
+    """Raised inside the reserve-floor block when a balance read failed.
+
+    Caught by the surrounding handler so the cycle continues normally. The
+    reserve check will be retried on the next cycle once Sage recovers — we
+    must never coerce a failed RPC into 'balance = 0' because that path
+    triggers a mass cancel of every open offer.
+    """
+
+
+def _extract_wallet_balance_or_defer(raw):
+    """Return the wallet_balance payload from a get_wallet_balance() result,
+    or raise _ReserveCheckDeferred if the read failed.
+
+    Treats any of these as failure (DEFER, do not coerce to zero):
+      - None
+      - non-dict result
+      - dict with success == False
+      - dict missing or with empty 'wallet_balance' key
+
+    Returns the inner wallet_balance dict on success.
+    """
+    if not isinstance(raw, dict):
+        raise _ReserveCheckDeferred("balance result was not a dict")
+    if raw.get("success") is False:
+        raise _ReserveCheckDeferred(f"balance RPC reported success=False: {raw.get('error')}")
+    bal = raw.get("wallet_balance")
+    if not bal:
+        raise _ReserveCheckDeferred("balance result missing wallet_balance payload")
+    return bal
+
+
 class BotLoop:
     """Main bot orchestrator — runs one trading cycle per LOOP_SECONDS.
 
@@ -5537,12 +5569,15 @@ class BotLoop:
 
             if _xch_reserve > Decimal("0"):
                 _xch_bal_raw = _get_wallet_balance(cfg.WALLET_ID_XCH)
-                _xch_bal = (_xch_bal_raw.get("wallet_balance") or _xch_bal_raw) if _xch_bal_raw else None
-                _xch_total = (
-                    Decimal(str(_xch_bal.get("confirmed_wallet_balance", 0)))
-                    / Decimal("1000000000000")
-                    if _xch_bal else Decimal("0")
-                )
+                # Guard: a failed balance read must NOT be coerced to 0 — that
+                # path used to mass-cancel every offer when Sage briefly 401'd.
+                try:
+                    _xch_bal = _extract_wallet_balance_or_defer(_xch_bal_raw)
+                except _ReserveCheckDeferred as _defer:
+                    log_event("warning", "reserve_check_skipped",
+                              f"XCH reserve check skipped: {_defer} (will retry next cycle)")
+                    raise
+                _xch_total = Decimal(str(_xch_bal.get("confirmed_wallet_balance", 0))) / Decimal("1000000000000")
                 _xch_near_floor = _xch_reserve * Decimal("1.05")
 
                 if _xch_total <= _xch_reserve:
@@ -5588,12 +5623,15 @@ class BotLoop:
 
             if not _reserve_skip_create and _cat_reserve > Decimal("0"):
                 _cat_bal_raw = _get_wallet_balance(cfg.CAT_WALLET_ID)
-                _cat_bal = (_cat_bal_raw.get("wallet_balance") or _cat_bal_raw) if _cat_bal_raw else None
+                # Same guard as XCH: failed reads must not coerce to 0.
+                try:
+                    _cat_bal = _extract_wallet_balance_or_defer(_cat_bal_raw)
+                except _ReserveCheckDeferred as _defer:
+                    log_event("warning", "reserve_check_skipped",
+                              f"CAT reserve check skipped: {_defer} (will retry next cycle)")
+                    raise
                 _cat_scale = Decimal(10) ** Decimal(str(cfg.CAT_DECIMALS))
-                _cat_total = (
-                    Decimal(str(_cat_bal.get("confirmed_wallet_balance", 0))) / _cat_scale
-                    if _cat_bal else Decimal("0")
-                )
+                _cat_total = Decimal(str(_cat_bal.get("confirmed_wallet_balance", 0))) / _cat_scale
                 _cat_near_floor = _cat_reserve * Decimal("1.05")
 
                 if _cat_total <= _cat_reserve:
@@ -5629,6 +5667,12 @@ class BotLoop:
                     _reserve_skip_create = True
                 else:
                     self._clear_alert("reserve_floor_cat")
+        except _ReserveCheckDeferred:
+            # Balance read failed — already logged. Skip the rest of the
+            # reserve guard for this cycle and retry next tick. Do NOT
+            # set _reserve_skip_create; offer creation can still proceed
+            # since the breach is unverified.
+            pass
         except Exception as _rf_err:
             log_event("debug", "reserve_floor_check_error",
                       f"Reserve floor check failed (non-fatal): {_rf_err}")
@@ -8780,6 +8824,61 @@ class BotLoop:
     # Health Monitor Thread (V1 parity)
     # -------------------------------------------------------------------
 
+    def _check_sage_fingerprint_drift(self):
+        """Detect when Sage's active fingerprint has drifted from the one
+        CATalyst logged in with. This catches the case where the operator
+        switches wallets inside Sage without stopping the bot.
+        """
+        try:
+            import sage_node
+            from wallet_sage import get_current_key
+        except Exception:
+            return
+
+        expected_fp = getattr(sage_node, "_selected_fingerprint", None)
+        if not expected_fp:
+            return
+
+        key = get_current_key()
+        live_fp = str(key.get("fingerprint")) if key and key.get("fingerprint") is not None else None
+        if not live_fp:
+            # Can't tell — Sage might be restarting. Leave the alert state
+            # alone; downstream health checks will surface the outage.
+            return
+
+        if live_fp == expected_fp:
+            if getattr(self, "_sage_fp_mismatch_active", False):
+                log_event(
+                    "success",
+                    "sage_fingerprint_restored",
+                    f"Sage active fingerprint back to {expected_fp}.",
+                )
+                self._clear_alert("sage_fingerprint_mismatch")
+                self._sage_fp_mismatch_active = False
+            return
+
+        # Mismatch — emit once per entry into the mismatched state so the
+        # log doesn't fill up every 15s.
+        if not getattr(self, "_sage_fp_mismatch_active", False):
+            log_event(
+                "warning",
+                "sage_fingerprint_changed_externally",
+                f"Sage active fingerprint changed: expected {expected_fp}, now {live_fp}. "
+                "Signing calls will fail until restored.",
+            )
+            self._sage_fp_mismatch_active = True
+
+        self._emit_alert(
+            "sage_fingerprint_mismatch",
+            "warning",
+            "Sage Wallet Switched",
+            f"Sage's active key changed from fingerprint {expected_fp} to {live_fp}. "
+            "Switch it back in Sage, or stop the bot and re-select the wallet here. "
+            "Until then, fills, cancels, and new offers will fail.",
+            action="restart_sage",
+            action_label="Open Sage",
+        )
+
     def _health_monitor_thread(self):
         """Background thread — polls Chia wallet & node sync every 15s.
 
@@ -8801,6 +8900,14 @@ class BotLoop:
 
         while self._running:
             try:
+                # Sage-only: detect if the user changed the active fingerprint
+                # in Sage outside of CATalyst. The old session keeps 401-ing
+                # for signing calls, which downstream surfaces as "balance=0
+                # → reserve_floor_breached → mass cancel." Catching the
+                # mismatch here gives the user the real cause first.
+                if startup_wallet_type == "sage":
+                    self._check_sage_fingerprint_drift()
+
                 health = get_chia_health()
 
                 wallet_info = health.get("wallet", {}) or {}

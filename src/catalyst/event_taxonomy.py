@@ -233,6 +233,8 @@ _EVENT_CATEGORY_MAP = {
     "chia_unhealthy": EventCategory.WALLET,
     "chia_still_unhealthy": EventCategory.WALLET,
     "chia_recovered": EventCategory.WALLET,
+    "sage_fingerprint_changed_externally": EventCategory.WALLET,
+    "sage_fingerprint_restored": EventCategory.WALLET,
     "chia_restart": EventCategory.WALLET,
     "chia_restart_needed": EventCategory.WALLET,
     "chia_startup": EventCategory.WALLET,
