@@ -626,12 +626,6 @@ class Config:
         self.GAP_CLOSE_START_PCT = _int("GAP_CLOSE_START_PCT", 75)  # Start at 75% of main spread
         self.GAP_CLOSE_STEP_PCT = _int("GAP_CLOSE_STEP_PCT", 30)  # Tighten 30% per stable period (bigger jumps = faster floor discovery)
         self.GAP_CLOSE_SAFETY_BUFFER_BPS = _int("GAP_CLOSE_SAFETY_BUFFER_BPS", 20)  # Buffer above arb gap
-        # TibetSwap charges a fixed swap fee per trade. Any arb routed via
-        # TibetSwap needs at least 2×this margin to cover both the buy and
-        # sell legs. The arb floor must include this so the bot doesn't
-        # waste rotations probing impossibly-tight spreads that no arber
-        # could profitably take. Default 70 bps = TibetSwap's 0.7% fee.
-        self.TIBETSWAP_FEE_BPS = _int("TIBETSWAP_FEE_BPS", 70)
         self.GAP_CLOSE_STEP_COOLDOWN_SECS = _int("GAP_CLOSE_STEP_COOLDOWN_SECS", 60)  # 1 min between steps
         self.GAP_CLOSE_CONVERGENCE_SECS = _int("GAP_CLOSE_CONVERGENCE_SECS", 120)  # 2 min between main book convergence steps
         self.GAP_CLOSE_CONVERGENCE_STEP_PCT = _int("GAP_CLOSE_CONVERGENCE_STEP_PCT", 20)  # Main book tightens 20% per step

@@ -161,15 +161,9 @@ class BoostManager:
         # initial value because each arb-widen is clamped back down to 30bps.
         self._widen_ceiling_bps = max(self._start_spread_bps, max(1, int(main_spread_bps)))
 
-        # Calculate arb floor (never go tighter than this).
-        # Real floor = arb_gap + round-trip TibetSwap fee + buffer. The
-        # 2×fee is critical: an arber routing through TibetSwap pays the
-        # fee on the buy AND the sell leg, so they need at least 2×fee of
-        # spread to break even. Without this, the bot wasted rotations
-        # probing tighter than any arb could profitably take.
+        # Calculate arb floor (never go tighter than this)
         buffer = getattr(cfg, "GAP_CLOSE_SAFETY_BUFFER_BPS", 20)
-        tibet_fee = int(getattr(cfg, "TIBETSWAP_FEE_BPS", 70))
-        self._arb_floor_bps = max(1, int(arb_gap_bps) + (2 * tibet_fee) + buffer)
+        self._arb_floor_bps = max(1, int(arb_gap_bps) + buffer)
 
         # Clamp starting spread: can't start below the arb floor
         if self._gap_spread_bps < self._arb_floor_bps:
@@ -522,17 +516,7 @@ class BoostManager:
             below_spread = max(1, int(self._arb_floor_bps * below_mult))
             already_subprobed = getattr(self, "_subprobe_attempted", False)
 
-            # Only fire the sub-probe if it could realistically be arbed.
-            # An arb routed through TibetSwap is only profitable when our
-            # full spread > 2×tibet_fee. Sub-probing below that threshold
-            # is meaningless data — no arber would take it at any size, so
-            # surviving it tells us nothing about the real floor. Skip
-            # straight to handoff in those cases.
-            tibet_fee = int(getattr(cfg, "TIBETSWAP_FEE_BPS", 70))
-            min_arbable_spread = 2 * tibet_fee
-            sub_probe_meaningful = below_spread > min_arbable_spread
-
-            if not already_subprobed and below_spread < self._gap_spread_bps and sub_probe_meaningful:
+            if not already_subprobed and below_spread < self._gap_spread_bps:
                 # Fire one sub-probe below the calculated floor
                 self._subprobe_attempted = True
                 old_spread = self._gap_spread_bps
