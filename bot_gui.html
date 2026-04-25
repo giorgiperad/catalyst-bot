@@ -28008,7 +28008,9 @@
             if (previewEl) {
                 const startPct = 75;
                 const startBps = Math.round(mainSpreadNum * startPct / 100);
-                const floorBps = Math.max(1, Math.ceil(arbNum) + 20);
+                // Floor includes 2x TibetSwap fee (default 70bps each leg, so 140bps round trip).
+                const TIBET_FEE_BPS = 70;
+                const floorBps = Math.max(1, Math.ceil(arbNum) + (2 * TIBET_FEE_BPS) + 20);
                 const effectiveStart = Math.max(startBps, floorBps);  // Can't start below floor
                 const stepsNeeded = effectiveStart > floorBps ? Math.ceil(Math.log(floorBps / effectiveStart) / Math.log(0.9)) : 0;
                 const estTime = stepsNeeded * 1;  // 1 min per step (60s cooldown)
@@ -28017,7 +28019,7 @@
                     `<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px 15px;">` +
                     `<span style="color: var(--slate-400);">Main book spread:</span><strong>${bps2pct(mainSpreadNum)}</strong>` +
                     `<span style="color: var(--slate-400);">Starting at:</span><strong>${bps2pct(effectiveStart)}</strong>` +
-                    `<span style="color: var(--slate-400);">Arb floor:</span><strong>${bps2pct(floorBps)} (gap ${bps2pct(arbNum)} + buffer)</strong>` +
+                    `<span style="color: var(--slate-400);">Arb floor:</span><strong>${bps2pct(floorBps)} (gap ${bps2pct(arbNum)} + 2×TibetSwap fee + buffer)</strong>` +
                     `<span style="color: var(--slate-400);">Est. steps to floor:</span><strong>~${stepsNeeded} steps (~${estTime} min)</strong>` +
                     `</div>`;
             }
@@ -28027,12 +28029,13 @@
             const infoEl = document.getElementById('gapSettingsInfo');
             const updateInfo = () => {
                 const raw = selectEl ? selectEl.value : '';
-                const floorBps = Math.max(1, Math.ceil(arbNum) + 20);
+                const TIBET_FEE_BPS = 70;
+                const floorBps = Math.max(1, Math.ceil(arbNum) + (2 * TIBET_FEE_BPS) + 20);
                 let effectiveStart;
                 let modeNote;
                 if (raw === '') {
-                    // Find-floor default — start at 1.5x arb floor (clamped to 30bps min)
-                    effectiveStart = Math.max(Math.round(floorBps * 1.5), 30);
+                    // Find-floor default — start AT the calculated arb floor (1.0x).
+                    effectiveStart = Math.max(floorBps, 30);
                     modeNote = ' (anchored to arb floor — most aggressive)';
                 } else {
                     const pct = parseInt(raw);
@@ -28051,15 +28054,47 @@
             // Risk info
             const riskEl = document.getElementById('boostRiskInfo');
             if (riskEl) {
+                // Arb-economics check: at floor + 50bps slack, an arber via
+                // TibetSwap profits (slack - 70bps_fee) per XCH. If our probe
+                // size makes the absolute profit trivial (~<$0.10), no bot
+                // will take it — meaning probes can't actually verify the
+                // floor by getting arbed. Be honest about this.
+                const TIBET_FEE_BPS = 70;
+                const probeSize = parseFloat(document.getElementById('gapSizeInput')?.value) || 0.001;
+                const floorBpsLocal = Math.max(1, Math.ceil(arbNum) + (2 * TIBET_FEE_BPS) + 20);
+                const operatingSpread = floorBpsLocal + 50;
+                const arbProfitBps = operatingSpread - (2 * TIBET_FEE_BPS);
+                const profitXch = probeSize * arbProfitBps / 10000;
+                const profitUsdApprox = profitXch * 2;  // rough $2/XCH for context
+                const minMeaningfulProbeXch = 0.10 / Math.max(arbProfitBps / 10000 * 2, 0.0001);
+
+                let riskParts = [];
                 if (arbNum > 100) {
-                    riskEl.innerHTML = `<span style="color: var(--status-warning);">⚠️ <strong>Arb gap is ${bps2pct(arbNum)}</strong> — ` +
-                        `gap-closer will never tighten below ${bps2pct(Math.ceil(arbNum) + 20)} to stay safe.</span>`;
+                    riskParts.push(`⚠️ <strong>Arb gap is ${bps2pct(arbNum)}</strong> — ` +
+                        `gap-closer will never tighten below ${bps2pct(floorBpsLocal)} to stay safe.`);
                 } else if (arbNum > 0) {
-                    riskEl.innerHTML = `<span style="color: var(--status-success);">✅ Low arb gap (${bps2pct(arbNum)}) — ` +
-                        `good conditions for gap closing.</span>`;
+                    riskParts.push(`Low arb gap (${bps2pct(arbNum)}). Floor is ${bps2pct(floorBpsLocal)} ` +
+                        `(includes ${bps2pct(2 * TIBET_FEE_BPS)} TibetSwap round-trip fee).`);
                 } else {
-                    riskEl.innerHTML = `<span style="color: var(--info-300);">Mid price: ${midNum.toFixed(8)} XCH — arb gap not yet calculated.</span>`;
+                    riskParts.push(`Mid price: ${midNum.toFixed(8)} XCH. Floor is ${bps2pct(floorBpsLocal)} ` +
+                        `(includes ${bps2pct(2 * TIBET_FEE_BPS)} TibetSwap round-trip fee).`);
                 }
+
+                if (arbProfitBps <= 0) {
+                    riskParts.push(`<br><br>⚠️ <strong>Probes can't verify the floor by getting arbed.</strong> ` +
+                        `The calculated floor is at the TibetSwap fee threshold — no arber can profit from taking probes ` +
+                        `at any size. The cascade still plants tight inner offers, but arb-detection happens via ` +
+                        `the inner ladder, not the probes.`);
+                } else if (profitUsdApprox < 0.10) {
+                    riskParts.push(`<br><br>⚠️ <strong>Probe size is too small to attract arbs.</strong> ` +
+                        `At ${probeSize.toFixed(4)} XCH per probe, an arber would only make ~$${profitUsdApprox.toFixed(4)} ` +
+                        `(less than network fees). For meaningful floor verification, probes would need to be ` +
+                        `≥ <strong>${minMeaningfulProbeXch.toFixed(2)} XCH</strong> each — but that's risky for "expendable" probes. ` +
+                        `Proceeding anyway will work as a price-discovery cascade, but probes won't get arbed regardless of spread.`);
+                }
+
+                const color = arbProfitBps <= 0 || profitUsdApprox < 0.10 ? 'var(--status-warning)' : 'var(--status-success)';
+                riskEl.innerHTML = `<span style="color: ${color};">${riskParts.join('')}</span>`;
             }
 
             document.getElementById('boostConfirmModal').classList.add('active');

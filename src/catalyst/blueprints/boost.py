@@ -116,7 +116,12 @@ def api_boost_activate():
         pass
 
     buffer = getattr(cfg, "GAP_CLOSE_SAFETY_BUFFER_BPS", 20)
-    expected_floor = max(1, int(arb_gap) + buffer)
+    # Real arb floor includes the round-trip TibetSwap fee. Without this,
+    # the calculated floor was just (arb_gap + buffer) which underestimated
+    # the actual spread at which TibetSwap-routed arbs become profitable.
+    # In a quiet market with arb_gap≈0, real_floor ≈ 2×fee + buffer ≈ 160bps.
+    tibet_fee = int(getattr(cfg, "TIBETSWAP_FEE_BPS", 70))
+    expected_floor = max(1, int(arb_gap) + (2 * tibet_fee) + buffer)
 
     # New default behavior (2026-04-25): start the first probe NEAR THE FLOOR,
     # not just inside the tightest competitor on Dexie. The probes are sniper-
@@ -163,14 +168,63 @@ def api_boost_activate():
     t = threading.Thread(target=_activate_bg, daemon=True)
     t.start()
 
+    # Effectiveness assessment — be honest about whether the probes can
+    # actually validate the floor at this user's balance + market state.
+    #
+    # The math: an arber routed via TibetSwap profits roughly
+    #   profit_per_xch ≈ (full_spread_bps - 2 × tibet_fee_bps) / 10000
+    # If our probe is tiny enough that profit < ~$0.10 even at floor + slack,
+    # no arber will take it — meaning probes will always survive regardless
+    # of whether the calculated floor is correct. In that case, Close the
+    # Gap can still place tight inner offers via the cascade, but it can
+    # NOT actually verify the floor against arbs. The user should know.
+    warnings: list[str] = []
+    try:
+        probe_size = float(size_xch_override) if size_xch_override is not None else float(getattr(cfg, "SNIPER_SIZE_XCH", 0.001))
+        # Profit available to an arber at floor + 50bps slack (typical
+        # operating zone after a step or two of tightening).
+        operating_spread = expected_floor + 50
+        profit_bps = operating_spread - (2 * tibet_fee)
+        if profit_bps <= 0:
+            warnings.append(
+                "Probes won't trigger arbs at this size — calculated floor "
+                f"({_bps_pct(expected_floor)}) is at or below the TibetSwap "
+                f"fee threshold ({_bps_pct(2 * tibet_fee)}). The cascade "
+                "will still plant inner offers at the calculated floor, but "
+                "the probes themselves can't verify it via arb behavior."
+            )
+        else:
+            # Estimated profit per probe at operating spread, in XCH terms
+            profit_xch = probe_size * profit_bps / 10000
+            # Rough USD assuming $2/XCH for context — order of magnitude
+            profit_usd_approx = profit_xch * 2
+            if profit_usd_approx < 0.10:
+                warnings.append(
+                    f"Probe size {probe_size:.4f} XCH is too small to "
+                    f"trigger TibetSwap arbs at this floor ({_bps_pct(expected_floor)}). "
+                    f"Estimated arb profit per probe ≈ ${profit_usd_approx:.4f} "
+                    "— no bot will take it. The cascade still plants tight "
+                    "inner offers, but probes won't validate the floor by "
+                    f"getting arbed. For meaningful floor verification, "
+                    f"probes would need to be ≥ {0.10 / max(profit_bps / 10000 * 2, 0.0001):.2f} XCH each."
+                )
+    except Exception:
+        pass
+
     return jsonify({
         "success": True,
         "spread_bps": expected_spread,
         "arb_floor_bps": expected_floor,
+        "tibet_fee_bps": tibet_fee,
         "created": 0,
         "async": True,
-        "warnings": [],
+        "warnings": warnings,
     })
+
+
+def _bps_pct(bps: int) -> str:
+    """Format a bps value as a percentage string for warnings."""
+    return f"{bps / 100:.2f}%"
 
 
 @bp.route("/api/boost/deactivate", methods=["POST"])
