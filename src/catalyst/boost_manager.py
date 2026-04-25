@@ -752,12 +752,16 @@ class BoostManager:
                     print(f"📈 SELL arbed at -{_bps_to_pct(self._sell_offset_bps)} → floor settled", flush=True)
 
     def _inverted_complete_handoff(self) -> bool:
-        """Both sides settled — log the discovered floors and deactivate.
+        """Both sides settled — log floors, plant a tighter inner-tier
+        cascade on the SAFE side (positive half-spread), then deactivate.
 
-        We do NOT plant inner-tier offers at the proven floor (which is in
-        INVERTED territory — that would be a continuous giveaway). Instead
-        we just report the floor as informational. The bot's normal ladder
-        operates at safe positive half-spread regardless.
+        Cascade rationale: the inverted floor proves watchers exist on
+        this pair. Symmetric tight quotes (BUY < mid, SELL > mid) are
+        immune to TibetSwap arb regardless of how tight, so we can
+        place a few new inner-tier offers at a much tighter spread than
+        the typical ladder — this brings the inside of the book inward
+        and competes for retail. We cancel a few of the FURTHEST inner
+        offers to maintain count.
         """
         log_event("info", "gap_closer_inverted_complete",
                   f"📈 Inverted floor discovery complete. "
@@ -774,8 +778,134 @@ class BoostManager:
                         "steps_taken": self._steps_taken})
         print(f"📈 Floor discovery complete: BUY +{_bps_to_pct(self._buy_floor_bps)}, "
               f"SELL -{_bps_to_pct(self._sell_floor_bps)} (arbs: {self._arb_count})", flush=True)
+
+        # Plant the inverted-mode cascade BEFORE deactivating so the
+        # boost manager state still holds the discovered floors.
+        try:
+            self._cascade_after_inverted_floor()
+        except Exception as e:
+            log_event("warning", "gap_closer_cascade_failed",
+                      f"📈 Inverted-mode cascade failed (non-critical): {e}")
+
         self.deactivate(preserve_convergence=True)
         return False
+
+    def _cascade_after_inverted_floor(self):
+        """Option A cascade: plant a few tight inner-tier offers (positive
+        half-spread, immune to TibetSwap arb) and cancel the same number
+        of the FURTHEST inner offers per side. Brings the inside of the
+        ladder inward to capture the retail interest the floor proves
+        exists.
+        """
+        om = self._offer_manager
+        if not om or not self._risk_manager:
+            log_event("info", "gap_closer_cascade_skip",
+                      "📈 Cascade skipped — missing offer_manager or risk_manager")
+            return
+
+        mid_price = self._boost_mid_price
+        if mid_price <= 0:
+            return
+
+        # How many to swap per side, and how tight to plant the new ones.
+        num_to_swap = int(getattr(cfg, "GAP_PROBE_CASCADE_COUNT_PER_SIDE", 2))
+        # Default tight spread: 50 bps half-spread = 100 bps total. Always
+        # positive half-spread on both sides, so always immune to TibetSwap
+        # arb regardless of the discovered inverted floor depth.
+        tight_half_spread_bps = int(getattr(cfg, "GAP_PROBE_CASCADE_HALF_SPREAD_BPS", 50))
+        tight_spread_fraction = Decimal(str(tight_half_spread_bps * 2)) / Decimal("10000")
+
+        from database import get_open_offers as _get_open_offers
+        cascade_total = 0
+
+        for side in ("buy", "sell"):
+            if side == "buy" and not cfg.ENABLE_BUY:
+                continue
+            if side == "sell" and not cfg.ENABLE_SELL:
+                continue
+
+            # Find the FURTHEST inner-tier offers (most stale) to swap out.
+            try:
+                open_offers = _get_open_offers(side=side,
+                                               cat_asset_id=cfg.CAT_ASSET_ID) or []
+            except Exception as e:
+                log_event("warning", "gap_closer_cascade_query_fail",
+                          f"📈 Cascade {side}: could not query open offers: {e}")
+                continue
+
+            inner_offers = [o for o in open_offers
+                            if (o.get("tier") or "").lower() == "inner"]
+            for o in inner_offers:
+                p = o.get("price")
+                try:
+                    o["_distance"] = abs(Decimal(str(p)) - mid_price) if p else Decimal("0")
+                except Exception:
+                    o["_distance"] = Decimal("0")
+            inner_offers.sort(key=lambda o: o.get("_distance", 0), reverse=True)
+
+            # Plant new tight offers FIRST, then cancel furthest old ones.
+            new_offers = []
+            try:
+                new_offers = om.create_ladder(
+                    mid_price, side,
+                    num_offers=num_to_swap,
+                    spread_fraction=tight_spread_fraction,
+                    risk_manager=self._risk_manager,
+                    coin_ids_enabled=cfg.COIN_IDS_ENABLED,
+                ) or []
+            except Exception as e:
+                log_event("warning", "gap_closer_cascade_create_fail",
+                          f"📈 Cascade {side} create failed: {e}")
+                continue
+
+            created_n = len(new_offers)
+            if created_n == 0:
+                log_event("info", "gap_closer_cascade_no_coins",
+                          f"📈 Cascade {side}: no spare coins — skipping swap")
+                continue
+
+            # Post new offers to Dexie (queued)
+            if self._dexie_manager and cfg.DEXIE_AUTO_POST:
+                for offer in new_offers:
+                    bech32 = offer.get("offer_bech32", offer.get("offer", ""))
+                    trade_id = offer.get("trade_id", "")
+                    if bech32 and trade_id:
+                        self._dexie_manager.queue_post(bech32, trade_id)
+
+            # Cancel matching number of furthest inner offers (fire-and-forget)
+            cancel_ids = []
+            for o in inner_offers[:created_n]:
+                tid = o.get("trade_id")
+                if tid:
+                    cancel_ids.append(tid)
+            if cancel_ids:
+                for tid in cancel_ids:
+                    om._bot_cancelled_ids.add(tid)
+                try:
+                    om.cancel_offers(cancel_ids,
+                                     reason="gap_closer_cascade_swap",
+                                     skip_confirmation=True)
+                except Exception as e:
+                    log_event("warning", "gap_closer_cascade_cancel_fail",
+                              f"📈 Cascade {side} cancel failed: {e}")
+
+            cascade_total += created_n
+            log_event("info", "gap_closer_cascade_swap",
+                      f"📈 Cascade {side}: planted {created_n} tight inner "
+                      f"offers at half-spread ±{_bps_to_pct(tight_half_spread_bps)}, "
+                      f"cancelled {len(cancel_ids)} furthest",
+                      data={"side": side, "planted": created_n,
+                            "cancelled": len(cancel_ids),
+                            "half_spread_bps": tight_half_spread_bps})
+            print(f"📈 Cascade {side}: planted {created_n} new inner offers at "
+                  f"±{_bps_to_pct(tight_half_spread_bps)} half-spread, "
+                  f"cancelled {len(cancel_ids)} furthest", flush=True)
+
+        if cascade_total > 0:
+            log_event("info", "gap_closer_cascade_complete",
+                      f"📈 Inverted cascade complete: {cascade_total} new "
+                      f"tight inner offer(s) planted across both sides.",
+                      data={"total_planted": cascade_total})
 
     # ------- Legacy step path retained behind a flag (unreachable in inverted mode) -------
     def _legacy_step_tighter(self, current_arb_gap_bps: Decimal) -> bool:
@@ -945,16 +1075,29 @@ class BoostManager:
             return False
 
         # ---- Check 1: Are offers still alive? ----
+        # Inverted-mode awareness: the EXPECTED count is 2 - (settled_sides).
+        # Once a side has settled (arbed and floor proven), we should NOT
+        # try to recreate a probe on that side — that would just keep
+        # giving away money. Only refresh if we're missing probes that
+        # SHOULD be there.
+        expected_active = 0
+        if not self._buy_settled:
+            expected_active += 1
+        if not self._sell_settled:
+            expected_active += 1
+
         needs_refresh = False
         refresh_reason = ""
 
-        if len(self._active_boost_ids) == 0:
-            needs_refresh = True
-            refresh_reason = "all offers gone (expired/filled)"
+        if expected_active == 0:
+            # Both sides settled — nothing to refresh, handoff already pending
+            return False
 
-        elif len(self._active_boost_ids) < 2:
+        if len(self._active_boost_ids) < expected_active:
             needs_refresh = True
-            refresh_reason = f"partial loss ({len(self._active_boost_ids)}/2 remaining)"
+            refresh_reason = (f"partial loss "
+                              f"({len(self._active_boost_ids)}/{expected_active} expected — "
+                              f"buy_settled={self._buy_settled}, sell_settled={self._sell_settled})")
 
         # ---- Check 1b: REMOVED — no expiry, no pre-emptive refresh needed ----
         # Offers no longer expire, so this check is unnecessary.
@@ -986,10 +1129,13 @@ class BoostManager:
         # Step 1: Create new offers FIRST (before cancelling old ones).
         # In inverted-probe mode use the new pair builder which respects
         # the per-side offsets and tracks BUY/SELL probe TIDs separately.
+        # Only clear the side(s) that need re-creation — the OTHER side's
+        # probe TID stays valid so prune can still attribute its arb.
         self._active_boost_ids.clear()
-        # Reset probe TIDs since the old ones are about to be cancelled
-        self._buy_probe_tid = ""
-        self._sell_probe_tid = ""
+        if not self._buy_settled and (self._buy_probe_tid in old_ids or not self._buy_probe_tid):
+            self._buy_probe_tid = ""
+        if not self._sell_settled and (self._sell_probe_tid in old_ids or not self._sell_probe_tid):
+            self._sell_probe_tid = ""
         created = self._create_inverted_probe_pair(current_mid_price)
 
         # Step 2: Cancel old offers AFTER new ones exist
@@ -1044,18 +1190,20 @@ class BoostManager:
                         log_event("debug", "gap_closer_offer_expired",
                                   f"Gap closer offer {tid[:16]}… expired naturally (not arbed)")
                     else:
-                        # Inverted-mode arb detection: identify which side
-                        # the missing trade_id belongs to so we can settle
-                        # only that side. _on_inverted_arb increments arb_count.
-                        if tid == self._buy_probe_tid:
+                        # Inverted-mode arb detection: identify which side the
+                        # missing trade_id belongs to. Check both the CURRENT
+                        # probe TID and the per-side HISTORY set (a fill can
+                        # arrive late, after the bot rotated to a new probe
+                        # whose TID we now hold as the "current" one). The
+                        # history catches that race.
+                        if tid == self._buy_probe_tid or tid in self._buy_probe_tid_history:
                             self._on_inverted_arb("buy")
-                        elif tid == self._sell_probe_tid:
+                        elif tid == self._sell_probe_tid or tid in self._sell_probe_tid_history:
                             self._on_inverted_arb("sell")
                         else:
-                            # Unknown probe — fall back to legacy widen
                             self._arb_count += 1
                             log_event("warning", "gap_closer_arb_unknown_side",
-                                      f"Probe {tid[:16]}… arbed but didn't match BUY or SELL TID")
+                                      f"Probe {tid[:16]}… arbed but didn't match any tracked probe TID")
 
             self._active_boost_ids = [
                 tid for tid in self._active_boost_ids if tid in open_trade_ids

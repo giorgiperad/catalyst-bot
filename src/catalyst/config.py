@@ -648,6 +648,10 @@ class Config:
         # (proven_floor - safety_buffer) — i.e. one step safer than where
         # we got arbed.
         self.GAP_PROBE_HANDOFF_BUFFER_BPS = _int("GAP_PROBE_HANDOFF_BUFFER_BPS", 20)
+        # Inverted-mode cascade after both sides settle: plant N new tight
+        # inner-tier offers per side at half-spread Y, cancel N furthest.
+        self.GAP_PROBE_CASCADE_COUNT_PER_SIDE = _int("GAP_PROBE_CASCADE_COUNT_PER_SIDE", 2)
+        self.GAP_PROBE_CASCADE_HALF_SPREAD_BPS = _int("GAP_PROBE_CASCADE_HALF_SPREAD_BPS", 50)
         self.GAP_CLOSE_STEP_COOLDOWN_SECS = _int("GAP_CLOSE_STEP_COOLDOWN_SECS", 60)  # 1 min between steps
         self.GAP_CLOSE_CONVERGENCE_SECS = _int("GAP_CLOSE_CONVERGENCE_SECS", 120)  # 2 min between main book convergence steps
         self.GAP_CLOSE_CONVERGENCE_STEP_PCT = _int("GAP_CLOSE_CONVERGENCE_STEP_PCT", 20)  # Main book tightens 20% per step
