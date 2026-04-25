@@ -15646,15 +15646,20 @@
 
             const idx = ((_advisorRotatorIdx % visibleSuggestions.length) + visibleSuggestions.length) % visibleSuggestions.length;
             _advisorRotatorIdx = idx;
-            const s = visibleSuggestions[idx];
-            const dismissKey = escapeHtml((s.type || '') + ':' + (s.msg || ''));
+            // NOTE: `const s` at function scope here would collide with
+            // `const s = dashboard.settings || {};` declared earlier in
+            // saUpdateAdvisor (whole function blew up with
+            // "Identifier 's' has already been declared"). Use `sg`
+            // (suggestion) for the active rotator slot item.
+            const sg = visibleSuggestions[idx];
+            const dismissKey = escapeHtml((sg.type || '') + ':' + (sg.msg || ''));
             const rotatorHint = (visibleSuggestions.length > 1)
                 ? '<span class="la-rotator-hint">' + (idx + 1) + ' / ' + visibleSuggestions.length + ' &#9656;</span>'
                 : '';
-            container.innerHTML = '<div class="sa-item ' + escapeHtml(s.type) + '" style="position: relative;">'
-                + '<span class="sa-icon">' + escapeHtml(s.icon) + '</span>'
+            container.innerHTML = '<div class="sa-item ' + escapeHtml(sg.type) + '" style="position: relative;">'
+                + '<span class="sa-icon">' + escapeHtml(sg.icon) + '</span>'
                 + '<div class="sa-content" style="flex: 1;">'
-                + '<div class="sa-msg">' + escapeHtml(s.msg) + ' ' + rotatorHint + '</div>'
+                + '<div class="sa-msg">' + escapeHtml(sg.msg) + ' ' + rotatorHint + '</div>'
                 + '</div>'
                 + '<button class="alert-dismiss" data-dismiss-key="' + dismissKey + '" '
                 +   'title="Dismiss until conditions change" '
@@ -32448,20 +32453,38 @@ document.addEventListener('DOMContentLoaded', async () => {
     // so the user never sees "Connecting to Sage" before accepting risks.
     startupShowRiskDisclosure();
 
-    // Check if bot is already running (page reload mid-session) — if so,
-    // skip the startup wizard entirely and go straight to the dashboard.
+    // Auto-skip the startup wizard when:
+    //   1. The bot is already running (page reload mid-session), OR
+    //   2. Sage already has a wallet logged in and the backend reports
+    //      phase=ready (fingerprint adopted from a prior session — see
+    //      sage_node.get_startup_status()).
+    let _skipWizard = false;
     try {
         const _statusResp = await apiFetch(`${API_URL}/status`,
             { signal: AbortSignal.timeout(2000) });
         const _statusData = await _statusResp.json();
         if ((_statusData.stats?.loop_count || 0) > 0) {
             console.log('[INIT] Bot already running — skipping startup wizard');
-            const _overlay = document.getElementById('startupOverlay');
-            if (_overlay) { _overlay.classList.add('hidden'); _overlay.style.display = 'none'; }
-            finalDismiss();
+            _skipWizard = true;
         }
     } catch(_e) {
-        console.log('[INIT] Bot status probe failed — showing startup wizard:', _e.message);
+        console.log('[INIT] Bot status probe failed (will try Sage-ready check):', _e.message);
+    }
+    if (!_skipWizard) {
+        try {
+            const _sresp = await apiFetch(`${API_URL}/sage/startup-status`,
+                { signal: AbortSignal.timeout(3000) });
+            const _sdata = await _sresp.json();
+            if (_sdata.phase === 'ready' && _sdata.fingerprint) {
+                console.log('[INIT] Sage already ready (fp adopted) — skipping startup wizard');
+                _skipWizard = true;
+            }
+        } catch(_e2) { /* fall through to wizard */ }
+    }
+    if (_skipWizard) {
+        const _overlay = document.getElementById('startupOverlay');
+        if (_overlay) { _overlay.classList.add('hidden'); _overlay.style.display = 'none'; }
+        finalDismiss();
     }
 
     // Then fetch fingerprint

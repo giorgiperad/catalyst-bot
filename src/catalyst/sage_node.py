@@ -943,14 +943,40 @@ def get_startup_status() -> Dict:
     # while the bot loop is happily running. We deliberately scope this
     # to "Sage already says someone is logged in" — never auto-pick from
     # a fresh state where no wallet is selected.
+    #
+    # Adoption ALSO kicks off the preload thread: if the GUI is polling
+    # startup-status, the user has accepted the disclaimer (the
+    # disclaimer shim runs before any startup polling), so we have
+    # implicit consent. Without this the GUI would sit on
+    # "Connecting to Sage / Checking wallet status..." forever even
+    # though Sage is healthy.
     if wallet_type == "sage" and not _selected_fingerprint:
         try:
             live_fp = _get_live_sage_fingerprint()
             if live_fp:
                 _selected_fingerprint = live_fp
+                # Signal _start_triggered so the preload thread (if
+                # already waiting on user selection) wakes up and uses
+                # the adopted fingerprint instead of sitting forever in
+                # "waiting_fingerprint". Set this BEFORE start_preload
+                # below so a freshly-spawned preload thread also sees it.
+                try:
+                    _start_triggered.set()
+                except Exception:
+                    pass
                 if _sage_startup_phase == "waiting_fingerprint":
                     with _phase_lock:
                         _sage_startup_phase = "ready"
+                # Auto-authorise + spin the preload thread so the rest
+                # of the startup pipeline (CAT discovery, sync checks,
+                # etc.) runs. Without this the GUI gets a "ready" phase
+                # but preload_running stays False and the dashboard is
+                # stuck on "Startup thread not running".
+                if not _startup_authorised or not _preload_running:
+                    try:
+                        start_preload()
+                    except Exception:
+                        pass
         except Exception:
             pass
 
