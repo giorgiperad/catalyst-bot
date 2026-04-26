@@ -9753,7 +9753,7 @@
                     <!-- Pending claimable rewards (populated from /api/dbx/pending) -->
                     <div id="intelDbxPendingPanel" style="display: none; margin-top: 12px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.08);">
                         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-                            <div style="font-size: 12px; font-weight: 600; color: rgba(255,255,255,0.85);"><span id="intelDbxPendingHeaderLabel">Pending Rewards</span> <span id="intelDbxAutoClaimBadge" style="font-size: 10px; color: var(--status-success); font-weight: 400; margin-left: 6px;">⚡ auto-claim ON</span> <span class="cc-help">?<span class="cc-tooltip">When auto-claim is on, posted offers carry the claim_rewards flag and Dexie pays DBX directly to your wallet every ~15 min. The Manual Claim button is hidden in that mode because Sage's standalone RPC can't sign the claim message anyway. Toggle DEXIE_AUTO_CLAIM_REWARDS off (env or settings) if you need the button back.</span></span></div>
+                            <div style="font-size: 12px; font-weight: 600; color: rgba(255,255,255,0.85);"><span id="intelDbxPendingHeaderLabel">Pending Rewards</span> <span id="intelDbxAutoClaimBadge" style="font-size: 10px; color: var(--status-success); font-weight: 400; margin-left: 6px;">⚡ auto-claim ON</span> <span class="cc-help">?<span class="cc-tooltip">When auto-claim is on, posted offers carry the claim_rewards flag and Dexie pays DBX directly to your wallet, batched approximately once per day to keep the wallet free of dust. The Manual Claim button is hidden in that mode because Sage's standalone RPC can't sign the claim message anyway. Toggle DEXIE_AUTO_CLAIM_REWARDS off (env or settings) if you need the button back.</span></span></div>
                             <button id="intelDbxClaimBtn" onclick="claimDbxRewards()" style="display: none; background: var(--accent-primary); color: white; border: none; border-radius: 4px; padding: 4px 10px; font-size: 11px; font-weight: 600; cursor: pointer;">Manual Claim</button>
                         </div>
                         <div id="intelDbxPendingTotal" style="font-size: 14px; color: rgba(255,255,255,0.85); margin-bottom: 4px;">—</div>
@@ -22554,15 +22554,15 @@
                 const detailEl = document.getElementById('intelDbxPendingDetail');
                 if (autoClaim) {
                     // With auto-claim ON, any pending balance is either
-                    // (a) waiting for Dexie's next ~15-min payout batch, or
+                    // (a) waiting for Dexie's next daily payout batch, or
                     // (b) leftover from offers posted before auto-claim
                     //     was enabled — those need a manual claim via the
                     //     dexie-rewards CLI since Sage RPC can't sign.
                     detailEl.innerHTML =
                         `${offers.length} offer${offers.length === 1 ? '' : 's'} with rewards · ` +
-                        `auto-paid by Dexie ~every 15 min. ` +
+                        `auto-paid by Dexie approximately once per day. ` +
                         `<span style="color: rgba(255,255,255,0.4);">` +
-                        `Anything still pending after a few payout cycles is from offers ` +
+                        `Anything still pending after a couple of payout cycles is from offers ` +
                         `posted before auto-claim was on — claim those via ` +
                         `<a href="https://github.com/dexie-space/dexie-rewards" target="_blank" ` +
                         `style="color: var(--accent-primary);">dexie-rewards</a>.</span>`;

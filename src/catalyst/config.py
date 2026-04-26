@@ -399,9 +399,11 @@ class Config:
         self.DEXIE_POST_RETRIES = _int("DEXIE_POST_RETRIES", 2)
         # Auto-claim DBX liquidity rewards: set the `claim_rewards` flag
         # when posting an offer so Dexie pays out rewards to our maker
-        # address automatically every ~15 minutes (no signed claim needed).
-        # Documented in dexie's API and AbandonedLand/dexiePowerShell. The
-        # flag is a no-op for non-incentivized pairs, so always-on is safe.
+        # address automatically — batched once daily to keep the spend
+        # bundle from spawning excessive coin dust (per dexie's API docs).
+        # The manual /v1/rewards/claim path pays every ~15 min, but the
+        # auto-claim flag is a different code path with a different cadence.
+        # Flag is a no-op for non-incentivized pairs, so always-on is safe.
         self.DEXIE_AUTO_CLAIM_REWARDS = _bool("DEXIE_AUTO_CLAIM_REWARDS", True)
         try:
             self.DEXIE_POST_RETRY_SLEEP = float(_str("DEXIE_POST_RETRY_SLEEP", "1.5"))
