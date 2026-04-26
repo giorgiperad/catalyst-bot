@@ -417,6 +417,145 @@ def _infer_designation_by_size(amt: int, tier_sizes_mojos: Dict[str, int]) -> Tu
     return _cc_infer(amt, tier_sizes_mojos)
 
 
+def check_tier_size_drift_standalone(
+    low_ratio: float = 0.95,
+    high_ratio: float = 1.20,
+    min_sample: int = 2,
+) -> List[Dict]:
+    """Module-level mirror of CoinManager.check_tier_size_drift.
+
+    Same logic, no instance required. Used by the coin-prep subprocess
+    for its end-of-prep verification (the worker doesn't have a live
+    CoinManager) and by api_server's pre-start gate. Returns the same
+    list-of-finding-dicts shape: empty when all tier coins match.
+    """
+    from database import get_coins_by_designation
+
+    findings: List[Dict] = []
+    if not cfg.TIER_ENABLED:
+        return findings
+    for wallet_type, is_cat in (("xch", False), ("cat", True)):
+        try:
+            live_sizes = get_tier_sizes_mojos_from_cfg(is_cat=is_cat)
+        except Exception:
+            continue
+        if not live_sizes:
+            continue
+        for tier_name in ("inner", "mid", "outer", "extreme"):
+            live_size = int(live_sizes.get(tier_name, 0) or 0)
+            if live_size <= 0:
+                continue
+            try:
+                coins = get_coins_by_designation(wallet_type, "tier_spare", tier_name)
+            except Exception:
+                continue
+            amounts = sorted(
+                int(c.get("amount_mojos") or 0)
+                for c in coins
+                if int(c.get("amount_mojos") or 0) > 0
+            )
+            if len(amounts) < max(1, int(min_sample)):
+                continue
+            n = len(amounts)
+            median = (
+                float(amounts[n // 2]) if n % 2 == 1
+                else (amounts[n // 2 - 1] + amounts[n // 2]) / 2.0
+            )
+            ratio = float(median) / float(live_size)
+            if ratio < low_ratio or ratio > high_ratio:
+                findings.append({
+                    "side": wallet_type,
+                    "tier": tier_name,
+                    "median_mojos": int(median),
+                    "live_size_mojos": live_size,
+                    "ratio": round(ratio, 3),
+                    "coin_count": n,
+                })
+    return findings
+
+
+def reclassify_tier_spare_coins() -> Dict[str, int]:
+    """Re-stamp every existing tier_spare coin against the CURRENT tier
+    sizes from cfg.
+
+    Coin prep's diff-based designator only labels NEW coins it creates
+    (coin_prep_worker._designate_new_tier_coins) — coins from previous
+    prep runs keep their original assigned_tier even if Smart Settings
+    has since changed the tier sizes. The drift check then sees stale
+    labels and fires `tier_size_drift` immediately on bot start.
+
+    This module-level function walks every tier_spare coin, runs
+    classify_coin against the current tier sizes, and either:
+      - re-stamps the coin to the tier its actual amount fits;
+      - moves obvious dust into the dust bucket;
+      - leaves the coin alone when the assignment is already correct.
+
+    Returns a counter dict (``reclassified``, ``to_dust``, ``unchanged``,
+    ``errors``) so callers can log churn. Module-level so the coin-prep
+    subprocess can call it directly without instantiating CoinManager.
+    """
+    from coin_classifier import classify_coin, CoinDesignation, CoinFit
+    from database import get_coins_by_designation, set_coin_designation
+
+    moved = {"reclassified": 0, "to_dust": 0, "unchanged": 0, "errors": 0}
+    if not cfg.TIER_ENABLED:
+        return moved
+
+    for wallet_type, is_cat in (("xch", False), ("cat", True)):
+        try:
+            live_sizes = get_tier_sizes_mojos_from_cfg(is_cat=is_cat)
+        except Exception:
+            continue
+        if not live_sizes:
+            continue
+        try:
+            coins = get_coins_by_designation(wallet_type, "tier_spare")
+        except Exception:
+            continue
+        for c in coins:
+            coin_id = c.get("coin_id") or c.get("id") or ""
+            amount = int(c.get("amount_mojos") or 0)
+            current_tier = (c.get("assigned_tier") or "").lower()
+            if not coin_id or amount <= 0:
+                continue
+            try:
+                cls = classify_coin(amount, live_sizes)
+            except Exception:
+                moved["errors"] += 1
+                continue
+
+            if cls.designation == CoinDesignation.DUST:
+                new_designation = "dust"
+                new_tier = None
+            elif cls.best_tier and cls.fit in (CoinFit.EXACT, CoinFit.OVERSIZE_FIT):
+                new_designation = "tier_spare"
+                new_tier = cls.best_tier
+            else:
+                # Coin doesn't fit any tier cleanly — leave the existing
+                # designation in place. The prep flow's consolidation step
+                # will pick it up as stranded and may absorb it. Promoting
+                # to dust here could orphan a coin that could still be
+                # recombined by a later prep pass.
+                moved["unchanged"] += 1
+                continue
+
+            if new_designation == "tier_spare" and new_tier == current_tier:
+                moved["unchanged"] += 1
+                continue
+
+            try:
+                set_coin_designation(coin_id, new_designation,
+                                     assigned_tier=new_tier or "none")
+                if new_designation == "dust":
+                    moved["to_dust"] += 1
+                else:
+                    moved["reclassified"] += 1
+            except Exception:
+                moved["errors"] += 1
+
+    return moved
+
+
 def get_tier_sizes_mojos_from_cfg(is_cat: bool = False) -> Dict[str, int]:
     """Module-level helper that builds the tier_sizes_mojos dict from cfg
     without requiring a CoinManager instance.

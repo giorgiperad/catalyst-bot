@@ -5138,11 +5138,35 @@ class CoinPrepWorker:
 # STEP 0: Cancel all open offers with verification
             self.update_status(PrepPhase.CONSOLIDATING, 0.05, "🗑️ Cancelling open offers...")
             cancel_success = self.cancel_all_offers()
-            
+
             if not cancel_success:
                 self.log("⚠️ Offer cancellation failed - coin prep may fail")
                 # Continue anyway - user can manually cancel
-            
+
+            # Re-classify existing tier_spare coins against the CURRENT tier
+            # sizes from cfg. Without this, coins designated by a previous
+            # prep run keep their original assigned_tier even if Smart
+            # Settings has changed the tier sizes since then — the bot
+            # then fires tier_size_drift on the first cycle because the
+            # measured median (stale-tier coins) doesn't match the live
+            # target. The reclassify pass cleans up that residue so
+            # downstream split decisions count only coins that genuinely
+            # fit the current tier shape.
+            try:
+                from coin_manager import reclassify_tier_spare_coins
+                _moved = reclassify_tier_spare_coins() or {}
+                _changed = int(_moved.get("reclassified", 0)) + int(_moved.get("to_dust", 0))
+                if _changed > 0:
+                    self.log(
+                        f"📋 Reclassified {_changed} existing coin(s) against current tier sizes "
+                        f"({_moved.get('reclassified', 0)} re-tiered, "
+                        f"{_moved.get('to_dust', 0)} demoted to dust)"
+                    )
+                else:
+                    self.log("📋 Existing tier coins already match current tier sizes")
+            except Exception as _reclass_err:
+                self.log(f"⚠️ Pre-prep reclassify skipped: {_reclass_err}")
+
             # Re-count coins AFTER cancellation — cancelled offers release locked coins
             # The initial coin count (before cancellation) is stale and unreliable
             self.log("\n📊 Re-counting coins after cancellation...")
@@ -5587,6 +5611,33 @@ class CoinPrepWorker:
 
             # Final DB designation sweep — ensures every coin has a role
             self._designate_final_sweep()
+
+            # End-of-prep drift verification. After every split, the
+            # designations should match the current tier sizes. If anything
+            # still drifts, log it as a hard error so the regression shows
+            # up next test run. Missing this assertion is what let the
+            # SBX→MZ residue cause a silent same-cycle drift warning.
+            try:
+                from coin_manager import check_tier_size_drift_standalone
+                _post_drift = check_tier_size_drift_standalone() or []
+                if _post_drift:
+                    _summary = ", ".join(
+                        f"{f['side']}/{f['tier']}={f['ratio']}× (n={f['coin_count']})"
+                        for f in _post_drift
+                    )
+                    self.log(f"❌ POST-PREP DRIFT: {_summary} — coin prep finished but "
+                             f"some tier sizes still don't match. Bot will refuse "
+                             f"to start with this state.")
+                    try:
+                        from database import log_event as _le
+                        _le("error", "tier_size_post_prep_drift",
+                            f"Coin prep finished with residual drift: {_summary}")
+                    except Exception:
+                        pass
+                else:
+                    self.log("✅ Post-prep drift check: every tier matches its target size")
+            except Exception as _drift_err:
+                self.log(f"⚠️ Post-prep drift check skipped: {_drift_err}")
 
             self.log(f"\n{'='*60}")
             self.log("🎉 COIN PREPARATION COMPLETE!")

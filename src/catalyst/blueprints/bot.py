@@ -149,6 +149,31 @@ def api_bot_start():
             "set HARD_MIN_PRICE_XCH/HARD_MAX_PRICE_XCH or DYNAMIC_LIMIT_PCT"
         )
 
+    # Tier-size drift gate: refuse to start if the on-disk coin
+    # designations don't match the current Smart Settings tier sizes.
+    # Without this, the first cycle posts offers from coins that won't
+    # fit any tier cleanly (the SBX→MZ residue case from yesterday) and
+    # the wallet can void them all simultaneously when an in-flight
+    # split TX confirms. Coin prep's reclassify pass should have caught
+    # this — if drift survives that, something's wrong and the bot
+    # shouldn't trade until it's fixed.
+    try:
+        from coin_manager import check_tier_size_drift_standalone
+        _drift = check_tier_size_drift_standalone(
+            low_ratio=0.50, high_ratio=2.00, min_sample=2
+        ) or []
+        if _drift:
+            _summary = ", ".join(
+                f"{f['side']}/{f['tier']}={f['ratio']}× (n={f['coin_count']})"
+                for f in _drift
+            )
+            errors.append(
+                "Coin tier sizes don't match Smart Settings — "
+                "re-run Coin Prep before starting. Drift: " + _summary
+            )
+    except Exception as _drift_err:
+        warnings.append(f"Tier-drift gate skipped: {_drift_err}")
+
     # Block start on critical errors
     if errors:
         return jsonify({"status": "error", "errors": errors, "warnings": warnings}), 400
