@@ -22412,6 +22412,13 @@
                 if (e.key !== 'Escape') return;
                 const top = findTopmostVisibleModal();
                 if (top) {
+                    // Coin-prep progress view is sticky for the same reason
+                    // backdrop-click is — silent worker abandonment is bad.
+                    if (top.id === 'coinPrepConfirmOverlay') {
+                        const progressView = document.getElementById('coinPrepProgressView');
+                        const inProgress = progressView && progressView.style.display !== 'none';
+                        if (inProgress) return;
+                    }
                     dismissModal(top);
                     e.stopPropagation();
                     e.preventDefault();
@@ -22435,6 +22442,17 @@
                 if (!isModalRoot) return;
                 if (!t.classList.contains('active')) return;
                 if (t.id && MODAL_NO_DISMISS.has(t.id)) return;
+                // Coin-prep modal: don't allow backdrop-dismiss while a
+                // prep run is in flight. The worker keeps running in the
+                // background after dismissal — silently — and the user
+                // has no way to know it's still happening. Block dismissal
+                // and force them through the explicit Cancel button (which
+                // also kills the worker) or wait for completion.
+                if (t.id === 'coinPrepConfirmOverlay') {
+                    const progressView = document.getElementById('coinPrepProgressView');
+                    const inProgress = progressView && progressView.style.display !== 'none';
+                    if (inProgress) return;
+                }
                 dismissModal(t);
             });
 
