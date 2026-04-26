@@ -134,6 +134,14 @@ class TestBase58(unittest.TestCase):
             self.assertIn(ch, "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 
 
+try:
+    import chia.util.bech32m as _bech32m_mod  # noqa: F401
+    _CHIA_AVAILABLE = True
+except ImportError:
+    _CHIA_AVAILABLE = False
+
+
+@unittest.skipUnless(_CHIA_AVAILABLE, "chia-blockchain not installed")
 class TestPuzzleHashToAddress(unittest.TestCase):
     def test_round_trip(self):
         from chia.util.bech32m import decode_puzzle_hash
@@ -143,6 +151,13 @@ class TestPuzzleHashToAddress(unittest.TestCase):
             addr = puzzle_hash_to_address(ph)
         self.assertTrue(addr.startswith("xch1"))
         self.assertEqual(decode_puzzle_hash(addr).hex(), ph)
+
+    def test_returns_empty_when_chia_missing(self):
+        # The production helper falls back gracefully when chia isn't
+        # importable (CI environments). Confirm the contract by patching
+        # encode_puzzle_hash to None — same as a missing-import code path.
+        with patch("dexie_claims.encode_puzzle_hash", None):
+            self.assertEqual(puzzle_hash_to_address("ab" * 32), "")
 
 
 if __name__ == "__main__":
