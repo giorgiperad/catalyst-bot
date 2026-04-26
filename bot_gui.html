@@ -10891,6 +10891,23 @@
         </div>
     </div>
 
+    <!-- Styled Prompt Modal (replaces native browser prompt) -->
+    <div class="confirm-overlay" id="styledPromptOverlay">
+        <div class="confirm-modal v4-modal-shell">
+            <div class="v4-modal-inner">
+                <div class="confirm-modal-icon" id="promptIcon">✏️</div>
+                <div class="confirm-modal-title" id="promptTitle">Enter a value</div>
+                <div class="confirm-modal-message" id="promptMessage" style="margin-bottom: 16px;"></div>
+                <input type="text" id="promptInput" maxlength="80" autocomplete="off" spellcheck="false" style="width:100%; padding:10px 12px; font-size:14px; background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.18); border-radius:6px; color:var(--text-primary); outline:none; box-sizing:border-box; margin-bottom: 6px;">
+                <div id="promptHint" style="font-size:11px; color:var(--text-tertiary); margin-bottom: 16px; min-height: 14px;"></div>
+                <div class="confirm-modal-buttons">
+                    <button class="confirm-btn-cancel" id="promptCancelBtn" onclick="resolveStyledPrompt(null)">Cancel</button>
+                    <button class="confirm-btn-warning" id="promptOkBtn" onclick="resolveStyledPrompt(document.getElementById('promptInput').value)">Save</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <div class="coin-prep-overlay" id="coinPrepConfirmOverlay">
         <div class="coin-prep-modal">
             
@@ -14923,13 +14940,27 @@
             // ticked. Captures the just-saved form state and writes a
             // named entry into the same localStorage bucket the
             // Configuration Presets panel reads from.
-            const nameRaw = prompt('Save these settings as a preset?\n\nName this preset (e.g. "Spacebux balanced + DBX cap"):', '');
-            if (nameRaw === null) return;  // user cancelled — settings still saved
-            const name = String(nameRaw).trim();
-            if (!name) { showToast('Preset skipped (no name given).', 'info'); return; }
-            if (name.length > 80) { showToast('Preset skipped — name too long (80 char max).', 'warning'); return; }
+            const name = await showStyledPrompt({
+                icon: '⭐',
+                title: 'Save settings as preset',
+                message: 'Your settings have been applied. Give this configuration a name to recall it later from the Configuration Presets panel.',
+                placeholder: 'e.g. Spacebux balanced + DBX cap',
+                okText: 'Save preset',
+                cancelText: 'Skip',
+            });
+            if (!name) return;  // user cancelled or empty — settings still saved
             const all = _presetsReadAll();
-            if (all[name] && !confirm('Overwrite existing preset "' + name + '"?')) return;
+            if (all[name]) {
+                const ok = await showStyledConfirm({
+                    icon: '⚠️',
+                    title: 'Overwrite preset?',
+                    message: `A preset named "${name}" already exists. Replace it with the current settings?`,
+                    confirmText: 'Overwrite',
+                    cancelText: 'Keep existing',
+                    style: 'warning',
+                });
+                if (!ok) return;
+            }
             all[name] = {
                 savedAt: new Date().toISOString(),
                 settings: _captureSetupFormValues(),
@@ -14942,14 +14973,28 @@
             }
         }
 
-        function presetsSaveFromButton() {
-            const nameRaw = prompt('Name this preset (e.g. "Monkeyzoo aggressive"):', '');
-            if (nameRaw === null) return;  // cancel
-            const name = String(nameRaw).trim();
-            if (!name) { showToast('Preset name is required.', 'warning'); return; }
-            if (name.length > 80) { showToast('Preset name too long (80 char max).', 'warning'); return; }
+        async function presetsSaveFromButton() {
+            const name = await showStyledPrompt({
+                icon: '⭐',
+                title: 'Save current settings as preset',
+                message: 'Captures every Setup-tab field so you can restore this configuration later.',
+                placeholder: 'e.g. Monkeyzoo aggressive',
+                okText: 'Save preset',
+                cancelText: 'Cancel',
+            });
+            if (!name) return;
             const all = _presetsReadAll();
-            if (all[name] && !confirm('Overwrite existing preset "' + name + '"?')) return;
+            if (all[name]) {
+                const ok = await showStyledConfirm({
+                    icon: '⚠️',
+                    title: 'Overwrite preset?',
+                    message: `A preset named "${name}" already exists. Replace it with the current settings?`,
+                    confirmText: 'Overwrite',
+                    cancelText: 'Keep existing',
+                    style: 'warning',
+                });
+                if (!ok) return;
+            }
             all[name] = {
                 savedAt: new Date().toISOString(),
                 settings: _captureSetupFormValues(),
@@ -14962,12 +15007,20 @@
             }
         }
 
-        function presetsLoadByName(name) {
+        async function presetsLoadByName(name) {
             name = String(name || '');
             const all = _presetsReadAll();
             const entry = all[name];
             if (!entry) { showToast('Preset not found.', 'warning'); return; }
-            if (!confirm('Load preset "' + name + '"? Any unsaved form changes will be overwritten.')) return;
+            const ok = await showStyledConfirm({
+                icon: '📥',
+                title: 'Load preset?',
+                message: `Load "${name}"? Any unsaved form changes will be overwritten.`,
+                confirmText: 'Load preset',
+                cancelText: 'Cancel',
+                style: 'warning',
+            });
+            if (!ok) return;
             const applied = _applySetupFormValues(entry.settings);
             showToast(
                 'Preset "' + name + '" loaded (' + applied + ' fields). Review and click Save to apply.',
@@ -14978,15 +15031,30 @@
             try { if (typeof markSettingsDirty === 'function') markSettingsDirty(); } catch (_) {}
         }
 
-        function presetsRenameByName(name) {
+        async function presetsRenameByName(name) {
             name = String(name || '');
             const all = _presetsReadAll();
             if (!(name in all)) return;
-            const nameRaw = prompt('New name for "' + name + '":', name);
-            if (nameRaw === null) return;
-            const next = String(nameRaw).trim();
+            const next = await showStyledPrompt({
+                icon: '✏️',
+                title: 'Rename preset',
+                message: `Rename "${name}" to:`,
+                initialValue: name,
+                okText: 'Rename',
+                cancelText: 'Cancel',
+            });
             if (!next || next === name) return;
-            if (all[next] && !confirm('Overwrite existing preset "' + next + '"?')) return;
+            if (all[next]) {
+                const ok = await showStyledConfirm({
+                    icon: '⚠️',
+                    title: 'Overwrite preset?',
+                    message: `A preset named "${next}" already exists. Replace it?`,
+                    confirmText: 'Overwrite',
+                    cancelText: 'Keep existing',
+                    style: 'warning',
+                });
+                if (!ok) return;
+            }
             all[next] = all[name];
             delete all[name];
             if (_presetsWriteAll(all)) {
@@ -14995,9 +15063,17 @@
             }
         }
 
-        function presetsDeleteByName(name) {
+        async function presetsDeleteByName(name) {
             name = String(name || '');
-            if (!confirm('Delete preset "' + name + '"? This cannot be undone.')) return;
+            const ok = await showStyledConfirm({
+                icon: '🗑️',
+                title: 'Delete preset?',
+                message: `Delete "${name}"? This cannot be undone.`,
+                confirmText: 'Delete',
+                cancelText: 'Keep',
+                style: 'danger',
+            });
+            if (!ok) return;
             const all = _presetsReadAll();
             if (!(name in all)) return;
             delete all[name];
@@ -17551,6 +17627,65 @@
             if (_confirmResolve) {
                 _confirmResolve(result);
                 _confirmResolve = null;
+            }
+        }
+
+        // Styled text-input prompt (replaces native browser prompt). Returns
+        // a promise resolving to the trimmed string, or null if cancelled /
+        // closed with an empty value. Same shell as showStyledConfirm so
+        // callers don't need separate styling. Defaults are tuned for the
+        // preset-name use case but options/title/message let it generalise.
+        let _promptResolve = null;
+        function showStyledPrompt({
+            icon = '✏️',
+            title = 'Enter a value',
+            message = '',
+            placeholder = '',
+            initialValue = '',
+            okText = 'Save',
+            cancelText = 'Cancel',
+            maxLength = 80,
+            allowHtml = false,
+        } = {}) {
+            return new Promise((resolve) => {
+                _promptResolve = resolve;
+                document.getElementById('promptIcon').innerHTML = icon;
+                document.getElementById('promptTitle').textContent = title;
+                const msgEl = document.getElementById('promptMessage');
+                if (allowHtml) msgEl.innerHTML = message;
+                else msgEl.textContent = String(message);
+                const input = document.getElementById('promptInput');
+                input.value = initialValue;
+                input.placeholder = placeholder;
+                input.maxLength = maxLength;
+                document.getElementById('promptHint').textContent = '';
+                document.getElementById('promptOkBtn').textContent = okText;
+                document.getElementById('promptCancelBtn').textContent = cancelText;
+                document.getElementById('styledPromptOverlay').classList.add('active');
+                // Focus + select after the overlay paints so the user can
+                // start typing immediately. Keyboard shortcuts: Enter
+                // submits, Escape cancels.
+                setTimeout(() => { input.focus(); input.select(); }, 30);
+                input.onkeydown = (e) => {
+                    if (e.key === 'Enter') {
+                        e.preventDefault();
+                        resolveStyledPrompt(input.value);
+                    } else if (e.key === 'Escape') {
+                        e.preventDefault();
+                        resolveStyledPrompt(null);
+                    }
+                };
+            });
+        }
+
+        function resolveStyledPrompt(result) {
+            document.getElementById('styledPromptOverlay').classList.remove('active');
+            const input = document.getElementById('promptInput');
+            if (input) input.onkeydown = null;
+            if (_promptResolve) {
+                const trimmed = (typeof result === 'string') ? result.trim() : null;
+                _promptResolve(trimmed === '' ? null : trimmed);
+                _promptResolve = null;
             }
         }
 
