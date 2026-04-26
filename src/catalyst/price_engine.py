@@ -381,6 +381,12 @@ class PriceEngine:
             # Also guard: bid > ask * 10 catches stale/garbage bids on thin books.
             bid_val = ticker.get("bid") or ticker.get("best_bid") or 0
             ask_val = ticker.get("ask") or ticker.get("best_ask") or 0
+            # Track whether we've already logged a "ticker unusable" reason
+            # this call so the fallback path below doesn't fire a duplicate
+            # warning for the same root cause. The crossed branch handles
+            # one specific cause (bid>ask) and the bid/ask-empty case below
+            # handles another (no bid/ask at all); only one warning per call.
+            _logged_ticker_problem = False
             try:
                 bid_d = Decimal(str(bid_val)) if bid_val else Decimal("0")
                 ask_d = Decimal(str(ask_val)) if ask_val else Decimal("0")
@@ -407,6 +413,7 @@ class PriceEngine:
                                   f"(bid={bid_d}, ask={ask_d}) — using "
                                   f"current_avg_price instead ({suffix})")
                         self._last_crossed_warn = _now
+                    _logged_ticker_problem = True
             except InvalidOperation:
                 pass
 
@@ -451,7 +458,12 @@ class PriceEngine:
                             cooldown = (self._stuck_cooldown_secs
                                         if self._empty_repeats >= 2
                                         else self._warn_cooldown_secs)
-                            if _now - self._last_empty_warn >= cooldown:
+                            # Suppress the "unavailable" warning when the
+                            # crossed branch already logged the same root
+                            # cause for this call — saves the user from
+                            # seeing two warnings per cycle for one event.
+                            if (not _logged_ticker_problem
+                                    and _now - self._last_empty_warn >= cooldown):
                                 suffix = (f"appears stuck; suppressed for "
                                            f"{int(cooldown // 60)}m"
                                            if self._empty_repeats >= 2
