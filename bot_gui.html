@@ -10762,6 +10762,11 @@
                     <div id="settingsUnsavedBadge" style="display:none; align-items:center; gap:6px; font-size:0.82em; color:var(--status-warning); font-weight:600; padding:4px 10px; background:rgba(245,158,11,0.1); border:1px solid rgba(245,158,11,0.3); border-radius:6px; white-space:nowrap; flex-shrink:1; min-width:0; overflow:hidden; text-overflow:ellipsis;"></div>
                     <div id="settingsValidationBanner" style="display:none; align-items:center; gap:6px; font-size:0.82em; color:var(--sell-color); font-weight:600; padding:4px 10px; background:rgba(248,113,113,0.1); border:1px solid rgba(248,113,113,0.3); border-radius:6px; white-space:nowrap; flex-shrink:1; min-width:0; overflow:hidden; text-overflow:ellipsis;"></div>
                     <button class="btn" id="exportEnvBtn" onclick="exportSettingsEnv()" style="padding:8px 16px; font-size:0.9em; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.15); border-radius:6px; color:var(--text-secondary); cursor:pointer; white-space:nowrap;">&#8595; Export .env</button>
+                    <label id="saveAsPresetWrap" style="display:flex; align-items:center; gap:6px; font-size:0.82em; color:var(--text-secondary); cursor:pointer; user-select:none; padding:0 6px; white-space:nowrap;">
+                        <input type="checkbox" id="saveAsPresetToggle" style="margin:0; cursor:pointer;">
+                        Save as preset
+                        <span class="cc-help">?<span class="cc-tooltip">Tick this to also save the settings you're about to apply as a named preset, so you can recall them later from the Configuration Presets panel above. The preset is captured AFTER Save succeeds, so it reflects exactly what got applied.</span></span>
+                    </label>
                     <button class="btn btn-start btn-primary btn-save" id="saveConfigBtn" onclick="handleSaveClick()">Save &amp; Continue</button>
                 </div>
 
@@ -14912,6 +14917,31 @@
             }
         }
 
+        async function _saveCurrentAsPresetPostSave() {
+            // Companion to presetsSaveFromButton, invoked from the
+            // Save & Continue flow when the "Save as preset" checkbox is
+            // ticked. Captures the just-saved form state and writes a
+            // named entry into the same localStorage bucket the
+            // Configuration Presets panel reads from.
+            const nameRaw = prompt('Save these settings as a preset?\n\nName this preset (e.g. "Spacebux balanced + DBX cap"):', '');
+            if (nameRaw === null) return;  // user cancelled — settings still saved
+            const name = String(nameRaw).trim();
+            if (!name) { showToast('Preset skipped (no name given).', 'info'); return; }
+            if (name.length > 80) { showToast('Preset skipped — name too long (80 char max).', 'warning'); return; }
+            const all = _presetsReadAll();
+            if (all[name] && !confirm('Overwrite existing preset "' + name + '"?')) return;
+            all[name] = {
+                savedAt: new Date().toISOString(),
+                settings: _captureSetupFormValues(),
+            };
+            if (_presetsWriteAll(all)) {
+                showToast('Preset saved: ' + name, 'success');
+                try { presetsRender(); } catch (_) {}
+            } else {
+                showToast('Could not save preset (localStorage error).', 'error');
+            }
+        }
+
         function presetsSaveFromButton() {
             const nameRaw = prompt('Name this preset (e.g. "Monkeyzoo aggressive"):', '');
             if (nameRaw === null) return;  // cancel
@@ -16372,35 +16402,54 @@
                 showToast('Stop the bot before changing the trading pair.', 'warning');
                 return;
             }
-            const hasPair = !!getDashboardSelectedPair({ requireExplicit: true }).selected;
-            if (hasPair) {
-                const proceed = await showStyledConfirm({
-                    icon: '↔️',
-                    title: 'Change Trading Pair',
-                    message: 'This changes the trading pair for the whole app, not just Settings.<br><br>Balances, pricing, warnings, and coin prep will reload for the new token. Continue to the dashboard to choose the replacement pair?',
-                    confirmText: 'Change Pair',
-                    cancelText: 'Keep Current Pair',
-                    style: 'warning',
-                    allowHtml: true
-                });
-                if (!proceed) return;
+            // In-place pair switch: reveal the hidden configCatSelector
+            // dropdown so the user picks the new pair without leaving
+            // Settings. Earlier this function bounced the user back to
+            // the Dashboard's Quick Start picker, which broke the flow
+            // if they were mid-tweak in Settings.
+            const select = document.getElementById('configCatSelector');
+            const trigger = document.getElementById('settingsPairChangeBtn');
+            if (!select) {
+                showToast('Pair selector not available — refresh the page.', 'error');
+                return;
             }
+            // Make the select visible + interactive. The "hidden" class
+            // collapses it behind the trigger button.
+            select.classList.remove('v4-settings-hidden-select');
+            select.removeAttribute('aria-hidden');
+            select.removeAttribute('tabindex');
+            select.style.display = '';
+            if (trigger) trigger.style.display = 'none';
 
-            resetPairSelectionState('Choose a CAT pair for this wallet.');
-            clearPairScopedDashboardState('selected pair');
-            if (typeof v4SwitchView === 'function') {
-                v4SwitchView('dashboard');
-            }
-            const selector = document.getElementById('catSelector');
-            const meta = document.getElementById('startupPairMeta');
-            if (meta) {
-                meta.textContent = 'Choose the CAT token this bot should price and manage. Settings will prepare the selected token for this run.';
-            }
-            showToast('Choose the trading pair from Quick Start to continue.', 'info');
-            setTimeout(() => {
-                selector?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                selector?.focus();
-            }, 180);
+            // One-shot handler: applies the picked pair via the same
+            // selectCAT() flow the dashboard uses, then re-hides the
+            // dropdown so the trigger button comes back. The handler
+            // de-registers itself after firing so successive clicks
+            // don't stack listeners.
+            const onPick = async () => {
+                const opt = select.options[select.selectedIndex];
+                if (!opt || opt.disabled || !opt.value) return;
+                // Sync the dashboard's catSelector first — selectCAT()
+                // reads from there, so we mirror the choice across.
+                const dashSel = document.getElementById('catSelector');
+                if (dashSel) {
+                    for (let i = 0; i < dashSel.options.length; i++) {
+                        if (dashSel.options[i].value === opt.value) {
+                            dashSel.selectedIndex = i;
+                            break;
+                        }
+                    }
+                }
+                select.removeEventListener('change', onPick);
+                try { await selectCAT(); } catch (e) { console.warn('[settings pair switch] selectCAT failed:', e); }
+                // Collapse picker back behind the trigger
+                select.classList.add('v4-settings-hidden-select');
+                select.setAttribute('aria-hidden', 'true');
+                select.setAttribute('tabindex', '-1');
+                if (trigger) trigger.style.display = '';
+            };
+            select.addEventListener('change', onPick);
+            select.focus();
         }
 
         function setCoinPrepPreviewLoading(tokenName = 'selected token') {
@@ -30286,6 +30335,22 @@
                     // A1: clear unsaved badge; A2: run inline validation after save
                     clearUnsavedBadge();
                     runInlineValidation();
+
+                    // Save-as-preset hook: if the user ticked the box next
+                    // to Save & Continue, prompt for a name now and snapshot
+                    // the just-saved form state into the same localStorage
+                    // bucket the Configuration Presets panel reads from.
+                    // Doing this AFTER the save succeeds means the preset
+                    // captures exactly what got applied to the bot.
+                    try {
+                        const _saveAsPresetEl = document.getElementById('saveAsPresetToggle');
+                        if (_saveAsPresetEl && _saveAsPresetEl.checked) {
+                            _saveAsPresetEl.checked = false;  // reset for next save
+                            await _saveCurrentAsPresetPostSave();
+                        }
+                    } catch (_presetErr) {
+                        console.warn('[saveConfig] post-save preset capture failed:', _presetErr);
+                    }
 
                     const _wasRunning = !!(bot_state && bot_state.running);
                     showToast(
