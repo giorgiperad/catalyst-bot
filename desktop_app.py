@@ -388,10 +388,11 @@ def check_port_free(port: int) -> bool:
             pass
 
 
-# Module-level handle so the OS-level lock survives the lifetime of the
-# process. If this is GC'd the lock is released and a second instance can
-# slip through.
+# Module-level handles so the OS resources (singleton lock, kill-on-close
+# Job Object) survive the lifetime of the process. If these are GC'd the
+# lock is released, the job is destroyed early, and the protection breaks.
 _instance_lock_handle = None
+_kill_on_close_job = None
 
 
 def _instance_lock_path() -> str:
@@ -463,6 +464,107 @@ def _open_existing_instance_in_browser() -> None:
         webbrowser.open(_app_url)
     except Exception:
         pass
+
+
+def _attach_to_kill_on_close_job() -> bool:
+    """Assign this process to a Windows Job Object that kills every child
+    when the parent dies — including SIGKILL / Task Manager / power loss.
+
+    Without this, coin-prep workers spawned via subprocess.Popen survive
+    a forced parent-kill on Windows (no SIGHUP is sent), and continue
+    submitting split TXs to Sage from the dead. That orphan-worker class
+    of bug is what produced the MEMPOOL_CONFLICT cascade earlier today.
+
+    Children of this process inherit job assignment automatically on
+    Windows 8+ via nested-job support. We hold the job handle for the
+    lifetime of this process; when the kernel releases it on exit, the
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE flag terminates everything still
+    running in the job.
+
+    Returns True on success. False on platforms / Windows versions where
+    nested jobs aren't supported — non-fatal, startup continues without
+    the protection (the singleton lock still bounds duplicate parents).
+    """
+    global _kill_on_close_job
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return False
+
+    JobObjectExtendedLimitInformation = 9
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+
+    class _IO_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong),
+        ]
+
+    class _BASIC_LIMIT(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", wintypes.LARGE_INTEGER),
+            ("PerJobUserTimeLimit", wintypes.LARGE_INTEGER),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class _EXTENDED_LIMIT(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _BASIC_LIMIT),
+            ("IoInfo", _IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD
+        ]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+
+        h_job = kernel32.CreateJobObjectW(None, None)
+        if not h_job:
+            return False
+
+        limits = _EXTENDED_LIMIT()
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(
+            h_job, JobObjectExtendedLimitInformation,
+            ctypes.byref(limits), ctypes.sizeof(limits),
+        ):
+            return False
+
+        if not kernel32.AssignProcessToJobObject(h_job, kernel32.GetCurrentProcess()):
+            # Most common failure: the parent (e.g. Explorer) already put us in
+            # a job that doesn't allow nesting. Non-fatal — singleton lock
+            # alone still prevents duplicate parents.
+            return False
+
+        _kill_on_close_job = h_job
+        return True
+    except Exception as e:
+        print(f"[JOB] Could not attach to kill-on-close job: {e}", flush=True)
+        return False
 
 
 def wait_for_flask(timeout: float = 15.0) -> bool:
@@ -1130,6 +1232,12 @@ def main(argv=None):
     if not _acquire_instance_lock():
         _open_existing_instance_in_browser()
         return 0
+
+    # Kill-on-close Job Object: ensures every child process (coin-prep
+    # worker, Sage if we launched it, etc.) dies when this parent dies,
+    # even on Task Manager force-kill. Closes the orphan-worker class of
+    # bug that survived the singleton lock alone.
+    _attach_to_kill_on_close_job()
 
     if not args.flask and not args.dev and not args.show_console:
         _hide_windows_console()

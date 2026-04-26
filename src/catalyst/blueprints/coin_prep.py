@@ -1420,6 +1420,86 @@ def api_coin_prep_reset():
     api_server._coin_prep_state["error"] = None
     return jsonify({"success": True})
 
+
+@bp.route("/api/coin-prep/cancel", methods=["POST"])
+def api_coin_prep_cancel():
+    """Cancel an in-flight coin prep run.
+
+    Kills the worker subprocess (whether launched by the blueprint's
+    /trigger path or by coin_manager's bot-loop path), clears the
+    running flags, and lets the GUI close the modal. Mirrors the kill
+    logic from /trigger so the same code path doesn't drift.
+
+    Returns a list of killed PIDs so the GUI can show the user what
+    happened. Empty list means there was nothing to cancel — that's
+    not an error, the response is still success=True.
+    """
+    bot = api_server.bot
+    killed: list[int] = []
+
+    # Blueprint-launched worker (manual coin prep trigger)
+    proc = api_server._coin_prep_proc
+    if proc is not None and proc.poll() is None:
+        pid = proc.pid
+        log_event("info", "coin_prep_cancel",
+                  f"User cancelled coin prep — killing worker PID: {pid}")
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                proc.kill()
+                proc.wait(timeout=2)
+            killed.append(pid)
+        except Exception as e:
+            log_event("warning", "coin_prep_cancel_kill_failed",
+                      f"Could not kill worker PID {pid}: {e}")
+        api_server._coin_prep_proc = None
+
+    # coin_manager-launched worker (bot loop path)
+    if bot and hasattr(bot, "coin_manager"):
+        cm = bot.coin_manager
+        cm_proc = getattr(cm, "_prep_process", None)
+        if cm_proc is not None and cm_proc.poll() is None:
+            pid = cm_proc.pid
+            log_event("info", "coin_prep_cancel",
+                      f"User cancelled coin prep — killing coin_manager worker PID: {pid}")
+            try:
+                cm_proc.terminate()
+                try:
+                    cm_proc.wait(timeout=3)
+                except Exception:
+                    cm_proc.kill()
+                    cm_proc.wait(timeout=2)
+                killed.append(pid)
+            except Exception as e:
+                log_event("warning", "coin_prep_cancel_kill_failed",
+                          f"Could not kill cm worker PID {pid}: {e}")
+            cm._prep_process = None
+        # Always release the gate flag so /api/coins/prep can run again
+        try:
+            with cm._lock:
+                cm._prep_running = False
+        except Exception:
+            cm._prep_running = False
+
+    # Clear the GUI-facing state so the modal can dismiss cleanly
+    api_server._coin_prep_state["running"] = False
+    api_server._coin_prep_state["complete"] = False
+    api_server._coin_prep_state["started_at"] = None
+    api_server._coin_prep_state["error"] = "cancelled_by_user" if killed else None
+
+    log_event("warning" if killed else "info",
+              "coin_prep_cancelled",
+              f"Coin prep cancellation completed — killed: {killed or 'no worker running'}")
+
+    return jsonify({
+        "success": True,
+        "killed_pids": killed,
+        "message": (f"Cancelled — killed worker(s): {killed}"
+                    if killed else "No coin prep was running"),
+    })
+
 @bp.route("/api/fills/export")
 def api_fills_export():
     """Export fill history as CSV."""

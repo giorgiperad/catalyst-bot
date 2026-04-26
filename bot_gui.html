@@ -11012,9 +11012,14 @@
                 </div>
                 
                 <div style="margin-top: 12px; display: flex; flex-direction: column; align-items: center; gap: 8px;">
-                    <button id="coinPrepConsoleBtn" onclick="toggleCoinPrepLogs()" style="background: rgba(100,116,139,0.2); border: 1px solid rgba(100,116,139,0.4); color: var(--slate-400); border-radius: 8px; padding: 8px 16px; cursor: pointer; font-size: 0.85em; transition: all 0.2s;">
-                        Show Coin Prep Logs
-                    </button>
+                    <div style="display: flex; gap: 10px; flex-wrap: wrap; justify-content: center;">
+                        <button id="coinPrepConsoleBtn" onclick="toggleCoinPrepLogs()" style="background: rgba(100,116,139,0.2); border: 1px solid rgba(100,116,139,0.4); color: var(--slate-400); border-radius: 8px; padding: 8px 16px; cursor: pointer; font-size: 0.85em; transition: all 0.2s;">
+                            Show Coin Prep Logs
+                        </button>
+                        <button id="coinPrepCancelBtn" onclick="cancelCoinPrepInProgress()" style="background: rgba(239,68,68,0.15); border: 1px solid rgba(239,68,68,0.4); color: var(--sell-color); border-radius: 8px; padding: 8px 16px; cursor: pointer; font-size: 0.85em; transition: all 0.2s;">
+                            Cancel Coin Prep
+                        </button>
+                    </div>
                     <div id="coinPrepLogBox" class="coin-prep-log-box">
                         Waiting for coin prep logs...
                     </div>
@@ -31341,13 +31346,62 @@ function closeCtgErrorModal() {
             } catch (e) {
                 console.log('Reset call failed (may not exist yet):', e);
             }
-            
+
             // Show confirm view again
             showCoinPrepView('confirm');
-            
+
             // Re-enable the confirm button
             const btn = document.getElementById('cpConfirmBtn');
             if (btn) { btn.disabled = false; btn.textContent = '✅ Yes, Prepare Coins'; }
+        }
+
+        // Cancel an in-flight coin prep run from the progress modal.
+        // Confirms with the user first because cancelling mid-flight
+        // can leave the wallet with a half-prepped coin set that
+        // requires another prep pass to clean up.
+        async function cancelCoinPrepInProgress() {
+            let ok = false;
+            if (typeof showStyledConfirm === 'function') {
+                ok = await showStyledConfirm({
+                    icon: '⚠️',
+                    title: 'Cancel Coin Prep?',
+                    message: 'Cancelling now will kill the worker. Any splits already submitted will still confirm on-chain — you may need to run coin prep again to clean up.',
+                    confirmText: 'Cancel Prep',
+                    cancelText: 'Keep Running',
+                    style: 'danger',
+                });
+            } else {
+                ok = window.confirm('Cancel coin prep? The worker will be killed but any in-flight splits will still confirm on-chain.');
+            }
+            if (!ok) return;
+
+            const btn = document.getElementById('coinPrepCancelBtn');
+            if (btn) { btn.disabled = true; btn.textContent = 'Cancelling...'; }
+
+            try {
+                const resp = await apiFetch(`${API_URL}/coin-prep/cancel`, { method: 'POST' });
+                const data = await resp.json();
+                if (data && data.success) {
+                    if (typeof showToast === 'function') {
+                        showToast(data.message || 'Coin prep cancelled', 'warning');
+                    }
+                    setCoinPrepStatus('error');
+                    const errSpan = document.getElementById('cpErrorDetail');
+                    if (errSpan) errSpan.textContent = 'Cancelled by user. Splits already submitted will still confirm on-chain — re-run coin prep if you need a clean state.';
+                    showCoinPrepView('error');
+                } else {
+                    if (typeof showToast === 'function') {
+                        showToast('Cancel failed: ' + (data && data.error || 'unknown error'), 'error');
+                    }
+                    if (btn) { btn.disabled = false; btn.textContent = 'Cancel Coin Prep'; }
+                }
+            } catch (e) {
+                console.error('cancelCoinPrepInProgress failed:', e);
+                if (typeof showToast === 'function') {
+                    showToast('Cancel request failed: ' + e.message, 'error');
+                }
+                if (btn) { btn.disabled = false; btn.textContent = 'Cancel Coin Prep'; }
+            }
         }
 
 function triggerCoinPrep() {
