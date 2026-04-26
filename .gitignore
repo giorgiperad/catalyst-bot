@@ -109,6 +109,7 @@ tmp_greenfloor_review/
 # --- Dev-only files (stay local) ---
 tools/
 website
+website screenshots/
 simulation/
 # Personal launcher with hardcoded paths — not useful off the dev machine
 CATalyst.vbs
@@ -122,6 +123,7 @@ check_thresholds.py
 config_live.py
 qdb*.py
 restart_after_coinprep.py
+scripts/snapshot_gui.py
 shutdown_bot.py
 start_bot.py
 test_prep.py

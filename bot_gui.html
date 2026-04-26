@@ -15455,18 +15455,32 @@
                             actionType: 'activateGapCloser'
                         });
                     } else if (arbGapBps < 50 && fillsHr === 0 && safeRoom > 100 && configBaseBps > 400) {
-                        // No arb gap, but BASE is wide with zero fills — tighten the actual config
-                        const rawTargetBps = Math.max(minBps, Math.round(configBaseBps * 0.85));
-                        const targetBps = Math.round(rawTargetBps / 25) * 25;
-                        if (targetBps > 0 && targetBps < configBaseBps) {
-                            pushSuggestion({
-                                type: 'info',
-                                icon: '📐',
-                                msg: 'No arb risk (' + fmtPct(arbGapBps) + ') and your base spread (' + fmtPct(configBaseBps) + ') is wide with zero fills. Tightening the base is more effective than probing with small offers in a quiet market.',
-                                action: 'Tighten base to ' + fmtPct(targetBps),
-                                actionType: 'applySpread',
-                                actionValue: String(targetBps)
-                            });
+                        // No arb gap, but BASE is wide with zero fills — tighten the actual config.
+                        //
+                        // Only fire this when we have NO competitor data. The
+                        // "no fills + competitors visible" branch below makes
+                        // a smarter call (tighten only if competitors are
+                        // demonstrably tighter than us — otherwise it's a
+                        // quiet patch, not a pricing problem). Without this
+                        // gate the two branches contradicted each other:
+                        // Block A would say "tighten because base is wide"
+                        // while Block B noted "spread is already close to
+                        // the live market". Defer to Block B whenever it
+                        // has competitor data to reason against.
+                        const haveCompetitorData = competitorCount > 0 && competitorBps > 0;
+                        if (!haveCompetitorData) {
+                            const rawTargetBps = Math.max(minBps, Math.round(configBaseBps * 0.85));
+                            const targetBps = Math.round(rawTargetBps / 25) * 25;
+                            if (targetBps > 0 && targetBps < configBaseBps) {
+                                pushSuggestion({
+                                    type: 'info',
+                                    icon: '📐',
+                                    msg: 'No arb risk (' + fmtPct(arbGapBps) + ') and your base spread (' + fmtPct(configBaseBps) + ') is wide with zero fills. Tightening the base is more effective than probing with small offers in a quiet market.',
+                                    action: 'Tighten base to ' + fmtPct(targetBps),
+                                    actionType: 'applySpread',
+                                    actionValue: String(targetBps)
+                                });
+                            }
                         }
                     }
                 }
