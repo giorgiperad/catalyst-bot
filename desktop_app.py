@@ -388,6 +388,83 @@ def check_port_free(port: int) -> bool:
             pass
 
 
+# Module-level handle so the OS-level lock survives the lifetime of the
+# process. If this is GC'd the lock is released and a second instance can
+# slip through.
+_instance_lock_handle = None
+
+
+def _instance_lock_path() -> str:
+    """Path to the cross-process singleton lock file."""
+    try:
+        from user_paths import data_dir
+        return os.path.join(data_dir(), ".instance.lock")
+    except Exception:
+        return os.path.join(APP_DIR, ".instance.lock")
+
+
+def _acquire_instance_lock() -> bool:
+    """Acquire an exclusive cross-process singleton lock.
+
+    The previous duplicate-prevention logic relied on `check_port_free()`
+    after Flask startup. That left a 1-2 second race window during Python
+    startup where a second launch could pass the port check before
+    instance #1 had bound 5000. Both instances would then run their own
+    Flask, AppBridge, and coin-prep worker — the workers would race to
+    split the same wallet coins, and Sage would reject the loser with
+    MEMPOOL_CONFLICT.
+
+    OS-level file locks close that window: the lock is granted atomically
+    by the kernel and is released automatically when the process dies
+    (even on SIGKILL / Task Manager / power loss), so there is no stale-
+    lock-file problem to clean up.
+
+    Returns True when the lock is held by us. Returns False when another
+    instance already holds it — caller should redirect the user to the
+    running instance and exit.
+    """
+    global _instance_lock_handle
+    lock_path = _instance_lock_path()
+    try:
+        fh = open(lock_path, "a+", encoding="utf-8")
+    except Exception as e:
+        print(f"[INSTANCE-LOCK] Could not open {lock_path}: {e} — skipping lock", flush=True)
+        return True  # Fail open: don't block startup on a filesystem hiccup
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, IOError):
+        try:
+            fh.close()
+        except Exception:
+            pass
+        return False
+    try:
+        fh.seek(0)
+        fh.truncate()
+        fh.write(f"pid={os.getpid()} started={int(time.time())}\n")
+        fh.flush()
+    except Exception:
+        pass
+    _instance_lock_handle = fh
+    return True
+
+
+def _open_existing_instance_in_browser() -> None:
+    """Bring the already-running instance forward when our own start was rejected."""
+    _app_url = f"http://{FLASK_HOST}:{FLASK_PORT}/"
+    print(f"\n  {APP_NAME} is already running — opening {_app_url}", flush=True)
+    try:
+        import webbrowser
+        webbrowser.open(_app_url)
+    except Exception:
+        pass
+
+
 def wait_for_flask(timeout: float = 15.0) -> bool:
     """Wait for Flask to start accepting connections. Returns True if ready."""
     import socket
@@ -1044,6 +1121,15 @@ def main(argv=None):
     if not args.flask and not args.dev and not args.show_console:
         if _respawn_under_pythonw():
             return 0
+
+    # Cross-process singleton: only ONE desktop_app may run at a time.
+    # Without this, a second double-click within the 1-2s Python startup
+    # window slips past the port check, both instances start their own
+    # Flask/AppBridge/coin-prep workers, and the workers race the same
+    # wallet coins → MEMPOOL_CONFLICT cascade in Sage.
+    if not _acquire_instance_lock():
+        _open_existing_instance_in_browser()
+        return 0
 
     if not args.flask and not args.dev and not args.show_console:
         _hide_windows_console()
