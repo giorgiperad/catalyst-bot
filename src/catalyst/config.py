@@ -397,6 +397,12 @@ class Config:
         self.DEXIE_POST_ENABLED = _bool("DEXIE_POST_ENABLED", True)
         self.DEXIE_POST_TIMEOUT = _int("DEXIE_POST_TIMEOUT", 15)
         self.DEXIE_POST_RETRIES = _int("DEXIE_POST_RETRIES", 2)
+        # Auto-claim DBX liquidity rewards: set the `claim_rewards` flag
+        # when posting an offer so Dexie pays out rewards to our maker
+        # address automatically every ~15 minutes (no signed claim needed).
+        # Documented in dexie's API and AbandonedLand/dexiePowerShell. The
+        # flag is a no-op for non-incentivized pairs, so always-on is safe.
+        self.DEXIE_AUTO_CLAIM_REWARDS = _bool("DEXIE_AUTO_CLAIM_REWARDS", True)
         try:
             self.DEXIE_POST_RETRY_SLEEP = float(_str("DEXIE_POST_RETRY_SLEEP", "1.5"))
         except (ValueError, TypeError):
@@ -779,6 +785,7 @@ class Config:
         # Dexie
         "DEXIE_AUTO_POST", "DEXIE_POST_ENABLED",
         "DEXIE_POST_TIMEOUT", "DEXIE_POST_RETRIES",
+        "DEXIE_AUTO_CLAIM_REWARDS",
         "DEXIE_POST_RETRY_SLEEP", "MAX_POSTS_PER_LOOP", "BOT_TAG",
         # TibetSwap
         "TIBET_TIMEOUT",

@@ -9753,8 +9753,8 @@
                     <!-- Pending claimable rewards (populated from /api/dbx/pending) -->
                     <div id="intelDbxPendingPanel" style="display: none; margin-top: 12px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.08);">
                         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-                            <div style="font-size: 12px; font-weight: 600; color: rgba(255,255,255,0.85);">Pending Claims <span class="cc-help">?<span class="cc-tooltip">Rewards already accrued on your offers that haven't been claimed yet. Claiming signs a message with the maker address — no XCH leaves your wallet.</span></span></div>
-                            <button id="intelDbxClaimBtn" onclick="claimDbxRewards()" style="background: var(--accent-primary); color: white; border: none; border-radius: 4px; padding: 4px 10px; font-size: 11px; font-weight: 600; cursor: pointer;">Claim All</button>
+                            <div style="font-size: 12px; font-weight: 600; color: rgba(255,255,255,0.85);">Pending Rewards <span style="font-size: 10px; color: var(--status-success); font-weight: 400; margin-left: 6px;">⚡ auto-claim ON</span> <span class="cc-help">?<span class="cc-tooltip">Posted offers carry the claim_rewards flag, so Dexie pays out DBX automatically to your wallet every ~15 min. The Claim button is a backup — only needed for offers posted before auto-claim was enabled, or if Dexie's auto-payout is paused.</span></span></div>
+                            <button id="intelDbxClaimBtn" onclick="claimDbxRewards()" style="background: var(--accent-primary); color: white; border: none; border-radius: 4px; padding: 4px 10px; font-size: 11px; font-weight: 600; cursor: pointer;">Manual Claim</button>
                         </div>
                         <div id="intelDbxPendingTotal" style="font-size: 14px; color: rgba(255,255,255,0.85); margin-bottom: 4px;">—</div>
                         <div id="intelDbxPendingDetail" style="font-size: 11px; color: rgba(255,255,255,0.55);"></div>

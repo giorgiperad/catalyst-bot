@@ -282,6 +282,14 @@ class DexieManager:
 
         url = f"{cfg.DEXIE_API_BASE.rstrip('/')}/v1/offers"
         payload = {"offer": offer_bech32}
+        # Auto-claim flag: when set, Dexie pays liquidity rewards
+        # automatically to the maker address (~every 15 min) without
+        # requiring a signed claim. For incentivized pairs we get DBX
+        # passively; for non-incentivized pairs the flag is a no-op.
+        # That makes "always on" safe — and avoids the Sage-RPC signing
+        # gap that blocks the manual claim flow today.
+        if bool(getattr(cfg, "DEXIE_AUTO_CLAIM_REWARDS", True)):
+            payload["claim_rewards"] = True
         headers = {
             "content-type": "application/json",
             "accept": "application/json",
