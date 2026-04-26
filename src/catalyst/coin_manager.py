@@ -7460,6 +7460,11 @@ class CoinManager:
             cat_asset_id = cfg.CAT_ASSET_ID
             if cat_asset_id:
                 _dexie_base = str(getattr(cfg, "DEXIE_API_BASE", "https://api.dexie.space") or "https://api.dexie.space").rstrip("/")
+                try:
+                    from api_call_tracker import record as _t
+                    _t("dexie", "/v2/prices/tickers")
+                except Exception:
+                    pass
                 resp = requests.get(
                     f"{_dexie_base}/v2/prices/tickers?ticker_id={cat_asset_id}_xch",
                     timeout=10

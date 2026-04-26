@@ -24,6 +24,12 @@ import api_server
 from config import cfg
 from database import log_event
 
+try:
+    from api_call_tracker import record as _record_api_call
+except Exception:
+    def _record_api_call(*args, **kwargs):
+        return None
+
 
 bp = Blueprint("market", __name__)
 
@@ -326,6 +332,7 @@ def api_market_summary():
     try:
         if ticker_id:
             tid = ticker_id if "_" in ticker_id else f"{ticker_id}_XCH"
+            _record_api_call("dexie", "/v2/prices/tickers")
             resp = _req.get(f"{dexie_base}/v2/prices/tickers",
                             params={"ticker_id": tid}, timeout=8)
             if resp.status_code == 200:
@@ -360,6 +367,7 @@ def api_market_summary():
         return 0.0
 
     try:
+        _record_api_call("dexie", "/v1/offers")
         resp = _req.get(f"{dexie_base}/v1/offers",
                         params={"offered": asset_id, "requested": "xch",
                                 "status": 0, "page_size": 3, "sort": "price_asc"},
@@ -371,6 +379,7 @@ def api_market_summary():
                     result["best_ask"] = p
                     break
 
+        _record_api_call("dexie", "/v1/offers")
         resp = _req.get(f"{dexie_base}/v1/offers",
                         params={"offered": "xch", "requested": asset_id,
                                 "status": 0, "page_size": 3, "sort": "price_asc"},
@@ -386,6 +395,7 @@ def api_market_summary():
 
     try:
         dexie_total_xch = 0.0
+        _record_api_call("dexie", "/v1/offers")
         resp = _req.get(f"{dexie_base}/v1/offers",
                         params={"offered": asset_id, "requested": "xch",
                                 "status": 0, "page_size": 50},
@@ -396,6 +406,7 @@ def api_market_summary():
                     if str(asset.get("code", "")).upper() == "XCH":
                         dexie_total_xch += float(asset.get("amount", 0) or 0)
 
+        _record_api_call("dexie", "/v1/offers")
         resp = _req.get(f"{dexie_base}/v1/offers",
                         params={"offered": "xch", "requested": asset_id,
                                 "status": 0, "page_size": 50},
@@ -411,6 +422,7 @@ def api_market_summary():
         pass
 
     try:
+        _record_api_call("tibetswap", "/pairs")
         resp = _req.get("https://api.v2.tibetswap.io/pairs",
                         params={"skip": 0, "limit": 200}, timeout=8)
         if resp.status_code == 200:

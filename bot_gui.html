@@ -25263,6 +25263,30 @@
                 const dx = data.dexie       || {};
                 const ts = data.tibetswap   || {};
                 const sp = data.splash      || {};
+                const cg = data.coingecko   || {};
+                const gh = data.github      || {};
+
+                // Render an endpoint-breakdown footer for any panel that
+                // exposes a {endpoint: count} map. Keeps the rows tight
+                // while still showing where the calls went.
+                const fmtEndpointFooter = (label, breakdown) => {
+                    if (!breakdown || !Object.keys(breakdown).length) return '';
+                    const items = Object.entries(breakdown)
+                        .map(([k, v]) => escapeHtml(k) + '=' + fmtN(v))
+                        .join(' · ');
+                    return '<div style="margin-top:10px; padding-top:8px; border-top: 1px solid var(--border-subtle); font-size: 0.85em; color: var(--text-tertiary);">'
+                        + escapeHtml(label) + ': ' + items
+                        + '</div>';
+                };
+                const fmtAge = (secs) => {
+                    if (secs === undefined || secs === null) return '—';
+                    const n = Number(secs);
+                    if (!isFinite(n) || n < 0) return '—';
+                    if (n < 60) return Math.round(n) + 's ago';
+                    if (n < 3600) return Math.round(n / 60) + 'm ago';
+                    if (n < 86400) return Math.round(n / 3600) + 'h ago';
+                    return Math.round(n / 86400) + 'd ago';
+                };
 
                 const fmtN = (v) => (v === undefined || v === null) ? '—' : Number(v).toLocaleString();
                 const fmtPct = (v) => (v === undefined || v === null) ? '—' : Number(v).toFixed(1) + '%';
@@ -25287,6 +25311,7 @@
                             <div style="color:var(--text-secondary);">Session uptime</div><div>${fmtN(ss.session_uptime_hours)}h</div>
                             <div style="color:var(--text-secondary);">Rate-limit cooldown</div><div>${escapeHtml(isCoolingDown(ss.rate_limited_until))}</div>
                           </div>
+                          ${fmtEndpointFooter('Direct calls', ss.direct_calls_by_endpoint)}
                         ` : '<div style="color:var(--text-tertiary);">Spacescan stats unavailable.</div>'}
                     </div>
                     <div class="v4-modal-panel">
@@ -25300,6 +25325,7 @@
                                 (cs.mode || 'unknown')
                             )}</div>
                             <div style="color:var(--text-secondary);">API calls this session</div><div>${fmtN(cs.api_calls_total)}</div>
+                            ${cs.direct_calls ? `<div style="color:var(--text-secondary);">Direct calls (fee estimates etc.)</div><div>${fmtN(cs.direct_calls)}</div>` : ''}
                             ${cs.mempool_watcher_calls ? `<div style="color:var(--text-secondary);">Mempool watcher calls</div><div>${fmtN(cs.mempool_watcher_calls)}</div>` : ''}
                             ${cs.api_errors_total ? `<div style="color:var(--text-secondary);">API errors</div><div style="color:var(--status-danger);">${fmtN(cs.api_errors_total)}</div>` : ''}
                             <div style="color:var(--text-secondary);">Last call latency</div><div>${fmtN(cs.last_coinset_time_ms)}ms</div>
@@ -25318,6 +25344,7 @@
                               Calls by method: ${Object.entries(cs.api_calls_by_method)
                                 .map(([k, v]) => `${escapeHtml(k)}=${fmtN(v)}`).join(' · ')}
                             </div>` : ''}
+                          ${fmtEndpointFooter('Direct calls', cs.direct_calls_by_endpoint)}
                         ` : '<div style="color:var(--text-tertiary);">Coinset client not running.</div>'}
                     </div>
                     <div class="v4-modal-panel">
@@ -25326,6 +25353,7 @@
                           <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 16px;font-size:0.92em;">
                             <div style="color:var(--text-secondary);">Price fetches</div><div>${fmtN(dx.price_fetches)}</div>
                             <div style="color:var(--text-secondary);">Orderbook refreshes</div><div>${fmtN(dx.orderbook_refreshes)}</div>
+                            ${dx.direct_calls ? `<div style="color:var(--text-secondary);">Direct queries (intel / Smart Settings)</div><div>${fmtN(dx.direct_calls)}</div>` : ''}
                             <div style="color:var(--text-secondary);">Offer posts</div><div>${fmtN(dx.session_posted != null ? dx.session_posted : dx.total_posted)}</div>
                             <div style="color:var(--text-secondary);">Post failures</div><div>${fmtN(dx.session_failed != null ? dx.session_failed : dx.total_failed)}</div>
                             <div style="color:var(--text-secondary);">Queue size</div><div>${fmtN(dx.queue_size)}</div>
@@ -25339,6 +25367,7 @@
                             <div style="margin-top:10px; padding:6px 10px; background: rgba(59,130,246,0.08); border: 1px solid rgba(59,130,246,0.2); border-radius: 6px; font-size: 0.82em; color: var(--text-tertiary);">
                               ℹ The "known mappings" count includes offers loaded from the local database at startup. "Posts this session" only counts new offers submitted since the bot process started — it resets on restart.
                             </div>` : ''}
+                          ${fmtEndpointFooter('Direct calls', dx.direct_calls_by_endpoint)}
                         ` : '<div style="color:var(--text-tertiary);">Dexie manager not running.</div>'}
                     </div>
                     <div class="v4-modal-panel">
@@ -25353,8 +25382,16 @@
                             <div style="color:var(--text-secondary);">Consecutive failures</div><div>${fmtN(ts.consecutive_failures)}</div>
                             <div style="color:var(--text-secondary);">Last success</div><div>${ts.last_success_ago_secs != null ? fmtN(Math.round(ts.last_success_ago_secs)) + 's ago' : '—'}</div>
                             <div style="color:var(--text-secondary);">Price cache age</div><div>${ts.price_cache_age_secs != null ? fmtN(Math.round(ts.price_cache_age_secs)) + 's' : '—'}</div>
+                            ${ts.direct_calls ? `<div style="color:var(--text-secondary);">Direct calls (token discovery)</div><div>${fmtN(ts.direct_calls)}</div>` : ''}
                           </div>
-                        ` : '<div style="color:var(--text-tertiary);">TibetSwap AMM monitor not running.</div>'}
+                          ${fmtEndpointFooter('Direct calls', ts.direct_calls_by_endpoint)}
+                        ` : (ts.direct_calls ? `
+                          <div style="color:var(--text-tertiary); margin-bottom: 6px;">AMM monitor not running, but token-discovery calls have hit /pairs:</div>
+                          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 16px;font-size:0.92em;">
+                            <div style="color:var(--text-secondary);">Direct calls</div><div>${fmtN(ts.direct_calls)}</div>
+                          </div>
+                          ${fmtEndpointFooter('Direct calls', ts.direct_calls_by_endpoint)}
+                        ` : '<div style="color:var(--text-tertiary);">TibetSwap AMM monitor not running.</div>')}
                     </div>
                     <div class="v4-modal-panel">
                         <div class="v4-modal-panel-title">Splash ${sp.available ? (sp.healthy ? '✅' : '⚠️') : '❌'}</div>
@@ -25372,6 +25409,26 @@
                             ` : ''}
                           </div>
                         ` : '<div style="color:var(--text-tertiary);">Splash manager not running.</div>'}
+                    </div>
+                    <div class="v4-modal-panel">
+                        <div class="v4-modal-panel-title">CoinGecko ${cg.available ? '✅' : '·'}</div>
+                        ${cg.available ? `
+                          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 16px;font-size:0.92em;">
+                            <div style="color:var(--text-secondary);">XCH/USD fetches</div><div>${fmtN(cg.calls)}</div>
+                            <div style="color:var(--text-secondary);">Last fetch</div><div>${escapeHtml(fmtAge(cg.last_call_ago_secs))}</div>
+                          </div>
+                          ${fmtEndpointFooter('Calls by endpoint', cg.by_endpoint)}
+                        ` : '<div style="color:var(--text-tertiary);">No CoinGecko calls yet this session. Used by Smart Settings for XCH/USD context (cached 5 min).</div>'}
+                    </div>
+                    <div class="v4-modal-panel">
+                        <div class="v4-modal-panel-title">GitHub ${gh.available ? '✅' : '·'}</div>
+                        ${gh.available ? `
+                          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 16px;font-size:0.92em;">
+                            <div style="color:var(--text-secondary);">Release-info polls</div><div>${fmtN(gh.calls)}</div>
+                            <div style="color:var(--text-secondary);">Last poll</div><div>${escapeHtml(fmtAge(gh.last_call_ago_secs))}</div>
+                          </div>
+                          ${fmtEndpointFooter('Calls by endpoint', gh.by_endpoint)}
+                        ` : '<div style="color:var(--text-tertiary);">No GitHub release-info polls yet this session. Used by Sage update check + Splash binary download (cached 6h+).</div>'}
                     </div>
                 `;
 

@@ -474,6 +474,11 @@ def _check_dexie_reachable() -> DoctorCheck:
     try:
         import requests
         from config import cfg
+        try:
+            from api_call_tracker import record as _t
+            _t("dexie", "/v1/offers (doctor)")
+        except Exception:
+            pass
         dexie_url = getattr(cfg, "DEXIE_API_BASE", "https://api.dexie.space")
         resp = requests.head(f"{dexie_url}/v1/offers", timeout=5)
         if resp.status_code < 500:
@@ -500,6 +505,11 @@ def _check_tibet_reachable() -> DoctorCheck:
     try:
         import requests
         from config import cfg
+        try:
+            from api_call_tracker import record as _t
+            _t("tibetswap", "/tokens (doctor)")
+        except Exception:
+            pass
         tibet_url = getattr(cfg, "TIBET_API_BASE", "https://api.v2.tibetswap.io")
         resp = requests.get(f"{tibet_url}/tokens", timeout=5)
         if resp.status_code < 500:

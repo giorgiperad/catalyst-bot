@@ -21,6 +21,12 @@ import requests
 from typing import Optional, Dict
 from database import log_event
 
+try:
+    from api_call_tracker import record as _record_api_call
+except Exception:
+    def _record_api_call(*args, **kwargs):
+        return None
+
 # Module-level cache so resolver only hits the network once per process.
 _cache: Optional[Dict] = None
 _cache_lock = threading.Lock()
@@ -54,6 +60,7 @@ def resolve_cat_metadata(asset_id: str,
 
     # --- Step 1: Token metadata (name, short_name) ---
     try:
+        _record_api_call("tibetswap", "/tokens")
         resp = requests.get(
             f"{base}/tokens",
             timeout=timeout,
@@ -75,6 +82,7 @@ def resolve_cat_metadata(asset_id: str,
 
     # --- Step 2: Pair ID ---
     try:
+        _record_api_call("tibetswap", "/pairs")
         resp2 = requests.get(
             f"{base}/pairs",
             params={"skip": 0, "limit": 200},

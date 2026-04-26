@@ -27,6 +27,12 @@ from config import cfg
 from database import log_event
 from super_log import slog
 
+try:
+    from api_call_tracker import record as _record_api_call
+except Exception:
+    def _record_api_call(*args, **kwargs):
+        return None
+
 
 bp = Blueprint("cat", __name__)
 
@@ -50,6 +56,7 @@ def _get_dexie_pairs() -> list:
         import requests as _req
         dexie_base = getattr(cfg, "DEXIE_API_BASE", "https://api.dexie.space")
         url = f"{dexie_base}/v2/prices/tickers"
+        _record_api_call("dexie", "/v2/prices/tickers")
         response = _req.get(url, timeout=10)
         response.raise_for_status()
 
@@ -213,6 +220,7 @@ def api_token_overview():
         import requests as _req
         dexie_base = getattr(cfg, "DEXIE_API_BASE", "https://api.dexie.space")
         for page in range(1, 4):
+            _record_api_call("dexie", "/v1/assets")
             resp = _req.get(
                 f"{dexie_base}/v1/assets",
                 params={"page": page, "page_size": 100},

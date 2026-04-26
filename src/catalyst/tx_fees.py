@@ -189,6 +189,11 @@ def _coinset_fee_estimate(target_seconds: int, cost: int) -> Optional[Dict]:
         r = None
         data = None
         for _attempt in range(3):
+            try:
+                from api_call_tracker import record as _t
+                _t("coinset", "/get_fee_estimate")
+            except Exception:
+                pass
             r = _requests.post(
                 f"{api_url}/get_fee_estimate",
                 json={"cost": cost, "target_times": [target_seconds]},

@@ -723,6 +723,11 @@ def _fetch_xch_usd_price() -> Optional[Dict]:
     Returns None on any failure — caller treats as "USD data unavailable".
     """
     try:
+        try:
+            from api_call_tracker import record as _record_api_call
+            _record_api_call("coingecko", "/simple/price")
+        except Exception:
+            pass
         resp = _session.get(
             f"{COINGECKO_BASE}/simple/price",
             params={

@@ -114,6 +114,11 @@ def _dexie_get_offer(dexie_id: str, timeout: float = 10.0) -> Optional[dict]:
     base = (getattr(cfg, "DEXIE_API_BASE", "") or "https://api.dexie.space").rstrip("/")
     url = f"{base}/v1/offers/{dexie_id}"
     try:
+        try:
+            from api_call_tracker import record as _t
+            _t("dexie", "/v1/offers/{id}")
+        except Exception:
+            pass
         req = urllib.request.Request(url, headers={"User-Agent": "MM_BOT/health"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())

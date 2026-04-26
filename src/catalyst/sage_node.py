@@ -2352,6 +2352,11 @@ def _build_cat_name_lookup() -> Dict[str, str]:
     # Try to get Dexie pairs for broader name resolution
     try:
         import requests as _req
+        try:
+            from api_call_tracker import record as _t
+            _t("dexie", "/v2/prices/tickers")
+        except Exception:
+            pass
         dexie_base = os.getenv("DEXIE_API_BASE", "https://api.dexie.space")
         url = f"{dexie_base}/v2/prices/tickers"
         response = _req.get(url, timeout=5)

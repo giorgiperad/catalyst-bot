@@ -1700,6 +1700,11 @@ def api_sage_latest_release():
 
     try:
         import requests as _req
+        try:
+            from api_call_tracker import record as _t
+            _t("github", "/repos/xch-dev/sage/releases/latest")
+        except Exception:
+            pass
         r = _req.get(
             "https://api.github.com/repos/xch-dev/sage/releases/latest",
             headers={

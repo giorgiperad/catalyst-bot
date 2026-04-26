@@ -31,6 +31,12 @@ from super_log import slog
 # Shared helper defined in the offers blueprint — used by /api/status.
 from blueprints.offers import _build_fill_history_for_gui
 
+try:
+    from api_call_tracker import record as _record_api_call
+except Exception:
+    def _record_api_call(*args, **kwargs):
+        return None
+
 
 bp = Blueprint("bot", __name__)
 
@@ -410,6 +416,7 @@ def api_status():
 
                 # --- Try TibetSwap ---
                 try:
+                    _record_api_call("tibetswap", "/pairs")
                     resp = _req.get("https://api.v2.tibetswap.io/pairs",
                                     params={"skip": 0, "limit": 200}, timeout=8)
                     if resp.status_code == 200:
@@ -443,6 +450,7 @@ def api_status():
                             ticker_id = f"{ticker_id}_XCH"
                         dexie_base = getattr(cfg, "DEXIE_API_BASE", "https://api.dexie.space")
                         if ticker_id:
+                            _record_api_call("dexie", "/v2/prices/tickers")
                             resp = _req.get(f"{dexie_base}/v2/prices/tickers",
                                             params={"ticker_id": ticker_id}, timeout=8)
                             if resp.status_code == 200:
@@ -460,6 +468,7 @@ def api_status():
                                             break
                         # If no ticker_id or no result, try orderbook
                         if mid == 0:
+                            _record_api_call("dexie", "/v1/offers")
                             resp = _req.get(f"{dexie_base}/v1/offers",
                                             params={"offered": asset_id, "requested": "xch",
                                                      "status": 0, "page_size": 1, "sort": "price_asc"},
@@ -731,6 +740,7 @@ def api_status():
                 asset_id = api_server._active_cat.get("asset_id") or (cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else "")
                 cat_dec = api_server._active_cat.get("decimals") or getattr(cfg, "CAT_DECIMALS", 3)
                 if asset_id:
+                    _record_api_call("tibetswap", "/pairs")
                     resp = _req.get("https://api.v2.tibetswap.io/pairs",
                                     params={"skip": 0, "limit": 200}, timeout=8)
                     if resp.status_code == 200:
@@ -1282,6 +1292,21 @@ def api_diagnostics_api_stats():
         "dexie":     {"available": False},
     }
 
+    # Pull the centralized tracker once. Lets us merge "direct" calls
+    # (calls bypassing per-service managers — e.g. Smart Settings hitting
+    # api.dexie.space directly) into each service panel and surface
+    # CoinGecko + GitHub which have no other counter source.
+    try:
+        from api_call_tracker import (
+            get_count as _tracker_get_count,
+            get_endpoint_breakdown as _tracker_endpoints,
+            get_last_call_ago_secs as _tracker_last_ago,
+        )
+    except Exception:
+        _tracker_get_count = lambda _s: 0
+        _tracker_endpoints = lambda _s: {}
+        _tracker_last_ago = lambda _s: None
+
     # --- Spacescan ----------------------------------------------------
     try:
         import spacescan as _ss
@@ -1307,6 +1332,15 @@ def api_diagnostics_api_stats():
             pass
     except Exception as e:
         payload["spacescan"]["error"] = str(e)
+
+    # Merge any spacescan calls recorded via the centralized tracker
+    # (currently market_data_collector routes through spacescan.record_external_call,
+    # so this is mostly informational, but still keep parity for future sites).
+    if payload["spacescan"].get("available"):
+        _tracked = int(_tracker_get_count("spacescan"))
+        if _tracked:
+            payload["spacescan"]["direct_calls"] = _tracked
+            payload["spacescan"]["direct_calls_by_endpoint"] = _tracker_endpoints("spacescan")
 
     # --- Coinset ------------------------------------------------------
     try:
@@ -1339,6 +1373,18 @@ def api_diagnostics_api_stats():
             }
     except Exception as e:
         payload["coinset"]["error"] = str(e)
+
+    # Merge "direct" Coinset calls (tx_fees fee-estimate, anything not
+    # going through coinset_client). These come from the centralized
+    # tracker so the operator sees a complete total.
+    if payload["coinset"].get("available"):
+        _direct = int(_tracker_get_count("coinset"))
+        if _direct:
+            payload["coinset"]["direct_calls"] = _direct
+            payload["coinset"]["direct_calls_by_endpoint"] = _tracker_endpoints("coinset")
+            payload["coinset"]["api_calls_total"] = (
+                payload["coinset"].get("api_calls_total", 0) + _direct
+            )
 
     # Add mempool watcher's Coinset API call count (separate HTTP client)
     try:
@@ -1395,6 +1441,15 @@ def api_diagnostics_api_stats():
             }
     except Exception as e:
         payload["dexie"]["error"] = str(e)
+
+    # Merge "direct" Dexie calls (Smart Settings, market intel, deposit
+    # advisor, fill verification, doctor, sage_node, etc.) — these
+    # bypass dexie_manager so they're invisible to the manager's stats.
+    if payload["dexie"].get("available"):
+        _direct = int(_tracker_get_count("dexie"))
+        if _direct:
+            payload["dexie"]["direct_calls"] = _direct
+            payload["dexie"]["direct_calls_by_endpoint"] = _tracker_endpoints("dexie")
 
     # --- Splash (P2P offer broadcast) ---------------------------------
     # Splash has its own /api/splash/stats endpoint, but callers of the
@@ -1492,6 +1547,49 @@ def api_diagnostics_api_stats():
             payload["tibetswap"] = {"available": False}
     except Exception as e:
         payload["tibetswap"] = {"available": False, "error": str(e)}
+
+    # Merge "direct" TibetSwap calls (token discovery, /pairs lookups
+    # from cat_resolver, smart_defaults, market intel, etc.) — these
+    # bypass amm_monitor so they're invisible to its stats. Always
+    # surface the counter; if amm_monitor isn't running we still want
+    # the direct counts to show up.
+    _tibet_direct = int(_tracker_get_count("tibetswap"))
+    if _tibet_direct:
+        if not isinstance(payload.get("tibetswap"), dict):
+            payload["tibetswap"] = {"available": False}
+        # Even when amm_monitor is offline (available=False), expose
+        # the direct calls so the modal can render *something*.
+        payload["tibetswap"]["direct_calls"] = _tibet_direct
+        payload["tibetswap"]["direct_calls_by_endpoint"] = _tracker_endpoints("tibetswap")
+        # Promote to "available" if at least one direct call landed —
+        # the panel becomes meaningful even without the AMM monitor.
+        if not payload["tibetswap"].get("available"):
+            payload["tibetswap"]["available_via_direct"] = True
+
+    # --- CoinGecko (XCH/USD price) ------------------------------------
+    # Used by Smart Settings to display USD-denominated values and to
+    # detect systemic XCH moves. No paid tier; cached 5 minutes.
+    _cg_calls = int(_tracker_get_count("coingecko"))
+    _cg_last_ago = _tracker_last_ago("coingecko")
+    payload["coingecko"] = {
+        "available": _cg_calls > 0,
+        "calls": _cg_calls,
+        "by_endpoint": _tracker_endpoints("coingecko"),
+        "last_call_ago_secs": _cg_last_ago,
+    }
+
+    # --- GitHub (release polls) ---------------------------------------
+    # Sage version check (api_server) + Splash binary download
+    # (splash_setup). Both are cached 6h+ so volume is low — we surface
+    # them so the operator can confirm the update path is alive.
+    _gh_calls = int(_tracker_get_count("github"))
+    _gh_last_ago = _tracker_last_ago("github")
+    payload["github"] = {
+        "available": _gh_calls > 0,
+        "calls": _gh_calls,
+        "by_endpoint": _tracker_endpoints("github"),
+        "last_call_ago_secs": _gh_last_ago,
+    }
 
     # F53 (2026-04-09): human-readable timestamp without microseconds.
     # Previously this returned a full ISO 8601 with microseconds + offset

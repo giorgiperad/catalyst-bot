@@ -18,6 +18,12 @@ import api_server
 from config import cfg
 from database import log_event
 
+try:
+    from api_call_tracker import record as _record_api_call
+except Exception:
+    def _record_api_call(*args, **kwargs):
+        return None
+
 
 bp = Blueprint("smart_defaults", __name__)
 
@@ -39,6 +45,7 @@ def _fetch_price_standalone(asset_id, decimals):
 
     # --- Try TibetSwap first ---
     try:
+        _record_api_call("tibetswap", "/pairs")
         resp = _req.get("https://api.v2.tibetswap.io/pairs",
                         params={"skip": 0, "limit": 200}, timeout=8)
         pairs = resp.json() if resp.status_code == 200 else []
@@ -79,6 +86,7 @@ def _fetch_price_standalone(asset_id, decimals):
 
             # Method 1: Try ticker endpoint if we have a ticker_id
             if ticker_id:
+                _record_api_call("dexie", "/v2/prices/tickers")
                 resp = _req.get(f"{dexie_base}/v2/prices/tickers",
                                 params={"ticker_id": ticker_id}, timeout=8)
                 if resp.status_code == 200:
@@ -104,6 +112,7 @@ def _fetch_price_standalone(asset_id, decimals):
 
             # Method 2: Try Dexie offers endpoint for best bid/ask
             if not price:
+                _record_api_call("dexie", "/v1/offers")
                 resp = _req.get(f"{dexie_base}/v1/offers",
                                 params={"offered": asset_id, "requested": "xch",
                                          "status": 0, "page_size": 1, "sort": "price_asc"},
@@ -165,6 +174,7 @@ def _fetch_dexie_orderbook_standalone(asset_id: str) -> dict:
     try:
         # Sell side: CAT offered for XCH (ascending = cheapest first = best ask)
         # NOTE: Dexie API uses "offered_asset_id" / "requested_asset_id" params
+        _record_api_call("dexie", "/v1/offers")
         sell_resp = _req.get(f"{dexie_base}/v1/offers", params={
             "offered_asset_id": asset_id,
             "status": 0, "page_size": 20, "sort": "price_asc"
@@ -173,6 +183,7 @@ def _fetch_dexie_orderbook_standalone(asset_id: str) -> dict:
         sell_offers = sell_resp.json().get("offers", []) if sell_ok else []
 
         # Buy side: XCH offered for CAT (descending = highest first = best bid)
+        _record_api_call("dexie", "/v1/offers")
         buy_resp = _req.get(f"{dexie_base}/v1/offers", params={
             "requested_asset_id": asset_id,
             "status": 0, "page_size": 20, "sort": "price_desc"

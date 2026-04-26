@@ -120,6 +120,11 @@ def get_latest_release() -> Optional[Dict]:
     or None on failure.
     """
     try:
+        try:
+            from api_call_tracker import record as _t
+            _t("github", f"/repos/{GITHUB_REPO}/releases/latest")
+        except Exception:
+            pass
         r = requests.get(
             GITHUB_API_URL,
             headers={"Accept": "application/vnd.github.v3+json"},
