@@ -94,6 +94,15 @@ class PriceEngine:
         self._last_crossed_warn: float = 0
         self._last_empty_warn: float = 0
         self._warn_cooldown_secs: int = 120  # max once per 2 min
+        # Stuck-data detection: when Dexie's ticker returns the SAME broken
+        # bid/ask (or the SAME stale fallback field) repeatedly, the data is
+        # frozen on Dexie's side, not transiently flickering. Drop the noise
+        # to once per hour after the same value has fired the warning twice.
+        self._stuck_cooldown_secs: int = 3600
+        self._last_crossed_signature: str = ""
+        self._crossed_repeats: int = 0
+        self._last_empty_signature: str = ""
+        self._empty_repeats: int = 0
 
     # -------------------------------------------------------------------
     # Public API
@@ -379,12 +388,24 @@ class PriceEngine:
                     return (bid_d + ask_d) / 2
                 elif bid_d > ask_d and ask_d > 0:
                     _now = time.time()
-                    if _now - self._last_crossed_warn >= self._warn_cooldown_secs:
+                    sig = f"{bid_d}/{ask_d}"
+                    if sig == self._last_crossed_signature:
+                        self._crossed_repeats += 1
+                    else:
+                        self._last_crossed_signature = sig
+                        self._crossed_repeats = 1
+                    cooldown = (self._stuck_cooldown_secs
+                                if self._crossed_repeats >= 2
+                                else self._warn_cooldown_secs)
+                    if _now - self._last_crossed_warn >= cooldown:
+                        suffix = (f"appears stuck on these values; "
+                                   f"suppressed for {int(cooldown // 60)}m"
+                                   if self._crossed_repeats >= 2
+                                   else f"suppressed for {self._warn_cooldown_secs}s")
                         log_event("warning", "dexie_crossed_market",
-                                  f"Dexie returned crossed bid/ask (bid={bid_d}, ask={ask_d}) "
-                                  f"— bid/ask midpoint skipped, falling back to "
-                                  f"current_avg_price (warning suppressed for "
-                                  f"{self._warn_cooldown_secs}s)")
+                                  f"Dexie ticker returned crossed bid/ask "
+                                  f"(bid={bid_d}, ask={ask_d}) — using "
+                                  f"current_avg_price instead ({suffix})")
                         self._last_crossed_warn = _now
             except InvalidOperation:
                 pass
@@ -409,7 +430,7 @@ class PriceEngine:
             last_price_age = time.time() - self._last_price_time
             if self._last_price_time > 0 and last_price_age > max_stale_secs:
                 log_event("warning", "dexie_fallback_too_stale",
-                          f"Dexie orderbook empty/crossed + last accepted price is "
+                          f"Dexie ticker bid/ask unusable + last accepted price is "
                           f"{last_price_age:.0f}s old (> {max_stale_secs}s max). "
                           f"Refusing to quote — price too uncertain.")
                 return None
@@ -421,12 +442,26 @@ class PriceEngine:
                         fallback_price = Decimal(str(val))
                         if fallback_price > 0:
                             _now = time.time()
-                            if _now - self._last_empty_warn >= self._warn_cooldown_secs:
-                                log_event("warning", "dexie_orderbook_empty",
-                                          f"Dexie orderbook empty (no valid bids or asks). "
-                                          f"Using historical fallback field '{field}': "
-                                          f"{fallback_price}. Spread may be inaccurate. "
-                                          f"(suppressed for {self._warn_cooldown_secs}s)")
+                            sig = f"{field}/{fallback_price}"
+                            if sig == self._last_empty_signature:
+                                self._empty_repeats += 1
+                            else:
+                                self._last_empty_signature = sig
+                                self._empty_repeats = 1
+                            cooldown = (self._stuck_cooldown_secs
+                                        if self._empty_repeats >= 2
+                                        else self._warn_cooldown_secs)
+                            if _now - self._last_empty_warn >= cooldown:
+                                suffix = (f"appears stuck; suppressed for "
+                                           f"{int(cooldown // 60)}m"
+                                           if self._empty_repeats >= 2
+                                           else f"suppressed for "
+                                                f"{self._warn_cooldown_secs}s")
+                                log_event("warning", "dexie_ticker_unusable",
+                                          f"Dexie ticker bid/ask unavailable "
+                                          f"(thin/illiquid pair). Using "
+                                          f"historical '{field}' = "
+                                          f"{fallback_price}. ({suffix})")
                                 self._last_empty_warn = _now
                             return fallback_price
                     except InvalidOperation:
