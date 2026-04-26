@@ -344,11 +344,13 @@ def api_smart_defaults():
         liquidity_mode = (request.args.get("liquidity_mode", "two_sided") or "two_sided").strip().lower()
         if liquidity_mode not in ("two_sided", "buy_only", "sell_only"):
             liquidity_mode = "two_sided"
+        dbx_cap = (request.args.get("dbx_cap", "false") or "").strip().lower() in ("1", "true", "yes")
         return api_server._calculate_smart_defaults(
             xch_reserve=xch_res,
             cat_reserve=cat_res,
             risk_profile=risk_profile,
             liquidity_mode=liquidity_mode,
+            dbx_cap=dbx_cap,
         )
     except Exception as e:
         import traceback
@@ -357,7 +359,7 @@ def api_smart_defaults():
         log_event("error", "smart_defaults", f"Smart Settings failed: {e}")
         return jsonify({"error": "Smart Settings calculation failed", "code": "SERVER_ERROR"}), 500
 
-def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="balanced", liquidity_mode="two_sided"):
+def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="balanced", liquidity_mode="two_sided", dbx_cap=False):
     """Smart Defaults v2 — data-driven settings from 30 days of market data.
 
     Replaces v1's snapshot-only approach with deep analysis:
@@ -2863,6 +2865,37 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
         and float(_smart_sniper_size or 0) > 0
         and int(_smart_sniper_prep or 0) > 0
     )
+
+    # ═══ DBX cap clamp (opt-in via the pre-prompt) ════════════════════════
+    # When the user picks "Maximize DBX" before Smart Settings runs, clamp
+    # the spread + requote so every tier of the resulting ladder lands
+    # inside Dexie's incentive cap and stays reward-eligible. The cap is
+    # the tighter of the two sides' caps (already computed in
+    # _smart_dbx_defaults). Only applies if the calculated spread is wider
+    # than the cap — otherwise the result already qualifies and we leave
+    # everything alone.
+    _dbx_cap_meta = _smart_dbx_defaults(asset_id) if dbx_cap else None
+    if dbx_cap and _dbx_cap_meta and _dbx_cap_meta.get("pair_incentivized"):
+        _cap_bps = int(_dbx_cap_meta.get("dbx_max_spread_bps") or 0)
+        if _cap_bps > 0:
+            _orig_base = base_spread_bps
+            if base_spread_bps > _cap_bps:
+                base_spread_bps = _cap_bps
+            if max_spread_bps > _cap_bps:
+                max_spread_bps = _cap_bps
+            if min_spread_bps > _cap_bps:
+                min_spread_bps = _cap_bps
+            # Requote scales with the (now tighter) spread so requotes
+            # don't slingshot offers outside the cap. Floor at 25 bps so
+            # we don't end up requoting on every micro-move.
+            if _orig_base > _cap_bps and _orig_base > 0:
+                _scale = Decimal(str(_cap_bps)) / Decimal(str(_orig_base))
+                requote_bps = max(Decimal("25"), Decimal(str(requote_bps)) * _scale)
+            messages.append(
+                f"DBX cap applied: spread tightened to {_cap_bps/100:.1f}% "
+                f"(from {_orig_base/100:.1f}%) so all tiers stay reward-eligible"
+            )
+
     result = {
         # Smart Pricing
         "dynamic_spread_enabled": has_both_prices,
