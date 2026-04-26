@@ -204,6 +204,165 @@ def check_db_integrity() -> Dict[str, object]:
     }
 
 
+def attempt_db_recovery() -> Dict[str, object]:
+    """If ``bot.db`` is corrupt, salvage what's readable and swap in a clean
+    file. Mirrors ``scripts/recover_db.py`` for use during desktop_app
+    startup so users don't have to run a separate script.
+
+    Returns a result dict with::
+
+        {"action": "ok" | "recovered" | "failed",
+         "result": <integrity message>,
+         "skipped_statements": int,           # only if recovered
+         "corrupt_backup": "<filename>",      # only if recovered
+         "error": "<reason>"}                 # only if failed
+
+    SAFETY — caller must guarantee no SQLite connection is open against
+    ``bot.db`` when this is invoked (the swap rename will fail on Windows
+    if any handle is alive). The right place to call this is from the
+    desktop_app entrypoint, after the singleton lock is acquired and
+    before ``init_database()`` is called.
+    """
+    import datetime as _dt
+    import shutil as _sh
+    from pathlib import Path as _P
+
+    db = _P(DB_PATH)
+    if not db.exists():
+        # Nothing to check. init_database() will create a fresh file.
+        return {"action": "ok", "result": "no_db_file"}
+
+    check = check_db_integrity()
+    if check.get("ok"):
+        return {"action": "ok", "result": "ok"}
+
+    stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    corrupt_backup = db.with_name(f"bot.db.corrupt_{stamp}")
+    recovered = db.with_name("bot.db.recovered")
+    if recovered.exists():
+        try:
+            recovered.unlink()
+        except Exception:
+            pass
+
+    # Step 1: forensic backup of the corrupt original (DB + WAL + SHM)
+    try:
+        _sh.copy2(db, corrupt_backup)
+        for suffix in ("-wal", "-shm"):
+            side = db.with_suffix(db.suffix + suffix)
+            if side.exists():
+                try:
+                    _sh.copy2(side, corrupt_backup.with_suffix(corrupt_backup.suffix + suffix))
+                except Exception:
+                    pass
+    except Exception as e:
+        return {"action": "failed", "result": str(check.get("result")),
+                "error": f"backup_failed: {e}"}
+
+    # Step 2: dump readable rows into a fresh DB. Try iterdump() first —
+    # it preserves data when corruption is mild. If iterdump itself
+    # explodes (the page that holds the schema is the corrupt one), fall
+    # back to renaming the corrupt file aside and letting init_database()
+    # create a fresh one. Better to lose some history than to leave the
+    # user unable to start the app.
+    skipped = 0
+    iterdump_ok = False
+    try:
+        src = sqlite3.connect(str(db), timeout=10)
+        dst = sqlite3.connect(str(recovered), timeout=10)
+        try:
+            with dst:
+                for stmt in src.iterdump():
+                    try:
+                        dst.execute(stmt)
+                    except Exception:
+                        skipped += 1
+            iterdump_ok = True
+        finally:
+            src.close()
+            dst.close()
+    except Exception:
+        # iterdump itself failed (severe corruption). Drop the partial
+        # recovered file so the fresh-start fallback below gets a clean
+        # path to swap into.
+        iterdump_ok = False
+        try:
+            recovered.unlink()
+        except Exception:
+            pass
+
+    if not iterdump_ok:
+        # Fresh-start fallback. The corrupt original is already saved as
+        # corrupt_backup, so no data is lost — it just isn't auto-merged.
+        # Remove the live files so init_database can build a clean DB.
+        try:
+            if db.exists():
+                db.unlink()
+            for suffix in ("-wal", "-shm"):
+                side = db.with_suffix(db.suffix + suffix)
+                if side.exists():
+                    try:
+                        side.unlink()
+                    except Exception:
+                        pass
+        except Exception as e:
+            return {"action": "failed", "result": str(check.get("result")),
+                    "error": f"fresh_start_unlink_failed: {e}"}
+        return {
+            "action": "recovered",
+            "result": str(check.get("result")),
+            "skipped_statements": -1,  # signals fresh-start, no rows kept
+            "corrupt_backup": corrupt_backup.name,
+            "fallback": "fresh_start",
+        }
+
+    # Step 3: verify the recovered file passes integrity_check before swap
+    try:
+        v = sqlite3.connect(str(recovered), timeout=5)
+        try:
+            rows = v.execute("PRAGMA integrity_check").fetchall()
+        finally:
+            v.close()
+    except Exception as e:
+        try:
+            recovered.unlink()
+        except Exception:
+            pass
+        return {"action": "failed", "result": str(check.get("result")),
+                "error": f"verify_failed: {e}"}
+    msgs = [str(r[0]) for r in rows if r and r[0] is not None]
+    if not (len(msgs) == 1 and msgs[0].strip().lower() == "ok"):
+        try:
+            recovered.unlink()
+        except Exception:
+            pass
+        return {"action": "failed", "result": str(check.get("result")),
+                "error": f"recovered_db_still_fails: {'; '.join(msgs[:3])}"}
+
+    # Step 4: atomically swap. Remove the WAL/SHM that belong to the old
+    # main DB so the recovered file owns its own WAL on first open.
+    try:
+        db.unlink()
+        for suffix in ("-wal", "-shm"):
+            side = db.with_suffix(db.suffix + suffix)
+            if side.exists():
+                try:
+                    side.unlink()
+                except Exception:
+                    pass
+        recovered.rename(db)
+    except Exception as e:
+        return {"action": "failed", "result": str(check.get("result")),
+                "error": f"swap_failed: {e}"}
+
+    return {
+        "action": "recovered",
+        "result": str(check.get("result")),
+        "skipped_statements": int(skipped),
+        "corrupt_backup": corrupt_backup.name,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Schema — all tables defined here
 # ---------------------------------------------------------------------------

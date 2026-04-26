@@ -1239,6 +1239,34 @@ def main(argv=None):
     # bug that survived the singleton lock alone.
     _attach_to_kill_on_close_job()
 
+    # Auto-recover the SQLite DB if the previous run left it corrupt.
+    # The singleton lock guarantees no other process holds bot.db open,
+    # which is the precondition for safely swapping in a recovered file.
+    # Without this, a once-corrupt DB persists across restarts and bleeds
+    # "database disk image is malformed" errors mid-trade until the user
+    # manually runs scripts/recover_db.py.
+    try:
+        from database import attempt_db_recovery
+        _rec = attempt_db_recovery() or {}
+        _action = _rec.get("action")
+        if _action == "recovered":
+            print(
+                f"\n  [DB] Auto-recovered corrupt bot.db — backed up as "
+                f"{_rec.get('corrupt_backup')}, "
+                f"{_rec.get('skipped_statements', 0)} unreadable statement(s) skipped",
+                flush=True,
+            )
+        elif _action == "failed":
+            print(
+                f"\n  [DB] WARNING: bot.db is corrupt and auto-recovery "
+                f"failed: {_rec.get('error')}\n"
+                f"  Original: {_rec.get('result')}\n"
+                f"  Run: python scripts/recover_db.py",
+                flush=True,
+            )
+    except Exception as _rec_err:
+        print(f"\n  [DB] Auto-recovery skipped: {_rec_err}", flush=True)
+
     if not args.flask and not args.dev and not args.show_console:
         _hide_windows_console()
 
