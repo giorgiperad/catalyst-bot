@@ -3727,6 +3727,46 @@ class OfferManager:
 
         open_buy, open_sell, closed = classify_offers_from_list(all_offers, cfg.CAT_ASSET_ID)
 
+        # Suspicious-empty guard: Sage's get_offers occasionally returns a
+        # valid-but-empty response during a sync hiccup — same RPC blip
+        # that produces "get_coins(selectable) returned 0 coins (total=0)"
+        # warnings. Without this guard the empty response would (a) flush
+        # the cache, (b) make every cycle's mass_disappearance_guard
+        # strike, and (c) eventually trip the 3-strike acceptance and
+        # pause trading on a wallet that's actually fine.
+        #
+        # Treat "we had >=5 offers a moment ago and now Sage returns 0"
+        # as a transient hiccup: keep the cached view, mark fresh=False,
+        # and let the fill-tracker's existing not-fresh check absorb the
+        # cycle. Real bulk cancellations recover on the very next poll
+        # (mass guard accepts after 3 strikes anyway), so the false-
+        # positive cost is negligible compared to a paused bot.
+        prev_total = (
+            len(self._wallet_sync_cache["buy"])
+            + len(self._wallet_sync_cache["sell"])
+        )
+        curr_total = len(open_buy) + len(open_sell)
+        if curr_total == 0 and prev_total >= 5:
+            self._wallet_sync_meta.update({
+                "fresh": False,
+                "using_cache": True,
+                "consecutive_failures": int(self._wallet_sync_meta.get("consecutive_failures", 0) or 0) + 1,
+                "last_error": f"suspicious_empty_offers (prev={prev_total})",
+                "last_failure_at": time.time(),
+                "cache_size": prev_total,
+            })
+            log_event(
+                "warning",
+                "wallet_sync_suspicious_empty",
+                f"Wallet returned 0 offers but had {prev_total} a moment ago — "
+                f"treating as Sage sync hiccup, using cached view this cycle",
+            )
+            return (
+                [dict(o) for o in self._wallet_sync_cache["buy"]],
+                [dict(o) for o in self._wallet_sync_cache["sell"]],
+                [dict(o) for o in self._wallet_sync_cache["closed"]],
+            )
+
         previous_failures = int(self._wallet_sync_meta.get("consecutive_failures", 0) or 0)
         self._wallet_sync_cache["buy"] = [dict(o) for o in open_buy]
         self._wallet_sync_cache["sell"] = [dict(o) for o in open_sell]
