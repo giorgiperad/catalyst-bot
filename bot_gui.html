@@ -16402,6 +16402,19 @@
             if (selector) selector.value = '';
             if (settingsSelector) settingsSelector.value = '';
 
+            // Clear all token icons + tab-pill identity strips. Without
+            // this the previous pair's logo remained visible next to the
+            // empty "-- Choose a Trading Pair --" dropdown after a fresh
+            // start (DB rebuild, wallet switch, etc.) — the .env still
+            // had the old CAT_ASSET_ID, so the icon got set on the first
+            // status tick before this reset path ran. Passing '' to
+            // updateTokenIcons hides every .cc-token-icon and
+            // .v4-tab-token-pill on the page in one pass.
+            try { _tokenPreviewUrl = ''; } catch (_) {}
+            if (typeof updateTokenIcons === 'function') {
+                try { updateTokenIcons(''); } catch (_) {}
+            }
+
             document.querySelectorAll('#catNameBalance, #catNameBalance2, #catNameCoinTrack').forEach((label) => {
                 label.textContent = 'Select Pair';
             });
