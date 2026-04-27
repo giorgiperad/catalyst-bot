@@ -518,6 +518,17 @@ def reclassify_tier_spare_coins() -> Dict[str, int]:
             current_tier = (c.get("assigned_tier") or "").lower()
             if not coin_id or amount <= 0:
                 continue
+            # Skip non-standard tiers (sniper, fees) — `classify_coin`
+            # only knows about inner/mid/outer/extreme via live_sizes.
+            # Sniper coins are tiny relative to the main tiers and would
+            # always be classified as DUST by the size-based classifier,
+            # which destroys the sniper pool every reclassify pass and
+            # forces an unnecessary topup absorption on every cycle. The
+            # sniper/fees tiers manage their own sizing outside this
+            # path; leaving these coins alone is correct.
+            if current_tier in ("sniper", "fees"):
+                moved["unchanged"] += 1
+                continue
             try:
                 cls = classify_coin(amount, live_sizes)
             except Exception:
