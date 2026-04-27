@@ -193,6 +193,44 @@ class TestGetOpenOffers(_TempDB):
         buys = _db.get_open_offers(side="buy", cat_asset_id="assetA")
         self.assertNotIn("b1", {o["trade_id"] for o in buys})
 
+    def test_excludes_pending_fill_verification_by_default(self):
+        _db.update_offer_lifecycle_state("b1", "mempool_observed")
+        offers = _db.get_open_offers(cat_asset_id="assetA")
+        self.assertNotIn("b1", {o["trade_id"] for o in offers})
+
+        with_pending = _db.get_open_offers(
+            cat_asset_id="assetA",
+            include_mempool_observed=True,
+        )
+        self.assertIn("b1", {o["trade_id"] for o in with_pending})
+
+    def test_get_stats_excludes_non_actionable_open_rows(self):
+        _db.update_offer_lifecycle_state("b1", "mempool_observed")
+        _db.update_offer_lifecycle_state("s1", "cancel_requested")
+
+        stats = _db.get_stats(cat_asset_id="assetA")
+
+        self.assertEqual(stats["open_offers"], 0)
+        self.assertEqual(stats["open_buys"], 0)
+        self.assertEqual(stats["open_sells"], 0)
+
+    def test_get_offers_for_repost_excludes_non_actionable_open_rows(self):
+        conn = _db.get_connection()
+        conn.execute(
+            "UPDATE offers SET offer_bech32='offer1fake' WHERE trade_id='b1'"
+        )
+        conn.execute(
+            "UPDATE offers SET offer_bech32='offer1fake' WHERE trade_id='s1'"
+        )
+        conn.commit()
+        _db.update_offer_lifecycle_state("b1", "mempool_observed")
+
+        repostable = _db.get_offers_for_repost(cat_asset_id="assetA")
+        trade_ids = {o["trade_id"] for o in repostable}
+
+        self.assertNotIn("b1", trade_ids)
+        self.assertIn("s1", trade_ids)
+
 
 @unittest.skipIf(_SKIP is not None, f"database unavailable: {_SKIP}")
 class TestRecordFill(_TempDB):

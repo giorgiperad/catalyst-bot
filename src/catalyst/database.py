@@ -1801,6 +1801,17 @@ def update_offer_bech32(trade_id: str, offer_bech32: str) -> bool:
             pass
         return False
 
+_NON_ACTIONABLE_OPEN_LIFECYCLE_STATES = (
+    "cancel_requested",
+    "cancel_sent",
+    "mempool_observed",
+)
+
+
+def _actionable_open_lifecycle_clause() -> str:
+    states = ", ".join(f"'{state}'" for state in _NON_ACTIONABLE_OPEN_LIFECYCLE_STATES)
+    return f"(lifecycle_state IS NULL OR lifecycle_state NOT IN ({states}))"
+
 
 def get_offers_for_repost(cat_asset_id: str = None) -> List[Dict]:
     """Get open offers with their bech32 strings for Dexie repost.
@@ -1809,8 +1820,11 @@ def get_offers_for_repost(cat_asset_id: str = None) -> List[Dict]:
     Used during startup to repost offers without calling wallet RPC.
     """
     conn = get_connection()
-    query = """SELECT trade_id, offer_bech32, dexie_id, side
-               FROM offers WHERE status='open' AND offer_bech32 IS NOT NULL"""
+    query = f"""SELECT trade_id, offer_bech32, dexie_id, side
+                FROM offers
+                WHERE status='open'
+                  AND offer_bech32 IS NOT NULL
+                  AND {_actionable_open_lifecycle_clause()}"""
     params = []
     if cat_asset_id:
         query += " AND cat_asset_id=?"
@@ -1820,7 +1834,8 @@ def get_offers_for_repost(cat_asset_id: str = None) -> List[Dict]:
 
 
 def get_open_offers(side: str = None, cat_asset_id: str = None,
-                    include_pending_cancel: bool = False) -> List[Dict]:
+                    include_pending_cancel: bool = False,
+                    include_mempool_observed: bool = False) -> List[Dict]:
     """Get all open offers, optionally filtered by side and/or CAT pair.
 
     By default, excludes offers whose lifecycle_state is 'cancel_requested'
@@ -1832,6 +1847,9 @@ def get_open_offers(side: str = None, cat_asset_id: str = None,
     Pass include_pending_cancel=True only when you specifically need to
     examine pending-cancel offers (e.g. the bot_health verifier loop that
     re-checks them against Dexie/Sage).
+    Pass include_mempool_observed=True only when investigating parked
+    fill-verification rows; they are protected in DB but hidden from normal
+    active-book views by default.
 
     Returns list of dicts with all offer fields.
     """
@@ -1839,8 +1857,18 @@ def get_open_offers(side: str = None, cat_asset_id: str = None,
     query = "SELECT * FROM offers WHERE status='open'"
     params = []
 
+    excluded_lifecycle_states = []
     if not include_pending_cancel:
-        query += " AND (lifecycle_state IS NULL OR lifecycle_state NOT IN ('cancel_requested', 'cancel_sent'))"
+        excluded_lifecycle_states.extend(("cancel_requested", "cancel_sent"))
+    if not include_mempool_observed:
+        excluded_lifecycle_states.append("mempool_observed")
+    if excluded_lifecycle_states:
+        placeholders = ", ".join("?" for _ in excluded_lifecycle_states)
+        query += (
+            " AND (lifecycle_state IS NULL "
+            f"OR lifecycle_state NOT IN ({placeholders}))"
+        )
+        params.extend(excluded_lifecycle_states)
 
     if side:
         query += " AND side=?"
@@ -3964,17 +3992,25 @@ def get_stats(cat_asset_id: str = None, since: str = None) -> Dict:
     stats = {}
 
     # Open offers count
+    open_lifecycle_clause = _actionable_open_lifecycle_clause()
     if cat_asset_id:
         row = conn.execute(
-            "SELECT COUNT(*) as cnt FROM offers WHERE status='open' AND cat_asset_id=?",
+            "SELECT COUNT(*) as cnt FROM offers "
+            f"WHERE status='open' AND {open_lifecycle_clause} AND cat_asset_id=?",
             (cat_asset_id,)
         ).fetchone()
     else:
-        row = conn.execute("SELECT COUNT(*) as cnt FROM offers WHERE status='open'").fetchone()
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM offers "
+            f"WHERE status='open' AND {open_lifecycle_clause}"
+        ).fetchone()
     stats["open_offers"] = row["cnt"]
 
     # Open offers by side
-    query_base = "SELECT side, COUNT(*) as cnt FROM offers WHERE status='open'"
+    query_base = (
+        "SELECT side, COUNT(*) as cnt FROM offers "
+        f"WHERE status='open' AND {open_lifecycle_clause}"
+    )
     params = []
     if cat_asset_id:
         query_base += " AND cat_asset_id=?"
