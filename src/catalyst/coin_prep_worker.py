@@ -954,6 +954,32 @@ class CoinPrepWorker:
         my_tx_ids = {tx.lstrip("0x").lower()
                      for tx in self._extract_sage_transaction_ids(result) if tx}
         expected_after = len(coins) - len(extra_ids)
+        # Compute the expected post-merge reserve amount so we can poll
+        # for the new coin specifically — not just for the total count
+        # to drop. Without this, "count dropped" is satisfied the moment
+        # the inputs disappear from mempool, but the new merged-output
+        # coin can lag the wallet RPC by several seconds. The downstream
+        # _designate_final_sweep then sees only the trading coins and
+        # tags reserve=0, leaving the visible-but-unowned coin to be
+        # picked up later by the bot's startup reconcile (and missing
+        # the post-prep deposit-advisory baseline write).
+        try:
+            _expected_merged_amount = (
+                int(reserve_coin.get("amount", 0))
+                + int(extra_total)
+                - int(self._tx_fee_mojos())
+            )
+        except Exception:
+            _expected_merged_amount = 0
+        # Identify the input coin_ids so we can distinguish the new
+        # merged-output coin from any pre-existing wallet coins.
+        _input_ids = set()
+        for c in [reserve_coin] + extra_coins:
+            _cid = str(c.get("coin_id", "")).strip().lower()
+            if _cid.startswith("0x"):
+                _cid = _cid[2:]
+            if _cid:
+                _input_ids.add(_cid)
 
         # 90s ceiling — typical Chia block time is ~52s, two blocks is
         # plenty for a 2-input combine. Beyond that something else is
@@ -973,12 +999,34 @@ class CoinPrepWorker:
                 # by coin count. If counts dropped to the expected level, done.
                 visible = self._get_coins_via_rpc(self.xch_wallet_id, "xch-fee-cleanup-confirm", selectable_only=True) or []
                 confirmed_count = self.get_confirmed_coin_count(self.xch_wallet_id)
-                if len(visible) <= expected_after and confirmed_count <= expected_after:
+                # Strict success: count matches AND a NEW (non-input)
+                # coin with the expected merged amount is visible. This
+                # eliminates the post-merge reserve-not-tagged race.
+                _merged_visible = False
+                if _expected_merged_amount > 0:
+                    for vc in visible:
+                        v_cid = str(vc.get("coin_id", "")).strip().lower()
+                        if v_cid.startswith("0x"):
+                            v_cid = v_cid[2:]
+                        if v_cid in _input_ids:
+                            continue
+                        v_amt = int(vc.get("amount", 0) or 0)
+                        # Allow 0.001 XCH / 1000 mojos tolerance for
+                        # fee-rounding artefacts from Sage.
+                        if abs(v_amt - _expected_merged_amount) <= 1_000_000_000:
+                            _merged_visible = True
+                            break
+                if (len(visible) <= expected_after
+                        and confirmed_count <= expected_after
+                        and (_merged_visible or _expected_merged_amount <= 0)):
                     self.log(f"XCH fee cleanup confirmed after {poll * poll_interval}s")
                     return True
-                # TX no longer pending but counts haven't updated yet —
-                # likely a sync lag, give it another tick or two.
-                if my_tx_ids and poll >= 2:
+                # TX no longer pending but counts/coin haven't updated yet —
+                # likely a sync lag, give it another tick or two. Wait
+                # one extra cycle past the previous threshold so the
+                # merged-coin visibility check has a real chance to
+                # succeed before we fall back to "assuming success".
+                if my_tx_ids and poll >= 3:
                     self.log(f"XCH fee cleanup TX cleared mempool but coin view lags — assuming success")
                     return True
 
