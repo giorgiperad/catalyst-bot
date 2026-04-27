@@ -77,6 +77,24 @@ class _TempDB(unittest.TestCase):
         _db._local.conn = None
         _db.init_database()
 
+        # Isolate the fresh-start flag to a per-test path. The default
+        # path is a fixed file under src/catalyst/, which is shared
+        # across pytest-xdist workers and causes cross-worker races
+        # (one worker's tearDown deletes another worker's flag mid-test).
+        # Each test gets its own temp file; tearDown restores the
+        # original module path.
+        self._orig_fresh_start_flag = api_server._FRESH_START_FLAG
+        self._fresh_start_flag_tmp = tempfile.NamedTemporaryFile(
+            suffix=".fresh_start_chosen", delete=False
+        )
+        self._fresh_start_flag_tmp.close()
+        # Start clean: remove the file so _fresh_start_is_set() returns False
+        try:
+            os.unlink(self._fresh_start_flag_tmp.name)
+        except Exception:
+            pass
+        api_server._FRESH_START_FLAG = self._fresh_start_flag_tmp.name
+
         api_server.app.testing = True
         self.client = api_server.app.test_client()
         self.token = api_server._LOCAL_API_TOKEN
@@ -102,6 +120,12 @@ class _TempDB(unittest.TestCase):
             pass
         api_server._rate_limit_log.clear()
         api_server._fresh_start_clear()
+        # Restore the per-test fresh-start flag isolation
+        try:
+            os.unlink(self._fresh_start_flag_tmp.name)
+        except Exception:
+            pass
+        api_server._FRESH_START_FLAG = self._orig_fresh_start_flag
         api_server._session_start_time = self._orig_session_start_time
         api_server._run_history_cutoff = self._orig_run_history_cutoff
         api_server._active_cat.clear()

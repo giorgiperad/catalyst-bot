@@ -1,11 +1,13 @@
 name: Code Quality
 
-# Runs on every push to master and on pull requests
+# Runs on every push to test/master and on pull requests targeting them.
+# Day-to-day work merges into `test`; `master` is the release-tag source
+# and only receives promotions from `test` when the user approves.
 on:
   push:
-    branches: [master]
+    branches: [test, master]
   pull_request:
-    branches: [master]
+    branches: [test, master]
 
 jobs:
   lint-and-syntax:
