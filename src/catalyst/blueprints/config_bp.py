@@ -14,10 +14,11 @@ Named `config_bp` (not `config`) to avoid shadowing the top-level
 from __future__ import annotations
 
 import json as _json
+import sys
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, current_app, jsonify, request
 
 import api_server
 from config import cfg
@@ -26,6 +27,19 @@ from tx_fees import get_fee_settings_snapshot
 
 
 bp = Blueprint("config_bp", __name__)
+
+
+def _api_server():
+    """Return the currently loaded api_server module.
+
+    Some tests reload api_server while Flask blueprints remain imported.
+    Looking it up lazily keeps these routes attached to the live module state.
+    """
+    try:
+        owner = current_app.config.get("_CATALYST_API_SERVER_MODULE")
+        return owner or sys.modules.get("api_server", api_server)
+    except RuntimeError:
+        return sys.modules.get("api_server", api_server)
 
 
 def _apply_sage_change_address_setting() -> dict:
@@ -711,17 +725,19 @@ def api_check_resume():
 
     Returns can_resume + offer details so the GUI can show a resume modal.
     """
-    bot = api_server.bot
-    cfg = api_server.cfg
+    server = _api_server()
+    bot = server.bot
+    cfg = server.cfg
     if bot and getattr(bot, "_loop_count", 0) > 0:
         return jsonify({"can_resume": False, "has_session": True,
                         "buy_count": 0, "sell_count": 0, "reason": "bot_already_running"})
-    if api_server._fresh_start_is_set():
+    if server._fresh_start_is_set():
         return jsonify({"can_resume": False, "has_session": False,
                         "buy_count": 0, "sell_count": 0, "reason": "fresh_start_chosen"})
     try:
         from wallet import get_all_offers, classify_offers_from_list
-        asset_id = api_server._active_cat.get("asset_id") or (cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else "")
+        active_cat = server._active_cat
+        asset_id = active_cat.get("asset_id") or (cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else "")
         offers = get_all_offers(include_completed=False, start=0, end=200)
         if not offers:
             return jsonify({"can_resume": False, "has_session": False,
@@ -740,11 +756,11 @@ def api_check_resume():
             saved["max_sell"] = int(cfg.MAX_ACTIVE_SELL)
         if hasattr(cfg, "SPREAD_BPS"):
             saved["spread_bps"] = float(cfg.SPREAD_BPS)
-        saved["cat_name"] = api_server._active_cat.get("name") or getattr(cfg, "CAT_NAME", "CAT")
-        saved["cat_asset_id"] = api_server._active_cat.get("asset_id") or getattr(cfg, "CAT_ASSET_ID", "")
-        saved["cat_wallet_id"] = api_server._active_cat.get("wallet_id") or getattr(cfg, "CAT_WALLET_ID", None)
-        saved["cat_decimals"] = api_server._active_cat.get("decimals") or getattr(cfg, "CAT_DECIMALS", 3)
-        saved["cat_ticker_id"] = api_server._active_cat.get("ticker_id") or getattr(cfg, "CAT_TICKER_ID", "")
+        saved["cat_name"] = active_cat.get("name") or getattr(cfg, "CAT_NAME", "CAT")
+        saved["cat_asset_id"] = active_cat.get("asset_id") or getattr(cfg, "CAT_ASSET_ID", "")
+        saved["cat_wallet_id"] = active_cat.get("wallet_id") or getattr(cfg, "CAT_WALLET_ID", None)
+        saved["cat_decimals"] = active_cat.get("decimals") or getattr(cfg, "CAT_DECIMALS", 3)
+        saved["cat_ticker_id"] = active_cat.get("ticker_id") or getattr(cfg, "CAT_TICKER_ID", "")
 
         # Detect gap closer activity via (1) open boost offers + (2) recent events.
         gap_closer_info = {"active": False, "count": 0}

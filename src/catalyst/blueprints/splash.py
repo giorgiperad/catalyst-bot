@@ -9,9 +9,10 @@ attribute access so reassignments (`create_bot()`) are picked up.
 from __future__ import annotations
 
 import hashlib
+import sys
 import time
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, current_app, jsonify, request
 
 import api_server
 from config import cfg
@@ -19,6 +20,15 @@ from database import log_event
 
 
 bp = Blueprint("splash", __name__)
+
+
+def _api_server():
+    """Return the currently loaded api_server module for reload-safe routes."""
+    try:
+        owner = current_app.config.get("_CATALYST_API_SERVER_MODULE")
+        return owner or sys.modules.get("api_server", api_server)
+    except RuntimeError:
+        return sys.modules.get("api_server", api_server)
 
 
 @bp.route("/api/splash/stats")
@@ -200,12 +210,14 @@ def api_splash_incoming():
     Loopback-only and token-exempt, but rate-limited to prevent a
     pathological flood from amplifying into unbounded DB writes.
     """
+    server = _api_server()
+    cfg = server.cfg
     if not getattr(cfg, "SPLASH_RECEIVE_ENABLED", False):
         return jsonify({"error": "Splash receive disabled"}), 403
 
     # Dedicated rate limiter (defined in api_server) — 200/sec is generous
     # for a real local Splash binary but stops abuse.
-    if api_server._splash_incoming_rate_limited():
+    if server._splash_incoming_rate_limited():
         return jsonify({"error": "rate_limited"}), 429
 
     data = request.get_json(silent=True)
@@ -233,16 +245,16 @@ def api_splash_incoming():
         if was_new:
             log_event("debug", "splash_received",
                       f"Received new offer from Splash (fp: {fp[:16]}...)")
-            bot = api_server.bot
+            bot = server.bot
             if bot:
                 try:
-                    api_server.events.emit("splash_incoming", bot.get_splash_receive_stats())
+                    server.events.emit("splash_incoming", bot.get_splash_receive_stats())
                 except Exception:
                     pass
 
         return jsonify({"ok": True, "new": was_new})
     except Exception as e:
-        return api_server._api_error(e, request.path)
+        return server._api_error(e, request.path)
 
 
 @bp.route("/api/splash/incoming/list")

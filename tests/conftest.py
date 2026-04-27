@@ -130,6 +130,7 @@ import pytest
 # Snapshot these at first conftest load — these are the real modules the
 # bot ships, and the ones tests most commonly stub.
 _ISOLATION_GUARDED = (
+    "api_server",
     "database", "wallet", "wallet_sage", "wallet_chia",
     "coin_manager", "coin_prep_worker", "bot_health", "bot_loop",
     "fill_tracker", "offer_manager", "price_engine",

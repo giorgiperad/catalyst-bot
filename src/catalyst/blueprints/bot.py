@@ -22,7 +22,7 @@ import time
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from flask import Blueprint, Response, jsonify, request
+from flask import Blueprint, Response, current_app, jsonify, request
 
 import api_server
 from config import cfg
@@ -39,6 +39,19 @@ except Exception:
 
 
 bp = Blueprint("bot", __name__)
+
+
+def _api_server():
+    """Return the currently loaded api_server module.
+
+    Flask keeps route callables registered even if tests reload api_server;
+    resolving the module lazily avoids reading stale bot/events state.
+    """
+    try:
+        owner = current_app.config.get("_CATALYST_API_SERVER_MODULE")
+        return owner or sys.modules.get("api_server", api_server)
+    except RuntimeError:
+        return sys.modules.get("api_server", api_server)
 
 
 @bp.route("/api/events")
@@ -86,8 +99,9 @@ def api_bot_start():
     Checks wallet sync status, CAT config, and basic sanity
     before allowing the bot to start. V1 had validate_start().
     """
-    bot = api_server.bot
-    cfg = api_server.cfg
+    server = _api_server()
+    bot = server.bot
+    cfg = server.cfg
     slog("GUI_ACTION", ">>> BUTTON: Start Bot")
     if not bot:
         return jsonify({"error": "Bot not initialised"}), 500
@@ -121,7 +135,7 @@ def api_bot_start():
     except Exception as e:
         warnings.append(f"Wallet check failed: {str(e)[:100]}")
 
-    signing_block_reason = api_server._get_sage_signing_block_reason()
+    signing_block_reason = server._get_sage_signing_block_reason()
     if signing_block_reason:
         errors.append(signing_block_reason)
 
@@ -193,7 +207,7 @@ def api_bot_start():
             })
         return jsonify(payload), 400
 
-    api_server._reset_runtime_session_stats()
+    server._reset_runtime_session_stats()
 
     # Start with warnings
     started = bot.start()
@@ -216,8 +230,8 @@ def api_bot_start():
     # This ensures the resume modal shows correctly on the NEXT restart —
     # the flag was only meant to suppress the modal within a single session
     # (so a hot-reload after choosing "Start Fresh" doesn't re-show it).
-    api_server._fresh_start_clear()
-    api_server.events.emit("bot_control", {"action": "started"})
+    server._fresh_start_clear()
+    server.events.emit("bot_control", {"action": "started"})
     result = {"success": True, "status": "started"}
     if warnings:
         result["warnings"] = warnings
@@ -226,13 +240,14 @@ def api_bot_start():
 @bp.route("/api/bot/stop", methods=["POST"])
 def api_bot_stop():
     """Stop the bot loop."""
-    bot = api_server.bot
+    server = _api_server()
+    bot = server.bot
     slog("GUI_ACTION", ">>> BUTTON: Stop Bot")
     if not bot:
         return jsonify({"error": "Bot not initialised"}), 500
 
     bot.stop()
-    api_server.events.emit("bot_control", {"action": "stopped"})
+    server.events.emit("bot_control", {"action": "stopped"})
     return jsonify({"status": "stopped"})
 
 @bp.route("/api/shutdown", methods=["POST"])

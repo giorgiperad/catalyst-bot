@@ -47,8 +47,9 @@ class SecurityGuardrailSourceTests(unittest.TestCase):
         bot_bp_source = (ROOT / "blueprints" / "bot.py").read_text(encoding="utf-8")
         api_source = (ROOT / "api_server.py").read_text(encoding="utf-8")
         bot_loop_source = (ROOT / "bot_loop.py").read_text(encoding="utf-8")
+        self.assertIn("signing_block_reason =", bot_bp_source)
         self.assertIn(
-            "signing_block_reason = api_server._get_sage_signing_block_reason()",
+            "_get_sage_signing_block_reason()",
             bot_bp_source,
         )
         self.assertIn("def _get_sage_signing_block_reason", api_source)

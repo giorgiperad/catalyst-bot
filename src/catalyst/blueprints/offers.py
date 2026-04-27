@@ -12,10 +12,11 @@ can still inspect it.
 from __future__ import annotations
 
 import threading
+import sys
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, current_app, jsonify, request
 
 import api_server
 from config import cfg
@@ -24,6 +25,15 @@ from super_log import slog
 
 
 bp = Blueprint("offers", __name__)
+
+
+def _api_server():
+    """Return the currently loaded api_server module for reload-safe routes."""
+    try:
+        owner = current_app.config.get("_CATALYST_API_SERVER_MODULE")
+        return owner or sys.modules.get("api_server", api_server)
+    except RuntimeError:
+        return sys.modules.get("api_server", api_server)
 
 
 def _build_fill_history_for_gui(asset_id: str, limit: int = 20) -> list:
@@ -1336,13 +1346,14 @@ def api_reset_full():
 @bp.route("/api/pnl")
 def api_pnl():
     """Get PnL summary with realised, unrealised, and round-trip details."""
-    bot = api_server.bot
-    cfg = api_server.cfg
+    server = _api_server()
+    bot = server.bot
+    cfg = server.cfg
     if not bot:
         return jsonify({"error": "Bot not initialised"}), 500
 
     try:
-        stats = api_server.get_stats(cfg.CAT_ASSET_ID, since=api_server._get_run_history_cutoff())
+        stats = server.get_stats(cfg.CAT_ASSET_ID, since=server._get_run_history_cutoff())
         inventory = bot.risk_manager.get_inventory_state()
         sniper_stats = bot.sniper.get_stats() if getattr(bot, "sniper", None) else {}
 
@@ -1354,7 +1365,7 @@ def api_pnl():
             "round_trips": stats.get("round_trips", 0),
             "win_rate": stats.get("win_rate", 0),
             "fill_rate_per_hour": stats.get("fill_rate_per_hour", 0),
-            "pending_verification_count": api_server._get_session_pending_verification_count(),
+            "pending_verification_count": server._get_session_pending_verification_count(),
             "avg_spread_capture": stats.get("avg_spread_capture", "0"),
             "net_position_cat": inventory.get("net_position_cat", "0"),
             "circuit_breaker_active": inventory.get("circuit_breaker_active", False),
@@ -1382,9 +1393,9 @@ def api_pnl():
             "avg_pnl_per_trip_xch": stats.get("avg_pnl_per_trip_xch", "0"),
         }
 
-        return jsonify(api_server._serialize_dict(pnl_data))
+        return jsonify(server._serialize_dict(pnl_data))
     except Exception as e:
-        return api_server._api_error(e, request.path)
+        return server._api_error(e, request.path)
 
 def _new_cancel_all_state():
     return {

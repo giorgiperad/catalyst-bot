@@ -783,6 +783,7 @@ def _get_live_local_offer_edges(asset_id: str) -> dict:
 # Flask App
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
+app.config["_CATALYST_API_SERVER_MODULE"] = sys.modules[__name__]
 
 # The bot loop instance (created at startup)
 bot: BotLoop = None
