@@ -5404,6 +5404,7 @@ class CoinManager:
                         pool_amount_mojos=pool_amount_mojos,
                         is_cat=is_cat,
                         tier_is_empty=tier_is_empty,
+                        inventory=inventory,
                     )
 
                     if not guard_ok:
@@ -5645,7 +5646,8 @@ class CoinManager:
     def _check_topup_reserve_guards(self, name: str, wallet_id: int,
                                     pool_amount_mojos: int,
                                     is_cat: bool,
-                                    tier_is_empty: bool = False) -> bool:
+                                    tier_is_empty: bool = False,
+                                    inventory: Optional[Dict[str, list]] = None) -> bool:
         """Return True if a split of `pool_amount_mojos` is permitted.
 
         Checks (in order):
@@ -5657,11 +5659,19 @@ class CoinManager:
              budget is treated as "unlimited" and only the hard reserve
              guard applies.
 
-        Empty-tier escape hatch: when `tier_is_empty=True` and only the
-        budget guard would block, bypass it with a prominent warning.
-        An empty tier blocks every offer on that slot, which is a worse
-        outcome than overspending the soft budget. The hard reserve
-        guard is never bypassed — capital protection still applies.
+        Two budget escape hatches (the hard reserve guard is never
+        bypassed — capital protection always applies):
+
+          a. ``tier_is_empty=True`` — every offer on this slot is
+             already blocked, which is worse than overspending the soft
+             budget.
+          b. ``inventory`` shows excess unlocked spare coins across
+             OTHER trading tiers that could fund this refill. As long
+             as the wallet has spare capacity it should be allowed to
+             use it; the soft budget exists to prevent unbounded spend
+             when no excess exists. Sniper/fees coins, plus tiers
+             below their own target, are excluded from the excess pool
+             so we never poach a healthy tier to refill another.
 
         Logs a structured refusal event on block and returns False.
         On any unexpected error, logs a warning and returns True so
@@ -5804,6 +5814,33 @@ class CoinManager:
                         )
                         return True
 
+                    # Excess-spares bypass: the soft budget exists to stop
+                    # unbounded spend, but if the wallet already holds
+                    # enough excess unlocked spare coins (in tiers above
+                    # their own target, excluding sniper/fees) to back this
+                    # refill, the spend isn't unbounded — it's a normal
+                    # working rotation. Allow the split and let normal
+                    # rebuild paths replenish the pool. The hard reserve
+                    # guard above already protects untouchable capital.
+                    excess_mojos = self._unlocked_excess_spare_mojos(
+                        inventory=inventory,
+                        is_cat=is_cat,
+                    )
+                    if excess_mojos >= pool_amount_mojos:
+                        log_event(
+                            "info",
+                            f"topup_{name.lower()}_budget_bypass_excess_spares",
+                            f"{name} bypassing topup pool budget — wallet has "
+                            f"{excess_mojos / _display_scale:.4f} {_unit} of excess "
+                            f"unlocked spare coins, enough to back the requested "
+                            f"{pool_amount_mojos / _display_scale:.4f} {_unit} split "
+                            f"({spent_mojos / _display_scale:.4f} spent + "
+                            f"{pool_amount_mojos / _display_scale:.4f} > "
+                            f"{budget_mojos / _display_scale:.4f} {budget_label}). "
+                            f"Hard reserve guard still honoured.",
+                        )
+                        return True
+
                     log_event(
                         "info",
                         f"topup_{name.lower()}_blocked_by_budget",
@@ -5811,7 +5848,8 @@ class CoinManager:
                         f"({spent_mojos / _display_scale:.4f} spent + "
                         f"{pool_amount_mojos / _display_scale:.4f} requested > "
                         f"{budget_mojos / _display_scale:.4f} {_unit}, "
-                        f"{budget_label}). Re-run Smart Settings to replenish the topup pool.",
+                        f"{budget_label}) and no excess unlocked spare coins to "
+                        f"cover it. Re-run Smart Settings to replenish the topup pool.",
                     )
                     return False
         except Exception as exc:
@@ -5820,6 +5858,63 @@ class CoinManager:
                       f"guard still enforced).")
 
         return True
+
+    def _unlocked_excess_spare_mojos(self, inventory: Optional[Dict[str, list]],
+                                     is_cat: bool) -> int:
+        """Sum the mojos of unlocked tier_spare coins that exceed each
+        tier's own target. Used by the budget guard's excess-spares
+        bypass to know whether the wallet can cover a refill from
+        already-held coins (without needing the operator to refill the
+        soft topup pool budget).
+
+        Excludes ``sniper`` and ``fees`` because those tiers use coin
+        sizes that the trading-tier topup path can't replenish, so
+        consuming them would strand those pools. Tiers below their own
+        target are also excluded — poaching from them creates a
+        split-then-steal loop. Same exclusion logic as the existing
+        Strategy 3 (pool rebuild from excess spares).
+        """
+        if not inventory:
+            return 0
+
+        try:
+            max_per_side = max(
+                getattr(cfg, "MAX_ACTIVE_BUY_OFFERS", 25),
+                getattr(cfg, "MAX_ACTIVE_SELL_OFFERS", 25),
+            )
+            multiplier = getattr(cfg, "COIN_PREP_MULTIPLIER", Decimal("1.0"))
+            side_key = "cat" if is_cat else "xch"
+            tier_sizes = (
+                self._configured_tier_sizes_xch(side="sell")
+                if is_cat else
+                self._configured_tier_sizes_xch(side="buy")
+            )
+            per_tier_targets = get_weighted_tier_prep_counts(
+                max_per_side, multiplier,
+                tier_sizes_xch=tier_sizes,
+                side=side_key,
+            )
+        except Exception:
+            per_tier_targets = {}
+
+        KEEP = 1  # safety buffer (matches Strategy 3 _POOL_REBUILD_KEEP)
+        total = 0
+        for tname in ("inner", "mid", "outer", "extreme"):
+            bucket = inventory.get(tname, []) or []
+            if not bucket:
+                continue
+            have = len(bucket)
+            target = int(per_tier_targets.get(tname, 0) or 0)
+            if target > 0 and have < target:
+                # Below own target — don't poach.
+                continue
+            floor = max(KEEP, target)
+            take = max(0, have - floor)
+            if take <= 0:
+                continue
+            for rec in bucket[:take]:
+                total += int(_coin_amount(rec) or 0)
+        return total
 
     def _max_coins_within_topup_budget(self, is_cat: bool,
                                        trading_size_mojos: int) -> Optional[int]:
