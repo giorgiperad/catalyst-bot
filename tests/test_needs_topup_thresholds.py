@@ -223,6 +223,17 @@ class NeedsTopupThresholdTests(unittest.TestCase):
         mgr._last_drip_time = time.time()  # block drip path too
         self.assertFalse(mgr.needs_topup(), "cooldown should block topup")
 
+    def test_drip_ready_does_not_bypass_emergency_cooldown(self):
+        """A ready drip timer must not re-run emergency topup while it cools down."""
+        mgr = self._manager(xch_overrides={"inner": 3})
+        mgr._last_topup_time = time.time()  # emergency path on cooldown
+        mgr._last_drip_time = 0             # drip path ready
+        self._ns.TIER_DRIP_PCT = 5          # keep this focused on emergency gating
+        self.assertFalse(
+            mgr.needs_topup(),
+            "drip readiness should not bypass the emergency topup cooldown",
+        )
+
 
 # ────────────────────────────────────────────────────────────────────────────
 # Non-reversed ladder (BUY_LADDER_REVERSED=False)

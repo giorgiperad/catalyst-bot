@@ -307,6 +307,35 @@ class OfferManagerCoinIdTests(unittest.TestCase):
         self.assertCountEqual(seen, preselected)
         self.assertEqual([offer["coin_id"] for offer in created], preselected)
 
+    def test_create_ladder_tier_mode_skips_when_no_preselected_coin(self):
+        manager = offer_manager.OfferManager()
+
+        class _FakeRiskManager:
+            @staticmethod
+            def get_tier_size(tier, side=None):
+                return Decimal("1.0")
+
+        with patch.object(offer_manager.cfg, "TIER_ENABLED", True), \
+                patch.object(offer_manager.cfg, "COIN_PREP_HEADROOM_PCT", Decimal("5")), \
+                patch.object(offer_manager.OfferManager, "_select_coin_for_offer",
+                             return_value=None), \
+                patch.object(offer_manager.OfferManager, "create_offer_with_retry",
+                             side_effect=AssertionError("Sage fallback should not run")), \
+                patch.object(offer_manager, "get_exact_spendable_coins_rpc",
+                             return_value={"success": True, "confirmed_records": []}), \
+                patch.object(manager, "record_slot_coin_failure") as record_failure:
+            created = manager.create_ladder(
+                mid_price=Decimal("0.001"),
+                side="buy",
+                num_offers=1,
+                total_slots=50,
+                coin_ids_enabled=True,
+                risk_manager=_FakeRiskManager(),
+            )
+
+        self.assertEqual(created, [])
+        record_failure.assert_called_once()
+
     def test_select_coin_for_offer_avoids_reserve_and_prefers_matching_tier(self):
         manager = offer_manager.OfferManager()
         records = [

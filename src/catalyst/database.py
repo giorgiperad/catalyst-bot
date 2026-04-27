@@ -2334,6 +2334,71 @@ def get_locked_coins(wallet_type: str = None) -> List[Dict]:
     return [dict(row) for row in rows]
 
 
+def get_oversized_locked_offers(max_ratio: float = 1.5,
+                                cat_decimals: int = 3) -> List[Dict]:
+    """Find open offers whose locked trade coin is too large for the offer.
+
+    This is a recovery guard for tiered coin mode. Normal offers should spend
+    a correctly sized tier coin. If a reserve/topup-pool coin or a wildly
+    oversized coin becomes locked to a small offer, live topup cannot use that
+    coin to rebuild depleted spare pools until the offer is cancelled.
+    """
+    conn = get_connection()
+    rows = conn.execute(
+        """
+        SELECT
+            o.trade_id, o.side, o.size_xch, o.size_cat, o.tier,
+            o.lifecycle_state, o.coin_id,
+            c.wallet_type, c.amount_mojos, c.designation, c.assigned_tier
+        FROM offers o
+        JOIN coins c ON c.coin_id = o.coin_id
+        WHERE o.status='open'
+          AND (o.lifecycle_state IS NULL
+               OR o.lifecycle_state NOT IN ('cancel_requested', 'cancel_sent', 'mempool_observed'))
+          AND c.status='locked'
+        """,
+    ).fetchall()
+
+    flagged: List[Dict] = []
+    ratio = Decimal(str(max(max_ratio, 1.0)))
+    cat_scale = Decimal(10) ** Decimal(int(cat_decimals or 0))
+    xch_scale = Decimal("1000000000000")
+
+    for row in rows:
+        side = str(row["side"] or "").lower()
+        wallet_type = str(row["wallet_type"] or "").lower()
+        if side == "buy":
+            if wallet_type != "xch":
+                continue
+            expected = Decimal(str(row["size_xch"] or "0")) * xch_scale
+        elif side == "sell":
+            if wallet_type != "cat":
+                continue
+            expected = Decimal(str(row["size_cat"] or "0")) * cat_scale
+        else:
+            continue
+
+        if expected <= 0:
+            continue
+
+        amount = Decimal(int(row["amount_mojos"] or 0))
+        designation = str(row["designation"] or "").lower()
+        reason = None
+        if designation == "reserve":
+            reason = "reserve_coin_locked"
+        elif amount > expected * ratio:
+            reason = "oversized_coin_locked"
+
+        if reason:
+            item = dict(row)
+            item["expected_mojos"] = int(expected)
+            item["ratio"] = str((amount / expected).quantize(Decimal("0.0001")))
+            item["reason"] = reason
+            flagged.append(item)
+
+    return flagged
+
+
 def get_coin_summary() -> Dict:
     """Get summary counts by wallet_type and status for the GUI.
 

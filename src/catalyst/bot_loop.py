@@ -7186,6 +7186,64 @@ class BotLoop:
     # Coin management
     # -------------------------------------------------------------------
 
+    def _reclaim_oversized_locked_offers(self) -> bool:
+        """Cancel offers that are pinning reserve/oversized topup coins."""
+        if not getattr(cfg, "TIER_ENABLED", False):
+            return False
+        try:
+            from database import get_oversized_locked_offers
+            flagged = get_oversized_locked_offers(
+                max_ratio=float(getattr(cfg, "COIN_MAX_SIZE_RATIO", 1.5) or 1.5),
+                cat_decimals=int(getattr(cfg, "CAT_DECIMALS", 3) or 3),
+            )
+        except Exception as e:
+            log_event("debug", "oversized_coin_reclaim_scan_failed",
+                      f"Oversized locked coin scan failed: {e}")
+            return False
+
+        if not flagged:
+            return False
+
+        trade_ids = sorted({str(row.get("trade_id") or "") for row in flagged if row.get("trade_id")})
+        if not trade_ids:
+            return False
+
+        previews = []
+        for row in flagged[:5]:
+            try:
+                amount = int(row.get("amount_mojos") or 0)
+                expected = int(row.get("expected_mojos") or 0)
+                if row.get("wallet_type") == "xch":
+                    amount_str = f"{Decimal(amount) / Decimal('1000000000000'):.4f} XCH"
+                else:
+                    scale = Decimal(10) ** Decimal(int(getattr(cfg, "CAT_DECIMALS", 3) or 3))
+                    amount_str = f"{Decimal(amount) / scale:.2f} CAT"
+                previews.append(
+                    f"{str(row.get('trade_id'))[:12]}... {row.get('side')}/{row.get('tier')} "
+                    f"{amount_str} ratio={row.get('ratio')} reason={row.get('reason')}"
+                )
+            except Exception:
+                continue
+
+        log_event(
+            "warning",
+            "oversized_coin_reclaim",
+            f"Cancelling {len(trade_ids)} offer(s) pinning reserve/oversized coins so "
+            f"topup can split them back into spare pools: {'; '.join(previews)}",
+            data={"trade_ids": trade_ids, "flagged": flagged[:10]},
+        )
+        try:
+            self.offer_manager.cancel_offers(
+                trade_ids,
+                reason="oversized_coin_reclaim",
+                skip_confirmation=True,
+            )
+            return True
+        except Exception as e:
+            log_event("warning", "oversized_coin_reclaim_failed",
+                      f"Failed to cancel oversized-coin offers: {e}")
+            return False
+
     def _handle_coins(self, active_buy_count: int, active_sell_count: int):
         """Handle coin counting, topup, and prep.
 
@@ -7194,6 +7252,9 @@ class BotLoop:
         2. needs_topup() — FREE coins low → lightweight split
         3. check_runtime_health() — every 5 loops, independent free coin check
         """
+        if self._reclaim_oversized_locked_offers():
+            return
+
         if self._recovery_is_active():
             # During recovery, still allow coin prep and topup to fire when a
             # tier is empty. Without this, a coin-exhaustion-triggered recovery

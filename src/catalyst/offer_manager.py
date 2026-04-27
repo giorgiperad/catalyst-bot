@@ -1808,6 +1808,7 @@ class OfferManager:
                     spend_amount,
                     used_coin_ids,
                     preferred_tier=coin_size_pref,
+                    strict_preferred_tier=exact_tier_spend_mode,
                     spendable_records=spendable_records,
                     max_amount_mojos=_max_coin,
                     tier_sizes_mojos=_tier_sizes_mojos_for_select,
@@ -1899,25 +1900,18 @@ class OfferManager:
         def _create_one(spec):
             """Create a single offer (runs in thread pool)."""
             if coin_ids_enabled and not spec.get("coin_id"):
-                # Pre-selection returned no coin. In PARALLEL mode this
-                # guardrail prevents two workers from competing for the
-                # same coin (BAD_AGGREGATE_SIGNATURE). In SERIAL mode
-                # (max_parallel == 1, used for requote batches) there is
-                # no concurrent worker to race with, so we can safely
-                # fall through and let ``create_offer_with_retry`` /
-                # Sage's default coin selector pick a coin from the
-                # actual wallet. This recovers from the case where the
-                # coin_manager's in-memory tier cache disagrees with the
-                # DB and leaves the ladder wedged at an under-built size
-                # after a fill burst consumes tier coins.
-                if max_parallel != 1:
+                # Pre-selection returned no coin. In exact tier mode, never
+                # let Sage auto-select a fallback coin: it can pick a reserve
+                # or wrong-sized tier coin and pin the topup pool behind a
+                # tiny offer. Skip the slot so topup/coin-prep can repair it.
+                if exact_tier_spend_mode or max_parallel != 1:
                     msg = (f"No unique pre-selected coin available for {side} "
-                           f"slot {spec['slot']} — skipping to avoid overlap")
+                            f"slot {spec['slot']} — skipping to avoid overlap")
                     log_event("debug", "coin_select_skip", msg)
                     # Fix F: track consecutive failures for this slot
                     self.record_slot_coin_failure(side, spec["slot"])
                     return spec["i"], {"success": False, "error": "no_unique_coin_preselected"}
-                # Serial mode: proceed without pre-selection
+                # Serial non-tier mode: proceed without pre-selection.
                 log_event("debug", "coin_select_skip_serial_fallback",
                           f"No pre-selected coin for {side} slot {spec['slot']} "
                           f"— serial mode, letting Sage pick from wallet")

@@ -4301,7 +4301,7 @@ class CoinManager:
                         f"xch={fee_xch_now}/{fee_target}(<{fee_threshold})"
                     )
 
-            if needs_any:
+            if needs_any and _emergency_ready:
                 log_event("info", "low_coins_adaptive",
                           f"Per-tier trigger fired (pace={pace}, scale={pace_scale:.2f}x). "
                           f"Trips: {'; '.join(trigger_log) if trigger_log else 'n/a'}")
@@ -4309,6 +4309,9 @@ class CoinManager:
                 return True
 
             # Drip check — proactively replenish tiers trending toward emergency.
+            # If emergency topup is on cooldown, low emergency-tier counts
+            # above are remembered in trigger_log but must not bypass the
+            # emergency cooldown just because the drip clock is ready.
             # Uses its own _TOPUP_DRIP_INTERVAL cooldown (90s) independent of
             # the emergency gate. Only runs if emergency check found nothing.
             if _drip_ready:
@@ -5136,6 +5139,11 @@ class CoinManager:
                         self._last_drip_time = time.time()
                     else:
                         self._last_topup_time = time.time()
+                        # A failed emergency attempt should also pause the
+                        # proactive drip path. Otherwise the drip gate can
+                        # immediately re-enter the same impossible split while
+                        # the emergency cooldown is doing its job.
+                        self._last_drip_time = time.time()
                     log_event("info", "topup_split_blocked",
                               f"{'Drip' if _is_drip else 'Topup'} needed but split did not complete "
                               f"this cycle ({xch_total:.4f} XCH in wallet) — will re-evaluate next cycle")
