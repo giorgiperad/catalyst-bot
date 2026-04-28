@@ -349,8 +349,8 @@ def _get_sage_connection(timeout: int = 10):
     if conn is not None:
         # Check if the existing connection is still usable
         try:
-            conn.sock  # will be None if closed
-            if conn.sock is not None:
+            sock = getattr(conn, "sock", None)
+            if sock is not None:
                 conn.timeout = timeout
                 return conn
         except Exception:
@@ -3097,7 +3097,7 @@ def _cancel_offers_bulk_proper(offer_ids: list, fee_mojos: int = 0) -> bool:
     # "pending cancel" rows. Validate the JSON body before claiming
     # success.
     if not isinstance(submit_resp, dict):
-        print(f"   [Bulk] submit_transaction response not a dict — falling back")
+        print("   [Bulk] submit_transaction response not a dict — falling back")
         return False
     _sub_err = submit_resp.get("error") or submit_resp.get("reason")
     _sub_status = str(submit_resp.get("status", "") or "").lower()
@@ -3106,7 +3106,7 @@ def _cancel_offers_bulk_proper(offer_ids: list, fee_mojos: int = 0) -> bool:
               f"(error={_sub_err!r}, status={_sub_status!r}) — falling back")
         return False
     if "success" in submit_resp and submit_resp.get("success") is False:
-        print(f"   [Bulk] submit_transaction success=false — falling back")
+        print("   [Bulk] submit_transaction success=false — falling back")
         return False
     return True
 
@@ -3530,7 +3530,7 @@ def get_transaction_count(wallet_id: int) -> int:
 # REMOVED: duplicate get_pending_transactions() that shadowed the correct
 # implementation at line ~833. The correct version uses Sage's documented
 # get_pending_transactions endpoint. This duplicate used get_transactions
-# with heuristic status filtering. See Codex audit item 4.2.
+# with heuristic status filtering.
 
 
 def get_all_coins_for_wallet(wallet_id: int):
@@ -4032,7 +4032,7 @@ def delete_offers_batch(offer_ids: list) -> dict:
 # REMOVED: duplicate get_spendable_coin_count() that shadowed the correct
 # implementation at line ~796. The correct version uses Sage's documented
 # get_spendable_coin_count endpoint. This duplicate used get_coins with
-# filter_mode=selectable approximation. See Codex audit item 4.3.
+# filter_mode=selectable approximation.
 
 
 def get_sage_version() -> str:

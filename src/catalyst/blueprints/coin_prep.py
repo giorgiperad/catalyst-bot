@@ -30,7 +30,7 @@ from flask import Blueprint, Response, jsonify, request, send_file
 
 import api_server
 from config import cfg
-from database import log_event, get_stats, backup_database
+from database import log_event, get_stats, backup_database, get_connection
 
 
 # Package directory — the parent of blueprints/ (i.e. src/catalyst/).
@@ -1699,7 +1699,7 @@ def api_logs_download():
     """Download a richer debug bundle with recent events and runtime state.
 
     Bundle contents are designed to give a support engineer (or a future
-    Claude session) enough context to triage a user-reported issue
+    debugging session) enough context to triage a user-reported issue
     *without* the user having to share raw DB or wallet credentials.
 
     Privacy guarantees:

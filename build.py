@@ -19,7 +19,8 @@ Usage:
 """
 
 # --- src-layout bootstrap (auto-inserted) ---
-import os as _os, sys as _sys
+import os as _os
+import sys as _sys
 _sys.path.insert(
     0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "src", "catalyst")
 )
@@ -160,7 +161,7 @@ def main():
 
     if not os.path.isfile(SPEC_FILE):
         print(f"\n  ERROR: Spec file not found: {SPEC_FILE}")
-        print("  Make sure build_windows.spec is in the same directory as build.py.")
+        print("  Make sure catalyst.spec is in the same directory as build.py.")
         sys.exit(1)
 
     _ensure_pyinstaller()

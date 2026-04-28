@@ -283,14 +283,13 @@ class FillTracker:
                 if _check and isinstance(_check, dict):
                     _status = _check.get("status", "")
                     _status_norm = str(_status).upper()
-                    if _status in (0, 1) or _status_norm in (
+                    if _status in (0, 1, 2) or _status_norm in (
                         "ACTIVE", "OPEN", "PENDING_ACCEPT", "PENDING_CONFIRM",
-                        "PENDING", "IN_PROGRESS"
+                        "PENDING", "PENDING_CANCEL", "IN_PROGRESS"
                     ):
                         return (trade_id, True, False, _status_norm)
-                    elif _status in (2, 3, 5) or _status_norm in (
-                        "PENDING_CANCEL", "CANCELLED", "CANCELED",
-                        "FAILED", "EXPIRED"
+                    elif _status in (3, 5) or _status_norm in (
+                        "CANCELLED", "CANCELED", "FAILED", "EXPIRED"
                     ):
                         return (trade_id, False, True, _status_norm)
             except Exception as _e:
@@ -655,14 +654,13 @@ class FillTracker:
                             _status = _check.get("status", "")
                             _status_norm = str(_status).upper()
                             wallet_offer_status = _status_norm
-                            if _status in (0, 1) or _status_norm in (
+                            if _status in (0, 1, 2) or _status_norm in (
                                 "ACTIVE", "OPEN", "PENDING_ACCEPT", "PENDING_CONFIRM",
-                                "PENDING", "IN_PROGRESS"
+                                "PENDING", "PENDING_CANCEL", "IN_PROGRESS"
                             ):
                                 offer_still_exists = True
-                            elif _status in (2, 3, 5) or _status_norm in (
-                                "PENDING_CANCEL", "CANCELLED", "CANCELED",
-                                "FAILED", "EXPIRED"
+                            elif _status in (3, 5) or _status_norm in (
+                                "CANCELLED", "CANCELED", "FAILED", "EXPIRED"
                             ):
                                 offer_closed_nonfill = True
             except Exception as _wallet_err:
@@ -731,6 +729,11 @@ class FillTracker:
                 fill_detail = self._record_fill(trade_id, side, details_cache)
                 if fill_detail:
                     fills.append(fill_detail)
+            elif verification == "still_open":
+                # Dexie still reports this offer as active. Treat the wallet
+                # disappearance as a Sage/cache blip and leave the local DB row
+                # open so the next fresh wallet sync can see it again.
+                continue
             elif verification == "rejected":
                 # Lifecycle: FILL_REJECTED signal → phantom_rejected terminal state.
                 try:
@@ -902,7 +905,8 @@ class FillTracker:
 
         Returns:
             "filled" = Spacescan confirms this was a real fill
-            "rejected" = Not a fill / do not retire locally here
+            "still_open" = Dexie still sees the offer active; leave DB alone
+            "rejected" = Confirmed not a fill
             "unverified" = Offer vanished but on-chain verification is unavailable
         """
         try:
@@ -969,7 +973,7 @@ class FillTracker:
             trade_id, db_offer, primary_coin_id
         )
         if dexie_still_open is True:
-            return "rejected"
+            return "still_open"
 
         # Get our wallet address for self-spend detection
         # This is populated dynamically at startup from the wallet RPC

@@ -9,6 +9,7 @@ on:
 permissions:
   contents: write
 
+
 jobs:
   build:
     strategy:
@@ -26,13 +27,16 @@ jobs:
             ext: .tar.gz
 
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
@@ -50,12 +54,12 @@ jobs:
           pip install pyinstaller
           pip install -r requirements.txt
 
-      - name: Sync _version.py to tag
+      - name: Sync release metadata to tag
         shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
-          echo "__version__ = \"${version}\"" > _version.py
-          echo "Synced _version.py to ${version}"
+          python scripts/sync_release_metadata.py "${version}"
+          echo "Synced release metadata to ${version}"
 
       - name: Build with PyInstaller
         run: python build.py

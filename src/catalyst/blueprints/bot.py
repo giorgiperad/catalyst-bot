@@ -21,6 +21,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
+from typing import Any, Dict
 
 from flask import Blueprint, Response, current_app, jsonify, request
 
@@ -481,9 +482,7 @@ def api_status():
             # put pointless load on the oracles. Cache the lookup result
             # for 60 s so log entries and HTTP calls drop to 1 per minute.
             global _prebot_price_cache  # noqa: PLW0603
-            try:
-                _prebot_price_cache
-            except NameError:  # first call in this process
+            if "_prebot_price_cache" not in globals():
                 _prebot_price_cache = {"fetched_at": 0.0, "pricing": None,
                                         "asset_id": ""}
 
