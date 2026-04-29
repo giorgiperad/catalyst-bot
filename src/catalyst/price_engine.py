@@ -620,6 +620,59 @@ class PriceEngine:
         with _tibet_lock:
             _tibet_cache["fetched_at"] = 0
 
+    def inject_tibet_reserves(self, pair_id: str = None, asset_id: str = None,
+                              xch_reserve=None, token_reserve=None,
+                              fetched_at: float = None) -> bool:
+        """Inject freshly observed Tibet reserves into the pair cache.
+
+        Confirmed reserve watchers already know the post-swap reserves.  Push
+        those into the shared cache immediately so the next get_price() call
+        cannot reuse a pre-swap Tibet price while the /pairs TTL is still hot.
+        Returns True when a cached pair was updated; otherwise invalidates the
+        cache so the next caller performs a full refresh.
+        """
+        try:
+            xch_int = int(xch_reserve)
+            token_int = int(token_reserve)
+        except (TypeError, ValueError):
+            return False
+
+        pair_id_norm = str(pair_id or "").strip()
+        asset_norm = str(asset_id or cfg.CAT_ASSET_ID or "").lower().strip()
+        if asset_norm.startswith("0x"):
+            asset_norm = asset_norm[2:]
+
+        with _tibet_lock:
+            pairs = _tibet_cache.get("pairs", []) or []
+            for pair in pairs:
+                cached_pair_id = str(pair.get("pair_id") or "").strip()
+                cached_asset = str(pair.get("asset_id") or "").lower().strip()
+                if cached_asset.startswith("0x"):
+                    cached_asset = cached_asset[2:]
+
+                pair_matches = bool(pair_id_norm and cached_pair_id == pair_id_norm)
+                asset_matches = bool(
+                    not pair_id_norm and asset_norm and cached_asset == asset_norm
+                )
+                if not (pair_matches or asset_matches):
+                    continue
+
+                pair["xch_reserve"] = xch_int
+                pair["token_reserve"] = token_int
+                _tibet_cache["fetched_at"] = (
+                    float(fetched_at) if fetched_at is not None else time.time()
+                )
+                log_event(
+                    "debug",
+                    "tibet_cache_injected",
+                    f"Injected confirmed Tibet reserves into price cache "
+                    f"(xch={xch_int}, token={token_int})",
+                )
+                return True
+
+            _tibet_cache["fetched_at"] = 0
+            return False
+
     def get_live_amm_price(self) -> Optional[Decimal]:
         """Return the most up-to-date AMM price from AMMMonitor if available,
         falling back to the standard Tibet price fetch.

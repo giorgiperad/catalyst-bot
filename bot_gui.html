@@ -10170,25 +10170,25 @@
                          because the values are populated by it. The pool is
                          separate from the user's hard reserve (set in step 1
                          above) and represents the working budget Smart
-                         Settings allocates for coin splits. -->
+                         Settings derives for topup headroom. -->
                     <div class="v4-settings-section v4-settings-green" style="background: rgba(16,185,129,0.05);">
                         <div class="v4-settings-section-title" style="display: flex; align-items: center; gap: 6px; color: var(--status-success);">
                             Topup Pool
                             <span class="cc-help">?<span class="cc-tooltip" style="text-align: left; min-width: 280px;">
                                 <strong>Two-tier reserve system.</strong><br><br>
                                 <strong>Reserves</strong> (set in the Reserves section above) are your untouchable hard floor — the bot will never split coins below this amount, no matter what.<br><br>
-                                <strong>Topup pool</strong> (here) is the working budget the bot is allowed to spend splitting large coins into trading tiers. Smart Settings sets it to 15% of the capital left after your reserves, which gives ~2 days of autonomous coin prep at typical fill rates. Raise the % for longer autonomous runtime; lower it for more trading capacity. When the pool runs out, re-run Smart Settings to replenish.<br><br>
+                                <strong>Topup pool</strong> (here) is a soft working budget the bot may draw from when it needs to split or top up trading-tier coins. Smart Settings derives the XCH/CAT budgets from this percentage after reserves, but efficient topup, coin reuse, and refunds mean it is not a runtime forecast or a promise that the full amount will be spent. Higher values give topup more headroom during busy recovery; lower values leave more capital in active offers.<br><br>
                                 Split protection is enforced at the coin level — even if the pool is exhausted, the bot refuses any split that would dip into your reserve.
                             </span></span>
                         </div>
-                        <div class="v4-settings-hint" style="margin-bottom: 10px;">Working budget for coin splits — Smart Settings pre-fills these, but you can edit them before saving.</div>
+                        <div class="v4-settings-hint" style="margin-bottom: 10px;">Soft headroom for future split/topup work — Smart Settings pre-fills these, but you can edit them before saving.</div>
                         <div class="form-group" style="margin-bottom: 8px;">
                             <label style="font-size: 0.85em;">Topup pool % <span style="color: var(--text-tertiary); font-weight: normal;">(of avail after reserve, 5–35%)</span></label>
                             <div style="display: flex; gap: 10px; align-items: center;">
                                 <input type="number" step="1" id="configTopupPoolPct" value="15" min="5" max="35" oninput="scheduleSettingsUpdate();" style="flex: 1;">
                                 <span style="font-size: 0.85em; opacity: 0.7; min-width: 32px;">%</span>
                             </div>
-                            <div class="v4-settings-hint">Bumping this up extends the bot's autonomous runtime (each refill uses more pool capacity), at the cost of slightly smaller trading tier sizes. 15% ≈ 2 days, 20% ≈ 2.8 days, 25% ≈ 3.5 days at typical fill rates. Re-run Smart Settings after changing for the new allocation to take effect.</div>
+                            <div class="v4-settings-hint">Sets the headroom Smart Settings carves out for future topup work. Larger = more buffer during busy recovery; smaller = more capital in offers. Actual usage depends on fills, reusable coins, and refunded topup spend.</div>
                         </div>
                         <div class="form-group" style="margin-bottom: 8px;">
                             <label style="font-size: 0.85em;">XCH topup budget</label>
@@ -10205,7 +10205,7 @@
                             </div>
                         </div>
                         <div class="v4-settings-hint" style="margin-top: 6px;">
-                            <span id="topupPoolStatus" style="opacity: 0.75;">Run Smart Settings to allocate the topup pool.</span>
+                            <span id="topupPoolStatus" style="opacity: 0.75;">Run Smart Settings to calculate the topup budget.</span>
                         </div>
                     </div>
 
@@ -10251,6 +10251,18 @@
                                 <label style="font-size: 0.85em;">Step-Change Guard (%) <span class="cc-help">?<span class="cc-tooltip">Rejects a price fetch if it moved more than this % from the previous reading in a single loop. Catches bad data or API glitches. Smart Settings calibrates this from historical max single-move. Set 0 to disable (default).</span></span></label>
                                 <input type="number" id="configMaxStepChange" value="0" min="0" max="50" step="1">
                                 <div class="v4-settings-hint">Max single-loop price change — 0 = disabled</div>
+                            </div>
+                        </div>
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 8px;">
+                            <div class="form-group" style="margin-bottom: 0;">
+                                <label style="font-size: 0.85em;">Tibet Shock Cancel (%) <span class="cc-help">?<span class="cc-tooltip">Confirmed TibetSwap pool move that triggers defensive cancel on the at-risk side before stale offers can be arbed. Set 0 for auto from inner edge.</span></span></label>
+                                <input type="number" id="configTibetShockCancelPct" value="0" min="0" max="50" step="0.01">
+                                <div class="v4-settings-hint">0 = auto from inner edge; positive value = explicit TibetSwap move trigger</div>
+                            </div>
+                            <div class="form-group" style="margin-bottom: 0;">
+                                <label style="font-size: 0.85em;">Arb Alert Threshold (bps) <span class="cc-help">?<span class="cc-tooltip">Dexie/Tibet gap, in basis points, that marks an arbitrage alert. Smart Settings calibrates this from liquidity, volatility, and the live venue gap.</span></span></label>
+                                <input type="number" id="configArbThreshold" value="200" min="1" max="5000" step="1">
+                                <div class="v4-settings-hint">100 bps = 1%; used by alerting and sniper re-arm calibration</div>
                             </div>
                         </div>
                         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
@@ -12623,11 +12635,11 @@
                                 const _catVal = parseFloat(_tpCat) || 0;
                                 if (_xchVal > 0 || _catVal > 0) {
                                     _tpStatusEl.textContent =
-                                        `Current allocation: ${_xchVal.toFixed(4)} XCH / `
+                                        `Current topup budget: ${_xchVal.toFixed(4)} XCH / `
                                         + `${_catVal.toLocaleString()} ${currentCAT?.name || 'tokens'}. `
-                                        + `Re-run Smart Settings to replenish.`;
+                                        + `Re-run Smart Settings to refresh it.`;
                                 } else {
-                                    _tpStatusEl.textContent = 'Run Smart Settings to allocate the topup pool.';
+                                    _tpStatusEl.textContent = 'Run Smart Settings to calculate the topup budget.';
                                 }
                             }
                         } catch (_tpLoadErr) { /* non-fatal */ }
@@ -12667,6 +12679,8 @@
                             document.getElementById('configMaxMid').value = parseFloat(g('HARD_MAX_PRICE_XCH') || 0) > 0 ? g('HARD_MAX_PRICE_XCH') : '';
                             const dlp = parseFloat(g('DYNAMIC_LIMIT_PCT') || 0); document.getElementById('configDynamicLimitPct').value = dlp > 0 ? dlp : 50;
                             const msc = parseFloat(g('MAX_STEP_CHANGE_FRACTION') || 0); document.getElementById('configMaxStepChange').value = msc > 0 ? (msc * 100).toFixed(0) : 0;
+                            const tsp = parseFloat(g('TIBET_SHOCK_CANCEL_TRIGGER_PCT') || 0); document.getElementById('configTibetShockCancelPct').value = tsp > 0 ? tsp.toFixed(2) : 0;
+                            const arb = parseInt(g('ARB_ALERT_THRESHOLD_BPS') || 0); document.getElementById('configArbThreshold').value = arb > 0 ? arb : 200;
 
                             const de = g('DYNAMIC_SPREAD_ENABLED'); if (de !== null) document.getElementById('configDynamicSpreadEnabled').checked = de === true || de === 'true' || de === '1' || de === 'True';
                             const bs = parseFloat(g('BASE_SPREAD_BPS') || 0); if (bs > 0) document.getElementById('configBaseSpreadBps').value = (bs / 100).toFixed(1);
@@ -13911,6 +13925,15 @@
             return div.innerHTML;
         }
 
+        function escapeAttr(value) {
+            return String(value == null ? '' : value)
+                .replace(/&/g, '&amp;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
+        }
+
         function sanitizeExternalHref(value) {
             const str = String(value || '').trim();
             if (!str) return '';
@@ -14913,15 +14936,16 @@
                     : 'unknown date';
                 const fieldCount = entry.settings ? Object.keys(entry.settings).length : 0;
                 const nameEsc = escapeHtml(name);
+                const nameAttr = escapeAttr(name);
                 return ''
                     + '<div class="v4-preset-row">'
                     +   '<div class="v4-preset-info">'
-                    +     '<div class="v4-preset-name" title="' + nameEsc + '">' + nameEsc + '</div>'
+                    +     '<div class="v4-preset-name" title="' + nameAttr + '">' + nameEsc + '</div>'
                     +     '<div class="v4-preset-meta">saved ' + escapeHtml(when) + ' · ' + fieldCount + ' fields</div>'
                     +   '</div>'
-                    +   '<button class="v4-preset-action v4-preset-action--primary" data-preset-action="load" data-preset-name="' + nameEsc + '">Load</button>'
-                    +   '<button class="v4-preset-action" data-preset-action="rename" data-preset-name="' + nameEsc + '">Rename</button>'
-                    +   '<button class="v4-preset-action v4-preset-action--danger" data-preset-action="delete" data-preset-name="' + nameEsc + '">Delete</button>'
+                    +   '<button class="v4-preset-action v4-preset-action--primary" data-preset-action="load" data-preset-name="' + nameAttr + '">Load</button>'
+                    +   '<button class="v4-preset-action" data-preset-action="rename" data-preset-name="' + nameAttr + '">Rename</button>'
+                    +   '<button class="v4-preset-action v4-preset-action--danger" data-preset-action="delete" data-preset-name="' + nameAttr + '">Delete</button>'
                     + '</div>';
             }).join('');
             list.innerHTML = rows;
@@ -16687,6 +16711,8 @@
                 'configMinMid',
                 'configMaxMid',
                 'configMaxMidMove',
+                'configTibetShockCancelPct',
+                'configArbThreshold',
                 // Requote (spread-derived)
                 'configRequoteBps',
                 'configRequoteCooldown',
@@ -16741,7 +16767,7 @@
 
             // Reset topup pool status text
             const _tpStatusReset = document.getElementById('topupPoolStatus');
-            if (_tpStatusReset) _tpStatusReset.textContent = 'Run Smart Settings to allocate the topup pool.';
+            if (_tpStatusReset) _tpStatusReset.textContent = 'Run Smart Settings to calculate the topup budget.';
 
             if (typeof updateFeeSettingsUi === 'function') updateFeeSettingsUi();
             if (typeof updateReserveFromInput === 'function') {
@@ -17781,10 +17807,18 @@
             // Require a trading pair to be selected first
             const settingsCatSel = document.getElementById('configCatSelector');
             const hasSettingsSelection = settingsCatSel && settingsCatSel.value && !settingsCatSel.options[settingsCatSel.selectedIndex]?.disabled;
-            const hasPair = hasSettingsSelection && currentCAT && currentCAT.name && currentCAT.asset_id;
+            const selectedCAT = hasSettingsSelection && typeof getSettingsSelectedCAT === 'function'
+                ? getSettingsSelectedCAT()
+                : (currentCAT && currentCAT.asset_id ? { ...currentCAT } : {});
+            const hasPair = hasSettingsSelection && selectedCAT && selectedCAT.asset_id;
             if (!hasPair) {
                 showToast('Please select a Trading Pair first', 'error');
                 return;
+            }
+            if (!currentCAT || currentCAT.asset_id !== selectedCAT.asset_id) {
+                currentCAT = { ...selectedCAT };
+                try { syncSettingsPairLabels(currentCAT); } catch (_) {}
+                try { updateTokenIcons(currentCAT.asset_id); } catch (_) {}
             }
 
             // ── DBX incentive pre-prompt ─────────────────────────────────
@@ -17797,14 +17831,14 @@
             // applied to base_spread / max_spread / requote_bps.
             let _dbxCapChoice = false;
             try {
-                const _dbxInfo = await _fetchDbxIncentiveInfo(currentCAT.asset_id);
+                const _dbxInfo = await _fetchDbxIncentiveInfo(selectedCAT.asset_id);
                 if (_dbxInfo && _dbxInfo.pair_incentivized && _dbxInfo.max_spread_bps > 0) {
                     const capPct = (_dbxInfo.max_spread_bps / 100).toFixed(1);
                     const aprPct = (_dbxInfo.estimated_apr * 100).toFixed(1);
                     const rewardToken = _dbxInfo.reward_token || 'DBX';
                     const choice = await showStyledConfirm({
                         icon: '🏆',
-                        title: `${currentCAT.name} earns ${rewardToken} rewards`,
+                        title: `${selectedCAT.name || 'Selected CAT'} earns ${rewardToken} rewards`,
                         message: `Dexie pays ${rewardToken} on offers within <strong>${capPct}%</strong> of market price (estimated ${aprPct}% APR).<br><br>` +
                                  `Cap your spread at ${capPct}% so all tiers stay reward-eligible? Otherwise Smart Settings will use the calculated spread for this pair's volatility.`,
                         confirmText: `Maximize ${rewardToken} (cap at ${capPct}%)`,
@@ -17840,7 +17874,7 @@
             // AND all inputs have been populated from the backend response.
             try {
                 if (typeof setCoinPrepPreviewLoading === 'function') {
-                    const _tokName = currentCAT?.name || 'selected token';
+                    const _tokName = selectedCAT?.name || 'selected token';
                     setCoinPrepPreviewLoading(_tokName);
                 }
             } catch (_e) { /* non-fatal */ }
@@ -17858,7 +17892,7 @@
                 // it to complete before calling /smart-defaults.
                 if (sdStatus) sdStatus.textContent = 'Refreshing wallet balances...';
                 try {
-                    const _assetId = currentCAT?.asset_id || '';
+                    const _assetId = selectedCAT?.asset_id || '';
                     if (_assetId && typeof refreshBalances === 'function') {
                         await refreshBalances(true, _assetId);
                     }
@@ -17877,6 +17911,11 @@
                 const params = new URLSearchParams({
                     xch_reserve: xchReserve,
                     cat_reserve: catReserve,
+                    asset_id: selectedCAT.asset_id || '',
+                    cat_wallet_id: selectedCAT.wallet_id || '',
+                    cat_decimals: selectedCAT.decimals ?? 3,
+                    cat_ticker_id: selectedCAT.ticker_id || '',
+                    cat_name: selectedCAT.name || '',
                     risk_profile: getSelectedRiskProfile(),
                     // Scope the plan to the selected Liquidity Mode so the
                     // backend zeroes the disabled side's fields before we
@@ -17970,10 +18009,10 @@
                     }
                     if (_poolStatus) {
                         const pctLabel = data.topup_pool_pct != null
-                            ? (Number(data.topup_pool_pct) * 100).toFixed(0) + '% of remaining'
+                            ? (Number(data.topup_pool_pct) * 100).toFixed(0) + '% setting'
                             : '';
                         _poolStatus.textContent =
-                            `Allocated ${Number(data.topup_pool_xch || 0).toFixed(4)} XCH / `
+                            `Topup budget ${Number(data.topup_pool_xch || 0).toFixed(4)} XCH / `
                             + `${Number(data.topup_pool_cat || 0).toLocaleString()} `
                             + `${currentCAT?.name || 'tokens'} ${pctLabel ? '(' + pctLabel + ')' : ''}.`;
                     }
@@ -17986,7 +18025,8 @@
                 document.getElementById('configMaxMidMove').value = data.max_mid_move;
                 if (data.dynamic_limit_pct > 0) document.getElementById('configDynamicLimitPct').value = data.dynamic_limit_pct;
                 if (data.max_step_change_pct >= 0) document.getElementById('configMaxStepChange').value = data.max_step_change_pct;
-                const _arbEl = document.getElementById('configArbThreshold'); if (_arbEl && data.arb_threshold_bps != null) _arbEl.value = data.arb_threshold_bps;
+                if (data.tibet_shock_cancel_trigger_pct !== undefined) document.getElementById('configTibetShockCancelPct').value = Number(data.tibet_shock_cancel_trigger_pct || 0).toFixed(2);
+                const _arbEl = document.getElementById('configArbThreshold'); if (_arbEl && data.arb_alert_threshold_bps != null) _arbEl.value = data.arb_alert_threshold_bps;
 
                 // Safety & Limits — Price Rails
                 if (data.min_mid > 0 && data.max_mid > 0) {
@@ -18464,11 +18504,25 @@
         // explicitly asked for either dynamic recompute OR a re-run prompt.
         const SMART_SETTINGS_WATCHED_INPUTS = [
             'configXchReserve', 'configCatReserve',
-            'configTopupPoolPct',
+            'configDynamicSpreadEnabled', 'configBaseSpreadBps',
+            'configVolatilityWindow', 'configMinEdgeBps',
+            'configMinSpreadBps', 'configMaxSpreadBps',
+            'configInventoryEnabled', 'configSkewIntensity',
+            'configMaxPositionXch', 'configSpreadBps',
+            'configLoopSeconds', 'configAutoRequote',
+            'configRequoteBps', 'configRequoteCooldown',
+            'configRequoteBatchSize', 'configDynamicLimitPct',
+            'configMaxStepChange', 'configTibetShockCancelPct',
+            'configArbThreshold', 'configCompetitorEnabled',
+            'configDbxMaxSpreadBps',
+            'configTopupPoolPct', 'configTopupPoolXch',
+            'configTopupPoolCat',
             'configTradeXch', 'configMaxBuy', 'configMaxSell',
             'configTierEnabled', 'configBuyLadderReversed',
             'configInnerSizeXch', 'configMidSizeXch',
             'configOuterSizeXch', 'configExtremeSizeXch',
+            'configBuyInnerSizeXch', 'configBuyMidSizeXch',
+            'configBuyOuterSizeXch', 'configBuyExtremeSizeXch',
             'configInnerTierCount', 'configMidTierCount',
             'configOuterTierCount', 'configExtremeTierCount',
             'configInnerTierCountXch', 'configMidTierCountXch',
@@ -18479,8 +18533,12 @@
             'configOuterTierSpareCountXch', 'configExtremeTierSpareCountXch',
             'configCoinPrepMultiplier', 'configCoinPrepHeadroomPct',
             'configSniperEnabled', 'configSniperSizeXch', 'configSniperPrepCount',
+            'configSniperRearmPriceMovePct', 'configSniperRearmGapMovePct',
             'configTransactionFeeEnabled', 'configTransactionFeeXch',
-            'configFeePrepCount', 'configFeeCoinSizeXch'
+            'configTransactionFeeTargetSecs', 'configFeePrepCount',
+            'configFeeCoinSizeXch', 'configSplashEnabled',
+            'configCoinPrepEnabled', 'configRuntimeCoinHealth',
+            'configSageChangeAddress'
         ];
         let _smartSettingsAppliedSnapshot = null;
         let _smartSettingsBannerListenersBound = false;
@@ -29644,7 +29702,7 @@
             // F76 (2026-04-17): trading-control toggles
             'configDryRun','configEnableBuy','configEnableSell',
             'configAutoRequote','configRequoteBps','configRequoteCooldown','configRequoteBatchSize',
-            'configMaxMidMove','configDynamicLimitPct','configMaxStepChange',
+            'configMaxMidMove','configTibetShockCancelPct','configArbThreshold','configDynamicLimitPct','configMaxStepChange',
             'configMinMid','configMaxMid',
             'configDynamicSpreadEnabled','configBaseSpreadBps','configMinEdgeBps',
             'configMinSpreadBps','configMaxSpreadBps','configVolatilityWindow',
@@ -29749,6 +29807,10 @@
             'CAT_RESERVE':               'configCatReserve',
             'HARD_MIN_PRICE_XCH':        'configMinMid',
             'HARD_MAX_PRICE_XCH':        'configMaxMid',
+            'ARB_ALERT_THRESHOLD_BPS':    'configArbThreshold',
+            'TIBET_SHOCK_CANCEL_TRIGGER_PCT': 'configTibetShockCancelPct',
+            'DYNAMIC_LIMIT_PCT':          'configDynamicLimitPct',
+            'MAX_STEP_CHANGE_FRACTION':   'configMaxStepChange',
             'LOOP_SECONDS':              'configLoopSeconds',
             'REQUOTE_COOLDOWN_SECS':     'configRequoteCooldown',
         };
@@ -29875,6 +29937,7 @@
                 ['# Safety & Limits', null],
                 ['HARD_MIN_PRICE_XCH', document.getElementById('configMinMid')?.value],
                 ['HARD_MAX_PRICE_XCH', document.getElementById('configMaxMid')?.value],
+                ['TIBET_SHOCK_CANCEL_TRIGGER_PCT', document.getElementById('configTibetShockCancelPct')?.value],
                 // MAX_MID_MOVE_BPS removed 2026-04-08 — config key was never consumed
                 // by trading code. Replaced by DYNAMIC_LIMIT_PCT + MAX_STEP_CHANGE_FRACTION.
                 ['', null],
@@ -30305,12 +30368,13 @@
                 dynamic_limit_pct: parseFloat(document.getElementById('configDynamicLimitPct').value) || 0,
                 max_step_change_fraction: parseFloat(document.getElementById('configMaxStepChange').value) > 0
                     ? parseFloat(document.getElementById('configMaxStepChange').value) / 100 : 0,
+                tibet_shock_cancel_trigger_pct: Math.max(0, parseFloat(document.getElementById('configTibetShockCancelPct')?.value || 0) || 0),
                 min_mid: document.getElementById('configMinMid').value || '',
                 max_mid: document.getElementById('configMaxMid').value || '',
                 // TibetSwap (with null checks)
                 // enable_tibetswap: REMOVED - TibetSwap always enabled
                 // price_strategy: NOT sent from GUI — managed via .env only to prevent accidental overwrite
-                arb_threshold_bps: parseInt(document.getElementById('configArbThreshold')?.value || '50'),
+                arb_threshold_bps: parseInt(document.getElementById('configArbThreshold')?.value || '200'),
 
                 // V2: Dynamic Spreads
                 dynamic_spread_enabled: document.getElementById('configDynamicSpreadEnabled').checked,

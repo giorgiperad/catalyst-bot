@@ -3,6 +3,7 @@ import types
 import unittest
 import io
 import contextlib
+import time
 from decimal import Decimal
 from unittest.mock import patch
 from reaction_strategy import RequoteSeverity
@@ -67,7 +68,7 @@ fake_database.log_event = lambda *args, **kwargs: None
 fake_database.get_events_since = lambda *args, **kwargs: []
 fake_database.get_open_offers = lambda *args, **kwargs: []
 fake_database.get_stats = lambda: {}
-fake_database.get_offer = lambda *args, **kwargs: None
+fake_database.get_offer = lambda tid, *args, **kwargs: {"dexie_id": f"dexie-{tid}"}
 fake_database.update_offer_status = lambda *args, **kwargs: True
 fake_database.backfill_verified_fills_from_offers = lambda *args, **kwargs: 0
 sys.modules["database"] = fake_database
@@ -233,6 +234,7 @@ _module_with_class("price_engine", "PriceEngine", _DummyPriceEngine)
 _module_with_class("offer_manager", "OfferManager", _DummyOfferManager)
 _module_with_class("fill_tracker", "FillTracker", _DummyFillTracker)
 _module_with_class("dexie_manager", "DexieManager", _DummyDexieManager)
+sys.modules["dexie_manager"].get_offer_detail = lambda *args, **kwargs: {"status": 0}
 _module_with_class("splash_manager", "SplashManager", _DummySplashManager)
 _module_with_class("splash_node", "SplashNode", _DummySplashNode)
 _module_with_class("coinset_client", "CoinsetClient", _DummyCoinsetClient)
@@ -290,6 +292,123 @@ class ProbeAnchorTests(unittest.TestCase):
 
     def tearDown(self):
         self._cfg_patcher.stop()
+
+    def test_probe_offer_state_marks_dexie_pending_as_taken(self):
+        loop = bot_loop.BotLoop()
+
+        with patch.object(bot_loop, "get_offer", return_value={"dexie_id": "dexie-buy"}), \
+                patch.object(bot_loop, "get_offer_detail", return_value={"status": 1}):
+            state = loop._classify_probe_offer("buy", "probe-buy", {"probe-buy"})
+
+        self.assertFalse(state["confirmable"])
+        self.assertTrue(state["taken"])
+        self.assertEqual(state["reason"], "dexie_pending")
+
+    def test_confirmed_probe_revalidation_rearms_dexie_pending_edge(self):
+        loop = bot_loop.BotLoop()
+        loop._running = False
+        loop._probe_state.update({
+            "active": False,
+            "confirmed_price": Decimal("1.10"),
+            "confirmed_at": 1000.0,
+            "launched_at": 990.0,
+            "buy_tid": "probe-buy",
+            "sell_tid": "probe-sell",
+        })
+
+        calls = []
+
+        def _fake_process(current_buy_ids, current_sell_ids, arb_gap, force_refresh=False):
+            calls.append((set(current_buy_ids), set(current_sell_ids), arb_gap, force_refresh))
+            return {
+                "buy_ids": set(current_buy_ids),
+                "sell_ids": set(current_sell_ids),
+                "sniper_fired": False,
+            }
+
+        loop._process_active_probe = _fake_process
+
+        def _fake_get_offer(tid):
+            return {"dexie_id": f"dexie-{tid}"}
+
+        def _fake_get_detail(dexie_id, **kwargs):
+            del kwargs
+            status = 1 if dexie_id == "dexie-probe-buy" else 0
+            return {"status": status}
+
+        with patch.object(bot_loop, "get_offer", side_effect=_fake_get_offer), \
+                patch.object(bot_loop, "get_offer_detail", side_effect=_fake_get_detail), \
+                patch.object(bot_loop.time, "time", return_value=1010.0):
+            buy_ids, sell_ids, rearmed = loop._revalidate_confirmed_probe_edges(
+                {"probe-buy"},
+                {"probe-sell"},
+                Decimal("125"),
+            )
+
+        self.assertEqual(buy_ids, {"probe-buy"})
+        self.assertEqual(sell_ids, {"probe-sell"})
+        self.assertTrue(rearmed)
+        self.assertTrue(loop._probe_state["active"])
+        self.assertEqual(loop._probe_state["confirmed_at"], 0)
+        self.assertEqual(len(calls), 1)
+
+    def test_pending_probe_does_not_confirm_after_max_attempts(self):
+        loop = bot_loop.BotLoop()
+        loop._running = True
+        loop._probe_state.update({
+            "active": True,
+            "buy_tid": "probe-buy",
+            "sell_tid": "probe-sell",
+            "buy_price": Decimal("1.02"),
+            "sell_price": Decimal("1.18"),
+            "tibet_price": Decimal("1.10"),
+            "attempt": 5,
+            "max_attempts": 5,
+            "launched_at": 1000.0,
+        })
+
+        created = []
+
+        def _try_snipe_single(side, price, arb_gap):
+            created.append((side, price, arb_gap))
+            return [{"trade_id": f"new-{side}"}]
+
+        loop.sniper.try_snipe_single = _try_snipe_single
+        loop.sniper._last_snipe_time = 0
+
+        with patch.object(
+            loop,
+            "_watch_active_probe_window",
+            return_value=({"probe-buy"}, {"probe-sell"}),
+        ), patch.object(
+            loop,
+            "_probe_hold_seconds_remaining",
+            return_value=0.0,
+        ), patch.object(
+            bot_loop,
+            "get_offer",
+            return_value={"dexie_id": "dexie-probe"},
+        ), patch.object(
+            bot_loop,
+            "get_offer_detail",
+            return_value={"status": 1},
+        ), patch.object(
+            loop,
+            "_get_market_aware_probe_prices",
+            return_value={
+                "buy_price": Decimal("1.00"),
+                "sell_price": Decimal("1.20"),
+                "overall_best_bid": Decimal("0"),
+                "overall_best_ask": Decimal("0"),
+            },
+        ):
+            result = loop._process_active_probe(set(), set(), Decimal("125"))
+
+        self.assertTrue(loop._probe_state["active"])
+        self.assertIsNone(loop._probe_state["confirmed_price"])
+        self.assertEqual(loop._probe_state["attempt"], 6)
+        self.assertEqual(result["sniper_fired"], True)
+        self.assertEqual([side for side, _, _ in created], ["sell", "buy"])
 
     def test_full_ladder_does_not_rearm_missing_lingering_probe(self):
         loop = bot_loop.BotLoop()
@@ -372,7 +491,7 @@ class ProbeAnchorTests(unittest.TestCase):
             Decimal("1.18") / Decimal("1.03"),
         )
 
-    def test_market_aware_probe_prices_target_live_top_of_book(self):
+    def test_market_aware_probe_prices_clamp_crossed_book_to_amm_safe_edge(self):
         loop = bot_loop.BotLoop()
         loop.market_intel.orderbook = {
             "overall_best_bid": Decimal("0.999"),
@@ -386,11 +505,36 @@ class ProbeAnchorTests(unittest.TestCase):
 
         self.assertEqual(
             prices["buy_price"],
-            Decimal("0.999") * Decimal("1.0001"),
+            Decimal("1.0") / Decimal("1.005"),
         )
         self.assertEqual(
             prices["sell_price"],
-            Decimal("1.001") / Decimal("1.0001"),
+            Decimal("1.0") * Decimal("1.005"),
+        )
+
+    def test_market_aware_probe_prices_clamp_wallet_edges_to_amm_safe_edge(self):
+        loop = bot_loop.BotLoop()
+        loop.market_intel.orderbook = {
+            "overall_best_bid": Decimal("0.990"),
+            "overall_best_ask": Decimal("1.010"),
+        }
+
+        prices = loop._get_market_aware_probe_prices(
+            Decimal("1.0"),
+            Decimal("50"),
+            offer_edges={
+                "our_best_bid": "1.003",
+                "our_best_ask": "0.997",
+            },
+        )
+
+        self.assertEqual(
+            prices["buy_price"],
+            Decimal("1.0") / Decimal("1.005"),
+        )
+        self.assertEqual(
+            prices["sell_price"],
+            Decimal("1.0") * Decimal("1.005"),
         )
 
     def test_probe_retry_backoff_steps_away_from_previous_probe(self):
@@ -576,6 +720,330 @@ class ProbeAnchorTests(unittest.TestCase):
         sell_call = next(call for call in loop.offer_manager.create_calls if call[0] == "sell")
         self.assertEqual(buy_call[2]["num_offers"], 4)
         self.assertEqual(sell_call[2]["num_offers"], 4)
+
+    def test_create_offers_if_needed_waits_for_wallet_active_pending_cancels(self):
+        loop = bot_loop.BotLoop()
+        loop._pending_cancel_wallet_ids_by_side = {
+            "buy": set(),
+            "sell": {"pending-sell"},
+        }
+
+        loop._create_offers_if_needed(
+            Decimal("1.10"),
+            current_buy_count=fake_config.cfg.MAX_ACTIVE_BUY_OFFERS,
+            current_sell_count=2,
+            current_buy_ids={"b1", "b2", "b3", "b4"},
+            current_sell_ids={"s1", "s2"},
+        )
+
+        self.assertFalse(
+            any(call[0] == "sell" for call in loop.offer_manager.create_calls),
+            "sell creation must pause until pending cancels disappear from Sage",
+        )
+
+    def test_wallet_active_pending_cancel_watchdog_queues_stale_retry(self):
+        loop = bot_loop.BotLoop()
+        loop.offer_manager._pending_cancel_retries = {}
+        loop._pending_cancel_settle_seen = {
+            "stuck-sell": {
+                "side": "sell",
+                "first_seen": 1000.0,
+                "last_retry": 0.0,
+                "retries": 0,
+            },
+            "gone-sell": {
+                "side": "sell",
+                "first_seen": 1000.0,
+                "last_retry": 0.0,
+                "retries": 0,
+            },
+        }
+        loop._pending_cancel_settle_retry_secs = 300.0
+
+        with patch.object(bot_loop.time, "time", return_value=1401.0):
+            loop._track_pending_cancel_settle_watchdog({
+                "buy": set(),
+                "sell": {"stuck-sell"},
+            })
+
+        self.assertIn("stuck-sell", loop.offer_manager._pending_cancel_retries)
+        self.assertEqual(
+            loop.offer_manager._pending_cancel_retries["stuck-sell"]["attempts"],
+            0,
+        )
+        self.assertEqual(loop._pending_cancel_settle_seen["stuck-sell"]["retries"], 1)
+        self.assertNotIn("gone-sell", loop._pending_cancel_settle_seen)
+
+    def test_wallet_active_pending_cancel_watchdog_uses_db_cancel_age_for_new_ids(self):
+        loop = bot_loop.BotLoop()
+        loop.offer_manager._pending_cancel_retries = {}
+        loop._pending_cancel_settle_retry_secs = 300.0
+
+        with patch.object(bot_loop.time, "time", return_value=1401.0), \
+                patch.object(bot_loop, "get_offer", return_value={
+                    "cancel_last_attempt_at": "1970-01-01T00:16:40+00:00",
+                }):
+            loop._track_pending_cancel_settle_watchdog({
+                "buy": set(),
+                "sell": {"old-sell"},
+            })
+
+        self.assertIn("old-sell", loop.offer_manager._pending_cancel_retries)
+        self.assertEqual(loop._pending_cancel_settle_seen["old-sell"]["first_seen"], 1000.0)
+
+    def test_forced_requote_waits_for_wallet_active_pending_cancels(self):
+        loop = bot_loop.BotLoop()
+        loop._loop_count = 6
+        loop._last_quoted_price["sell"] = Decimal("1.00")
+        loop._force_requote["sell"] = True
+        loop._pending_cancel_wallet_ids_by_side = {
+            "buy": set(),
+            "sell": {"pending-sell"},
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            loop._handle_requoting(Decimal("1.20"), set(), set())
+
+        self.assertEqual(loop.offer_manager.requote_calls, [])
+        self.assertTrue(
+            loop._force_requote["sell"],
+            "forced requote should retry after pending cancels settle",
+        )
+
+    def test_opposite_side_requote_waits_during_recent_tibet_shock_guard(self):
+        loop = bot_loop.BotLoop()
+        loop._loop_count = 6
+        loop._last_quoted_price["sell"] = Decimal("1.00")
+        loop._last_tibet_shock = {
+            "at": time.time(),
+            "direction": "down",
+            "pct": 9.68,
+            "sides": ("buy",),
+            "tiers": ("inner", "mid"),
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            loop._handle_requoting(
+                Decimal("0.90"),
+                current_buy_ids={"buy-live"},
+                current_sell_ids={"sell-live"},
+            )
+
+        self.assertEqual(
+            loop.offer_manager.requote_calls,
+            [],
+            "non-vulnerable sell requote should wait during a recent down-shock guard",
+        )
+        self.assertTrue(
+            loop._force_requote["sell"],
+            "deferred opposite-side requote should retry after the guard expires",
+        )
+
+    def test_mempool_price_move_refreshes_tibet_cache_and_marks_reprice(self):
+        loop = bot_loop.BotLoop()
+        loop._running = True
+        injected = []
+        invalidated = []
+
+        class _PriceEngine:
+            def inject_tibet_reserves(self, **kwargs):
+                injected.append(kwargs)
+                return True
+
+            def invalidate_tibet_cache(self):
+                invalidated.append(True)
+
+        class _Watcher:
+            def get_pending_signals(self):
+                return [{
+                    "type": "price_move",
+                    "direction": "up",
+                    "magnitude_pct": 7.684,
+                    "timestamp": 123.0,
+                    "delta_xch": 42,
+                    "old_xch_reserve": 1000,
+                    "old_tok_reserve": 5000,
+                    "new_xch_reserve": 1100,
+                    "new_tok_reserve": 4500,
+                    "old_price_xch": 0.00017369,
+                    "new_price_xch": 0.00018716,
+                    "pair_id": "pair-1",
+                }]
+
+        fake_mempool = types.SimpleNamespace(_watcher_instance=_Watcher())
+        loop.price_engine = _PriceEngine()
+
+        with patch.object(bot_loop, "_mempool_watcher_mod", fake_mempool), \
+                patch.object(bot_loop.time, "time", return_value=1000.0):
+            loop._drain_mempool_signals(in_cycle=True)
+
+        self.assertEqual(len(injected), 1)
+        self.assertEqual(injected[0]["pair_id"], "pair-1")
+        self.assertEqual(injected[0]["xch_reserve"], 1100)
+        self.assertEqual(injected[0]["token_reserve"], 4500)
+        self.assertFalse(invalidated)
+        self.assertTrue(loop._mempool_price_refresh_needed)
+        self.assertEqual(loop._watcher_data["last_change_ts"], 1000.0)
+        self.assertEqual(loop._watcher_data["last_xch_reserve"], 1100)
+        self.assertEqual(loop._watcher_data["last_token_reserve"], 4500)
+        self.assertEqual(loop._watcher_data["last_confirmed_price_xch"], "0.00018716")
+
+    def test_mempool_price_move_invalidates_cache_when_injection_misses(self):
+        loop = bot_loop.BotLoop()
+        loop._running = True
+        invalidated = []
+
+        class _PriceEngine:
+            def inject_tibet_reserves(self, **kwargs):
+                del kwargs
+                return False
+
+            def invalidate_tibet_cache(self):
+                invalidated.append(True)
+
+        class _Watcher:
+            def get_pending_signals(self):
+                return [{
+                    "type": "price_move",
+                    "direction": "down",
+                    "magnitude_pct": 5.0,
+                    "timestamp": 123.0,
+                    "delta_xch": -42,
+                    "new_xch_reserve": 900,
+                    "new_tok_reserve": 5500,
+                    "new_price_xch": 0.00016000,
+                    "pair_id": "pair-2",
+                }]
+
+        fake_mempool = types.SimpleNamespace(_watcher_instance=_Watcher())
+        loop.price_engine = _PriceEngine()
+
+        with patch.object(bot_loop, "_mempool_watcher_mod", fake_mempool):
+            loop._drain_mempool_signals(in_cycle=False)
+
+        self.assertTrue(invalidated)
+        self.assertFalse(loop._mempool_price_refresh_needed)
+
+    def test_mempool_price_move_respects_configured_shock_trigger(self):
+        loop = bot_loop.BotLoop()
+        loop._running = True
+        original_trigger = getattr(fake_config.cfg, "TIBET_SHOCK_CANCEL_TRIGGER_PCT", None)
+        fake_config.cfg.TIBET_SHOCK_CANCEL_TRIGGER_PCT = Decimal("2.5")
+        cancel_calls = []
+
+        class _PriceEngine:
+            def inject_tibet_reserves(self, **kwargs):
+                del kwargs
+                return True
+
+            def invalidate_tibet_cache(self):
+                raise AssertionError("cache should not invalidate on successful injection")
+
+        class _Watcher:
+            def get_pending_signals(self):
+                return [{
+                    "type": "price_move",
+                    "direction": "up",
+                    "magnitude_pct": 2.0,
+                    "timestamp": 123.0,
+                    "delta_xch": 42,
+                    "new_xch_reserve": 1100,
+                    "new_tok_reserve": 4500,
+                    "new_price_xch": 0.00018716,
+                    "pair_id": "pair-1",
+                }]
+
+        def _cancel_tiers(*args, **kwargs):
+            cancel_calls.append((args, kwargs))
+            return 1
+
+        fake_mempool = types.SimpleNamespace(_watcher_instance=_Watcher())
+        loop.price_engine = _PriceEngine()
+        loop._defensive_cancel_tiers = _cancel_tiers
+
+        try:
+            with patch.object(bot_loop, "_mempool_watcher_mod", fake_mempool):
+                loop._drain_mempool_signals(in_cycle=False)
+        finally:
+            if original_trigger is None:
+                delattr(fake_config.cfg, "TIBET_SHOCK_CANCEL_TRIGGER_PCT")
+            else:
+                fake_config.cfg.TIBET_SHOCK_CANCEL_TRIGGER_PCT = original_trigger
+
+        self.assertEqual(cancel_calls, [])
+
+    def test_pending_mempool_reprice_updates_cycle_mid(self):
+        loop = bot_loop.BotLoop()
+        loop._mempool_price_refresh_needed = True
+        arb_updates = []
+
+        class _PriceEngine:
+            def get_price(self, *args, **kwargs):
+                del args, kwargs
+                return {
+                    "mid_price": Decimal("1.25"),
+                    "dexie_price": Decimal("1.10"),
+                    "tibet_price": Decimal("1.30"),
+                    "arb_gap_bps": Decimal("1818.18"),
+                }
+
+        class _RiskManager:
+            def update_arb_gap(self, arb_gap):
+                arb_updates.append(arb_gap)
+
+        loop.price_engine = _PriceEngine()
+        loop.risk_manager = _RiskManager()
+
+        mid, arb_gap, fresh = loop._refresh_price_if_mempool_move_pending(
+            Decimal("1.00"),
+            Decimal("0"),
+        )
+
+        self.assertEqual(mid, Decimal("1.25"))
+        self.assertEqual(arb_gap, Decimal("1818.18"))
+        self.assertEqual(fresh["tibet_price"], Decimal("1.30"))
+        self.assertFalse(loop._mempool_price_refresh_needed)
+        self.assertEqual(loop._current_mid_price, Decimal("1.25"))
+        self.assertEqual(loop._bot_state["mid_price"], "1.25")
+        self.assertEqual(arb_updates, [Decimal("1818.18")])
+
+    def test_mempool_reprice_replaces_cycle_price_data_for_probe_launch(self):
+        loop = bot_loop.BotLoop()
+        loop._mempool_price_refresh_needed = True
+
+        class _PriceEngine:
+            def get_price(self, *args, **kwargs):
+                del args, kwargs
+                return {
+                    "mid_price": Decimal("1.25"),
+                    "dexie_price": Decimal("1.10"),
+                    "tibet_price": Decimal("1.30"),
+                    "arb_gap_bps": Decimal("1818.18"),
+                }
+
+        class _RiskManager:
+            def update_arb_gap(self, arb_gap):
+                del arb_gap
+
+        loop.price_engine = _PriceEngine()
+        loop.risk_manager = _RiskManager()
+        stale_price_data = {
+            "mid_price": Decimal("1.00"),
+            "dexie_price": Decimal("0.95"),
+            "tibet_price": Decimal("0.90"),
+            "arb_gap_bps": Decimal("0"),
+        }
+
+        price_data, mid, arb_gap = loop._refresh_cycle_price_after_mempool_move(
+            stale_price_data,
+            Decimal("1.00"),
+            Decimal("0"),
+        )
+
+        self.assertEqual(mid, Decimal("1.25"))
+        self.assertEqual(arb_gap, Decimal("1818.18"))
+        self.assertEqual(price_data["tibet_price"], Decimal("1.30"))
+        self.assertEqual(price_data["dexie_price"], Decimal("1.10"))
 
     def test_handle_requoting_updates_baseline_to_anchored_mid(self):
         loop = bot_loop.BotLoop()

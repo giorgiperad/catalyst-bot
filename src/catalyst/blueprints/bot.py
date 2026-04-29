@@ -115,6 +115,7 @@ def api_bot_start():
     errors = []
     needs_coin_prep = False
     coin_prep_error = None
+    coin_prep_reason = None
     tier_size_drift = []
 
     # Check CAT_ASSET_ID is configured
@@ -183,6 +184,7 @@ def api_bot_start():
         if _drift:
             tier_size_drift = _drift
             needs_coin_prep = True
+            coin_prep_reason = "tier_size_drift"
             _summary = ", ".join(
                 f"{f['side']}/{f['tier']}={f['ratio']}× (n={f['coin_count']})"
                 for f in _drift
@@ -195,13 +197,38 @@ def api_bot_start():
     except Exception as _drift_err:
         warnings.append(f"Tier-drift gate skipped: {_drift_err}")
 
+    if getattr(cfg, "ENABLE_COIN_PREP", False):
+        try:
+            _prep_state = getattr(server, "_coin_prep_state", {}) or {}
+            _prep_running = bool(_prep_state.get("running"))
+            _prep_error = str(_prep_state.get("error") or "").strip()
+            _prep_phase = str(_prep_state.get("phase") or "").strip().lower()
+
+            if _prep_running:
+                needs_coin_prep = True
+                coin_prep_reason = "coin_prep_running"
+                coin_prep_error = (
+                    "Coin Prep is still running - wait for it to finish before starting the bot"
+                )
+                errors.append(coin_prep_error)
+            elif _prep_error or _prep_phase == "error":
+                needs_coin_prep = True
+                coin_prep_reason = "coin_prep_failed"
+                detail = f": {_prep_error}" if _prep_error else ""
+                coin_prep_error = (
+                    "Coin Prep failed - rerun Coin Prep before starting the bot" + detail
+                )
+                errors.append(coin_prep_error)
+        except Exception as _prep_gate_err:
+            warnings.append(f"Coin-prep gate skipped: {_prep_gate_err}")
+
     # Block start on critical errors
     if errors:
         payload = {"success": False, "status": "error", "errors": errors, "warnings": warnings}
         if needs_coin_prep:
             payload.update({
                 "needs_coin_prep": True,
-                "reason": "tier_size_drift",
+                "reason": coin_prep_reason or "coin_prep_required",
                 "error": coin_prep_error or errors[-1],
                 "message": coin_prep_error or errors[-1],
                 "tier_size_drift": tier_size_drift,

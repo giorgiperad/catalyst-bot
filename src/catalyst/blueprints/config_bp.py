@@ -133,6 +133,9 @@ _KEY_MAP = {
     "requote_bps": "REQUOTE_BPS",
     "requote_cooldown": "REQUOTE_COOLDOWN_SECS",
     "requote_batch_size": "REQUOTE_BATCH_SIZE",
+    "tibet_shock_cancel_trigger_pct": "TIBET_SHOCK_CANCEL_TRIGGER_PCT",
+    "tibet_shock_cancel_mid_pct": "TIBET_SHOCK_CANCEL_MID_PCT",
+    "tibet_shock_cancel_outer_pct": "TIBET_SHOCK_CANCEL_OUTER_PCT",
     "xch_reserve": "XCH_RESERVE",
     "cat_reserve": "CAT_RESERVE",
     "dry_run": "DRY_RUN",
@@ -604,6 +607,7 @@ def api_settings_validate():
     default_trade_xch = _decimal_value("default_trade_xch", "DEFAULT_TRADE_XCH")
     sniper_rearm_price_move = _decimal_value("sniper_rearm_price_move_bps", "SNIPER_REARM_PRICE_MOVE_BPS")
     sniper_rearm_gap_move = _decimal_value("sniper_rearm_gap_move_bps", "SNIPER_REARM_GAP_MOVE_BPS")
+    shock_trigger_pct = _decimal_value("tibet_shock_cancel_trigger_pct", "TIBET_SHOCK_CANCEL_TRIGGER_PCT")
     dynamic_enabled = _bool_value("dynamic_spread_enabled", "DYNAMIC_SPREAD_ENABLED")
     inventory_enabled = _bool_value("inventory_enabled", "INVENTORY_ENABLED")
     competitor_enabled = _bool_value("competitor_aware_enabled", "COMPETITOR_AWARE_ENABLED")
@@ -705,6 +709,16 @@ def api_settings_validate():
             warnings.append("Sniper re-arm arb gap move of 0% makes sniper re-arm on every qualifying gap")
         elif sniper_rearm_gap_move < Decimal("25"):
             warnings.append("Sniper re-arm arb gap move below 0.25% may create frequent tiny probes")
+
+    if shock_trigger_pct is not None:
+        if shock_trigger_pct < 0:
+            errors.append("Tibet shock cancel threshold must be zero or greater")
+        elif shock_trigger_pct == 0:
+            pass
+        elif shock_trigger_pct < Decimal("0.5"):
+            warnings.append("Tibet shock cancel threshold below 0.5% may churn offers on normal pool noise")
+        elif shock_trigger_pct > Decimal("20"):
+            warnings.append("Tibet shock cancel threshold above 20% may react too late to stale offers")
 
     if dynamic_enabled is False and (inventory_enabled or competitor_enabled):
         warnings.append(

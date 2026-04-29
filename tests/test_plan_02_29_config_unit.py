@@ -135,6 +135,12 @@ class TestGetRequoteFraction(unittest.TestCase):
 
 
 @unittest.skipIf(_SKIP_CFG is not None, f"config unavailable: {_SKIP_CFG}")
+class TestTibetShockConfig(unittest.TestCase):
+    def test_shock_threshold_is_gui_updatable(self):
+        self.assertIn("TIBET_SHOCK_CANCEL_TRIGGER_PCT", Config._UPDATABLE_KEYS)
+
+
+@unittest.skipIf(_SKIP_CFG is not None, f"config unavailable: {_SKIP_CFG}")
 class TestIsTwoSided(unittest.TestCase):
     def test_two_sided_mode_both_enabled(self):
         c = _bare_config(LIQUIDITY_MODE="two_sided", ENABLE_BUY=True, ENABLE_SELL=True)

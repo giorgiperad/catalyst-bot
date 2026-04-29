@@ -4695,6 +4695,8 @@ class CoinManager:
                 cat_tier_mojos = self._get_tier_sizes_mojos(is_cat=True)
                 xch_inv = self._classify_coins_by_designation(xch_records, "xch", xch_tier_mojos)
                 cat_inv = self._classify_coins_by_designation(cat_records, "cat", cat_tier_mojos)
+                if self._fee_pool_enabled():
+                    self.fee_pool.refresh(xch_inv.get("fees", []))
 
                 # Log tier breakdown
                 tier_names = self._configured_tier_names()
@@ -6155,6 +6157,59 @@ class CoinManager:
                       f"Could not record topup pool refund ({amount_mojos} mojos, "
                       f"is_cat={is_cat}): {exc}")
 
+    def _stamp_topup_output_designations(self, name: str, wallet_id: int,
+                                         output_coin_ids: List[str],
+                                         owned_amounts: Dict[str, int],
+                                         is_cat: bool) -> None:
+        """Persist intended tier designations for freshly split topup outputs.
+
+        Sage one-step splits surface output IDs before the normal inventory scan
+        has inserted/classified them. If sniper/fee-sized outputs reach that scan
+        as unknown coins, the generic size classifier can route them to small/dust
+        and the misfit absorber folds them back into reserve. Stamp the intended
+        tier immediately while the split context still tells us what these coins
+        were created for.
+        """
+        label = str(name or "").strip().lower()
+        tier_name = label.rsplit("-", 1)[-1] if "-" in label else label
+        valid_tiers = {"inner", "mid", "outer", "extreme", "sniper", get_fee_tier_name()}
+        if tier_name not in valid_tiers:
+            return
+
+        wallet_type = "cat" if is_cat else "xch"
+        stamped = 0
+        try:
+            from database import upsert_coin, set_coin_designation
+            for raw_cid in output_coin_ids or []:
+                cid = str(raw_cid or "").strip()
+                if not cid:
+                    continue
+                amount = int((owned_amounts or {}).get(raw_cid)
+                             or (owned_amounts or {}).get(cid)
+                             or 0)
+                if amount <= 0:
+                    continue
+                upsert_coin(
+                    coin_id=cid,
+                    wallet_type=wallet_type,
+                    amount_mojos=amount,
+                    tier=tier_name,
+                    designation="tier_spare",
+                    assigned_tier=tier_name,
+                )
+                set_coin_designation(cid, "tier_spare", tier_name)
+                stamped += 1
+        except Exception as exc:
+            log_event("warning", f"topup_{label}_stamp_failed",
+                      f"Could not stamp {wallet_type.upper()} topup outputs "
+                      f"as {tier_name}: {exc}")
+            return
+
+        if stamped:
+            log_event("debug", f"topup_{label}_outputs_stamped",
+                      f"Stamped {stamped} {wallet_type.upper()} topup output "
+                      f"coin(s) as tier_spare/{tier_name}")
+
     def _sage_one_step_split(self, name: str, wallet_id: int,
                               source_coin_id: str, num_to_create: int,
                               trading_size_mojos: int, is_cat: bool) -> bool:
@@ -6215,6 +6270,21 @@ class CoinManager:
         pre_owned_map = self._get_owned_coin_amount_map(wallet_id, f"{tag}-pre-osstep") or {}
         pre_owned_ids = set(pre_owned_map.keys())
 
+        fee_mojos = self._tx_fee_mojos()
+        fee_coin_id = None
+        if is_cat and fee_mojos > 0 and self._fee_pool_enabled():
+            fee_coin_id = self.fee_pool.reserve()
+            if fee_coin_id:
+                log_event("info", f"{tag}_fee_coin_reserved",
+                          f"Reserved XCH fee coin {fee_coin_id[:12]}... "
+                          f"for CAT top-up split")
+            else:
+                log_event("warning", f"{tag}_fee_coin_unavailable",
+                          "Fee pool enabled but no unreserved XCH fee coin "
+                          "is available for CAT top-up; refusing this split "
+                          "so Sage cannot auto-select a pending fee input")
+                return False
+
         log_event("info", f"{tag}_osstep_start",
                   f"Sage one-step split: {num_to_create}×{size_str} from "
                   f"topup pool coin {source_coin_id[:12]}... via /create_transaction")
@@ -6226,8 +6296,9 @@ class CoinManager:
                 num_coins=num_to_create,
                 trading_size_mojos=trading_size_mojos,
                 own_address=address,
-                fee_mojos=self._tx_fee_mojos(),
+                fee_mojos=fee_mojos,
                 is_cat=is_cat,
+                fee_coin_id=fee_coin_id,
             )
             if not result:
                 if self._spacescan_self_send_confirmed(source_coin_id, address, tag):
@@ -6326,6 +6397,13 @@ class CoinManager:
                           else f"{owned_count}/{num_to_create} owned, selectable lagging")
                 log_event("info", f"{tag}_osstep_confirmed",
                           f"One-step split confirmed after {elapsed}s ({detail})")
+                self._stamp_topup_output_designations(
+                    name=name,
+                    wallet_id=wallet_id,
+                    output_coin_ids=new_coins[:num_to_create],
+                    owned_amounts=owned_map,
+                    is_cat=is_cat,
+                )
                 return True
 
             if elapsed % 20 == 0 and elapsed > 0:
@@ -6352,6 +6430,13 @@ class CoinManager:
             log_event("info", f"{tag}_osstep_confirmed",
                       f"One-step split confirmed after timeout "
                       f"({owned_count}/{num_to_create} owned, selectable lagging)")
+            self._stamp_topup_output_designations(
+                name=name,
+                wallet_id=wallet_id,
+                output_coin_ids=new_coins[:num_to_create],
+                owned_amounts=owned_map,
+                is_cat=is_cat,
+            )
             return True
 
         # IMPORTANT: returning False here means the caller does NOT record

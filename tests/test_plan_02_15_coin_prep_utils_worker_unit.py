@@ -4,6 +4,7 @@ import hashlib
 import sys
 import os
 import unittest
+from decimal import Decimal
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -66,6 +67,9 @@ class TestShouldRetryUnconsumedSplit(unittest.TestCase):
     def test_custom_max_retries(self):
         self.assertTrue(self._call(retries_used=1, max_retries=2))
         self.assertFalse(self._call(retries_used=2, max_retries=2))
+
+    def test_false_when_outputs_were_already_observed(self):
+        self.assertFalse(self._call(owned_output_high_water=14, expected_count=14))
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +394,33 @@ class TestComputeCoinId(unittest.TestCase):
         r1 = CoinPrepWorker._compute_coin_id("0x" + self._PARENT, "0x" + self._PUZZLE, 1)
         r2 = CoinPrepWorker._compute_coin_id(self._PARENT, self._PUZZLE, 1)
         self.assertEqual(r1, r2)
+
+
+class TestPartitionCoinsForDesignation(unittest.TestCase):
+
+    def test_xch_fee_outputs_with_full_fee_delta_still_match_fee_tier(self):
+        worker = object.__new__(CoinPrepWorker)
+        worker.tier_enabled = True
+        worker.tier_order = ["fees"]
+        worker.xch_tier_counts = {"fees": 2}
+        worker.cat_tier_counts = {}
+        worker.tier_xch_sizes = {"fees": Decimal("0.00115")}
+        worker.tier_cat_sizes = {}
+        worker.cat_decimals = 3
+        worker._tx_fee_mojos = lambda: 13_079_100
+
+        assigned, unmatched = CoinPrepWorker._partition_coins_for_designation(
+            worker,
+            [
+                {"coin_id": "a", "amount": 1_136_920_900},
+                {"coin_id": "b", "amount": 1_136_920_900},
+                {"coin_id": "reserve", "amount": 45_000_000_000_000},
+            ],
+            "xch",
+        )
+
+        self.assertEqual(len(assigned["fees"]), 2)
+        self.assertEqual([coin["coin_id"] for coin in unmatched], ["reserve"])
 
 
 if __name__ == "__main__":

@@ -177,6 +177,7 @@ _cls_mod("price_engine", "PriceEngine", _PE)
 _cls_mod("offer_manager", "OfferManager", _OM)
 _cls_mod("fill_tracker", "FillTracker", _FT)
 _cls_mod("dexie_manager", "DexieManager", _DM)
+sys.modules["dexie_manager"].get_offer_detail = lambda *a, **kw: {"status": 0}
 _cls_mod("splash_manager", "SplashManager", _SM)
 _cls_mod("splash_node", "SplashNode", _SN)
 _cls_mod("coinset_client", "CoinsetClient", _CC)

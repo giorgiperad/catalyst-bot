@@ -284,6 +284,7 @@ _module_with_class("price_engine", "PriceEngine", _DummyPriceEngine)
 _module_with_class("offer_manager", "OfferManager", _DummyOfferManager)
 _module_with_class("fill_tracker", "FillTracker", _DummyFillTracker)
 _module_with_class("dexie_manager", "DexieManager", _DummyDexieManager)
+sys.modules["dexie_manager"].get_offer_detail = lambda *args, **kwargs: {"status": 0}
 _module_with_class("splash_manager", "SplashManager", _DummySplashManager)
 _module_with_class("splash_node", "SplashNode", _DummySplashNode)
 _module_with_class("coinset_client", "CoinsetClient", _DummyCoinsetClient)

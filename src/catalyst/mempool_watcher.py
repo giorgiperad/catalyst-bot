@@ -366,6 +366,7 @@ class MempoolWatcher:
                 "delta_tok": new_tok - old_tok,
                 "old_price_xch": float(old_price),
                 "new_price_xch": float(new_price),
+                "pair_id": self._pair_id,
                 "pool_coin_changed": (old_coin != new_coin),
             }
             with self._lock:

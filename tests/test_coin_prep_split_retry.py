@@ -3,6 +3,7 @@ from pathlib import Path
 
 from coin_prep_utils import (
     should_extend_pending_consumed_split_grace,
+    should_wait_for_pending_fee_inputs_before_split,
     should_retry_unconsumed_split,
 )
 
@@ -133,6 +134,42 @@ class TestCoinPrepSplitRetry(unittest.TestCase):
             "Expected 'Split confirmation failed within Xs' abort message not found",
         )
         self.assertNotIn("split not confirmed after {timeout_s}s — proceeding cautiously", source)
+
+
+    def test_worker_uses_transaction_builder_for_sage_cat_splits(self):
+        source = (Path(__file__).resolve().parent.parent / "src" / "catalyst" / "coin_prep_worker.py").read_text(encoding="utf-8")
+        self.assertIn("sage_topup_split", source)
+        self.assertIn("if is_cat:", source)
+        self.assertIn("amount_per_coin = pool_mojos // count", source)
+
+    def test_fee_paid_cat_splits_wait_for_fee_inputs(self):
+        self.assertTrue(
+            should_wait_for_pending_fee_inputs_before_split(is_cat=True, fee_mojos=1)
+        )
+        self.assertFalse(
+            should_wait_for_pending_fee_inputs_before_split(
+                is_cat=True,
+                fee_mojos=1,
+                has_dedicated_fee_coin=True,
+            )
+        )
+        self.assertFalse(
+            should_wait_for_pending_fee_inputs_before_split(is_cat=True, fee_mojos=0)
+        )
+        self.assertFalse(
+            should_wait_for_pending_fee_inputs_before_split(is_cat=False, fee_mojos=1)
+        )
+
+    def test_worker_serializes_fee_paid_sage_cat_splits(self):
+        source = (Path(__file__).resolve().parent.parent / "src" / "catalyst" / "coin_prep_worker.py").read_text(encoding="utf-8")
+        self.assertIn("should_wait_for_pending_fee_inputs_before_split(", source)
+        self.assertIn("CAT {tier_name} fee-input-ready", source)
+
+    def test_worker_prefunds_dedicated_cat_split_fee_inputs(self):
+        source = (Path(__file__).resolve().parent.parent / "src" / "catalyst" / "coin_prep_worker.py").read_text(encoding="utf-8")
+        self.assertIn("_prepare_cat_split_fee_coins", source)
+        self.assertIn("fee_coin_id=fee_coin_id", source)
+        self.assertIn("has_dedicated_fee_coin=bool(fee_coin_id)", source)
 
 
 if __name__ == "__main__":

@@ -16,6 +16,8 @@ Thread-safe via `_lock`. All mutating operations should be called while holding
 the lock, and any coin reservation crosses through shared state guarded here.
 """
 
+import json
+import os
 import time
 import threading
 from decimal import Decimal, ROUND_DOWN
@@ -201,6 +203,10 @@ class OfferManager:
             "last_success_at": 0.0,
             "last_failure_at": 0.0,
             "cache_size": 0,
+        }
+        self._expected_empty_wallet_book: Dict[str, Any] = {
+            "until": 0.0,
+            "reason": "",
         }
 
     # -------------------------------------------------------------------
@@ -2492,20 +2498,15 @@ class OfferManager:
                      live_offer_ids: set = None,
                      max_offers: int = 0,
                      allowed_tiers: set = None) -> List[Dict]:
-        """Single-pass requote: create new offers then fire-and-forget cancel
-        old ones.
+        """Single-pass requote: cancel old offers, then create replacements.
 
-        Simplified from the rolling-wave approach.  One pass through:
+        One pass through:
             1. Count spare coins available for this side
-            2. Create new offers at the updated price (limited by spares)
-            3. Post them to Dexie immediately
-            4. Fire-and-forget cancel matching old offers (skip_confirmation)
-            5. Return — the trim pass (step 12a) handles any residual excess
-
-        No rolling waves, no cancel-first fallback, no inter-batch coin
-        polling, no overalloc guard.  The trim pass already runs every
-        cycle and cancels furthest-from-mid offers above the per-side cap,
-        which naturally cleans up any slow-confirming cancels.
+            2. Cancel matching old offers and wait for confirmed removal
+            3. Create replacements only for confirmed cancelled slots
+            4. Post replacements to Dexie immediately
+            5. Return; pending cancels stay open and block replacement
+               creation until Sage stops reporting them fillable.
 
         Args:
             max_offers: If > 0, create/cancel at most this many offers.
@@ -2702,11 +2703,64 @@ class OfferManager:
                 "tier_filter_drained": False,
             }
 
-        # ── Step 1: Create new offers at new price ──
+        # Cancel old offers first. Creating before cancellation briefly
+        # over-stacks the side whenever Sage keeps cancelled offers
+        # wallet-active for another cycle.
         create_count = min(target_count, spare_count)
-        log_event("info", "requote_creating",
-                  f"Requote {side}: creating {create_count} new offers "
+        log_event("info", "requote_cancel_first",
+                  f"Requote {side}: cancelling {create_count} old offers "
                   f"({spare_count} spares, target {target_count})")
+
+        cancel_ids = [o["trade_id"] for o in open_offers[:create_count]
+                      if o.get("trade_id")]
+        if not cancel_ids:
+            log_event("info", "requote_no_cancel_ids",
+                      f"Requote {side}: no cancellable trade IDs found")
+            return {
+                "offers": [],
+                "fully_replaced": False,
+                "replaced_count": 0,
+                "target_count": target_count,
+                "original_target_count": original_target_count,
+                "tier_filter_drained": False,
+            }
+
+        cancel_results = self.cancel_offers(
+            cancel_ids, reason="requote", skip_confirmation=False)
+        confirmed_cancel_ids = []
+        pending_cancel_ids = []
+        failed_cancel_ids = []
+        for tid in cancel_ids:
+            result = (cancel_results or {}).get(tid) or {}
+            if result.get("success"):
+                method = str(result.get("method") or "")
+                if method in CANCEL_PENDING_METHODS:
+                    pending_cancel_ids.append(tid)
+                else:
+                    confirmed_cancel_ids.append(tid)
+            else:
+                failed_cancel_ids.append(tid)
+
+        if not confirmed_cancel_ids:
+            log_event("info", "requote_waiting_for_cancel_settle",
+                      f"Requote {side}: {len(pending_cancel_ids)} cancel(s) "
+                      f"still pending, {len(failed_cancel_ids)} failed; "
+                      "replacement creation held to avoid over-stacking")
+            with self._lock:
+                self._last_requote_time[side] = time.time()
+            return {
+                "offers": [],
+                "fully_replaced": False,
+                "replaced_count": 0,
+                "target_count": target_count,
+                "original_target_count": original_target_count,
+                "tier_filter_drained": False,
+            }
+
+        create_count = len(confirmed_cancel_ids)
+        log_event("info", "requote_creating",
+                  f"Requote {side}: creating {create_count} replacement "
+                  f"offers after confirmed cancels")
 
         # Use the full ladder size for tier classification so that
         # each replacement offer lands in the correct tier (inner/mid/outer/
@@ -2748,24 +2802,11 @@ class OfferManager:
                 if bech32 and trade_id:
                     dexie_manager.queue_post(bech32, trade_id)
 
-        # ── Step 3: Fire-and-forget cancel matching old offers ──
-        # Cancel the same number as created so the book stays near cap.
-        # skip_confirmation=True: don't block for on-chain confirmation.
-        # If cancels are slow the trim pass handles the transient excess.
-        cancel_count = min(len(new_offers), len(open_offers))
-        cancel_ids = [o["trade_id"] for o in open_offers[:cancel_count]
-                      if o.get("trade_id")]
-        if cancel_ids:
-            log_event("info", "requote_cancel",
-                      f"Requote {side}: fire-and-forget cancel of "
-                      f"{len(cancel_ids)} old offers")
-            self.cancel_offers(cancel_ids, reason="requote",
-                               skip_confirmation=True)
-
         log_event("info", "requote_done",
                   f"Requote {side} complete: created {len(new_offers)} new, "
-                  f"cancelled {len(cancel_ids)} old "
-                  f"(trim pass handles residual excess)")
+                  f"confirmed {len(confirmed_cancel_ids)} old cancel(s), "
+                  f"pending {len(pending_cancel_ids)}, "
+                  f"failed {len(failed_cancel_ids)}")
         # Requote did real work — stamp the cooldown timer now (not at entry)
         with self._lock:
             self._last_requote_time[side] = time.time()
@@ -2777,7 +2818,10 @@ class OfferManager:
         # drift baseline and skipped them until another trigger fired.
         return {
             "offers": new_offers,
-            "fully_replaced": len(new_offers) >= original_target_count,
+            "fully_replaced": (
+                len(new_offers) >= original_target_count
+                and len(confirmed_cancel_ids) >= original_target_count
+            ),
             "replaced_count": len(new_offers),
             "target_count": target_count,
             "original_target_count": original_target_count,
@@ -3049,6 +3093,7 @@ class OfferManager:
                 log_event("error", "cancel_all", f"Wallet RPC fallback failed: {e}")
 
         if not trade_ids:
+            self.expect_empty_wallet_offer_book("cancel_all_no_active_offers")
             emit_progress(
                 running=False,
                 complete=True,
@@ -3193,6 +3238,8 @@ class OfferManager:
             failed=failures,
             message=final_message,
         )
+        if confirmed_count > 0 and pending_count == 0:
+            self.expect_empty_wallet_offer_book("cancel_all_confirmed")
 
         return all_results
 
@@ -3669,6 +3716,74 @@ class OfferManager:
         """Return lightweight metadata about the last wallet offer sync."""
         return dict(self._wallet_sync_meta)
 
+    def expect_empty_wallet_offer_book(self, reason: str, ttl_seconds: int = 180) -> None:
+        """Allow the next empty wallet offer sync after an intentional cancel-all."""
+        self._expected_empty_wallet_book = {
+            "until": time.time() + max(1, int(ttl_seconds or 1)),
+            "reason": str(reason or "expected_empty_offer_book"),
+        }
+
+    def _cached_wallet_offer_ids(self) -> set:
+        ids = set()
+        for side in ("buy", "sell"):
+            for offer in self._wallet_sync_cache.get(side, []) or []:
+                tid = offer.get("trade_id") or offer.get("offer_id")
+                if tid:
+                    ids.add(str(tid))
+        return ids
+
+    def _worker_cancelled_empty_reason(self, cached_ids: set) -> str:
+        """Return a reason when coin prep intentionally cancelled cached offers."""
+        if not cached_ids:
+            return ""
+
+        try:
+            from user_paths import worker_cancelled_ids_file
+            cancelled_path = worker_cancelled_ids_file()
+        except Exception:
+            cancelled_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "worker_cancelled_ids.json",
+            )
+
+        if not cancelled_path or not os.path.exists(cancelled_path):
+            return ""
+
+        try:
+            with open(cancelled_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if isinstance(payload, dict):
+                cancelled_ids = payload.get("cancelled_ids") or []
+            else:
+                cancelled_ids = payload or []
+            cancelled_set = {
+                str(tid).strip()
+                for tid in cancelled_ids
+                if str(tid).strip()
+            }
+        except Exception as e:
+            log_event(
+                "debug",
+                "worker_cancelled_ids_read_failed",
+                f"Could not inspect coin-prep cancelled IDs: {e}",
+            )
+            return ""
+
+        if cached_ids.issubset(cancelled_set):
+            return "coin_prep_cancel_all"
+        return ""
+
+    def _expected_empty_wallet_reason(self, now_ts: float, cached_ids: set) -> str:
+        expected_until = float(
+            self._expected_empty_wallet_book.get("until", 0.0) or 0.0
+        )
+        if expected_until >= now_ts:
+            return str(
+                self._expected_empty_wallet_book.get("reason", "")
+                or "expected_empty_offer_book"
+            )
+        return self._worker_cancelled_empty_reason(cached_ids)
+
     def sync_from_wallet(self) -> Tuple[List, List, List]:
         """Sync offer state from the Chia wallet RPC.
 
@@ -3740,26 +3855,41 @@ class OfferManager:
             + len(self._wallet_sync_cache["sell"])
         )
         curr_total = len(open_buy) + len(open_sell)
+        _now = time.time()
+        expected_empty_reason = ""
         if curr_total == 0 and prev_total >= 5:
-            self._wallet_sync_meta.update({
-                "fresh": False,
-                "using_cache": True,
-                "consecutive_failures": int(self._wallet_sync_meta.get("consecutive_failures", 0) or 0) + 1,
-                "last_error": f"suspicious_empty_offers (prev={prev_total})",
-                "last_failure_at": time.time(),
-                "cache_size": prev_total,
-            })
-            log_event(
-                "warning",
-                "wallet_sync_suspicious_empty",
-                f"Wallet returned 0 offers but had {prev_total} a moment ago — "
-                f"treating as Sage sync hiccup, using cached view this cycle",
+            expected_empty_reason = self._expected_empty_wallet_reason(
+                _now,
+                self._cached_wallet_offer_ids(),
             )
-            return (
-                [dict(o) for o in self._wallet_sync_cache["buy"]],
-                [dict(o) for o in self._wallet_sync_cache["sell"]],
-                [dict(o) for o in self._wallet_sync_cache["closed"]],
-            )
+            if expected_empty_reason:
+                self._expected_empty_wallet_book = {"until": 0.0, "reason": ""}
+                log_event(
+                    "info",
+                    "wallet_sync_expected_empty",
+                    f"Wallet returned 0 offers after {expected_empty_reason}; "
+                    f"accepting empty book instead of cached {prev_total}-offer view",
+                )
+            else:
+                self._wallet_sync_meta.update({
+                    "fresh": False,
+                    "using_cache": True,
+                    "consecutive_failures": int(self._wallet_sync_meta.get("consecutive_failures", 0) or 0) + 1,
+                    "last_error": f"suspicious_empty_offers (prev={prev_total})",
+                    "last_failure_at": _now,
+                    "cache_size": prev_total,
+                })
+                log_event(
+                    "warning",
+                    "wallet_sync_suspicious_empty",
+                    f"Wallet returned 0 offers but had {prev_total} a moment ago - "
+                    f"treating as Sage sync hiccup, using cached view this cycle",
+                )
+                return (
+                    [dict(o) for o in self._wallet_sync_cache["buy"]],
+                    [dict(o) for o in self._wallet_sync_cache["sell"]],
+                    [dict(o) for o in self._wallet_sync_cache["closed"]],
+                )
 
         previous_failures = int(self._wallet_sync_meta.get("consecutive_failures", 0) or 0)
         self._wallet_sync_cache["buy"] = [dict(o) for o in open_buy]
@@ -3773,6 +3903,10 @@ class OfferManager:
             "last_success_at": time.time(),
             "cache_size": len(open_buy) + len(open_sell),
         })
+        if expected_empty_reason:
+            self._wallet_sync_meta["expected_empty_reason"] = expected_empty_reason
+        else:
+            self._wallet_sync_meta.pop("expected_empty_reason", None)
 
         if previous_failures > 0:
             log_event(

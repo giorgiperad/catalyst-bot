@@ -165,6 +165,33 @@ class TestBotStart(_FlaskBase):
         self.assertEqual(body.get("tier_size_drift"), drift)
         bot.start.assert_not_called()
 
+    def test_failed_coin_prep_blocks_start(self):
+        fake_cfg = _fake_cfg()
+        fake_cfg.ENABLE_COIN_PREP = True
+        bot = _make_bot(running=False)
+        failed_state = {
+            "running": False,
+            "complete": False,
+            "phase": "error",
+            "error": "Sage tier pool creation + splitting failed",
+        }
+        with patch.object(api_server, "bot", bot), \
+             patch.object(api_server, "cfg", fake_cfg), \
+             patch.dict(api_server._coin_prep_state, failed_state, clear=True), \
+             patch.object(api_server, "_get_sage_signing_block_reason", return_value=None), \
+             patch("wallet.get_wallet_sync_status",
+                   return_value={"reachable": True, "sync_state": "synced"}), \
+             patch("coin_manager.check_tier_size_drift_standalone",
+                   return_value=[]):
+            resp = self._post("/api/bot/start")
+
+        self.assertEqual(resp.status_code, 400)
+        body = resp.get_json()
+        self.assertTrue(body.get("needs_coin_prep"))
+        self.assertEqual(body.get("reason"), "coin_prep_failed")
+        self.assertIn("Sage tier pool creation", body.get("message", ""))
+        bot.start.assert_not_called()
+
     def test_signing_block_reason_prevents_start(self):
         """If _get_sage_signing_block_reason returns a string, start is blocked."""
         fake_cfg = _fake_cfg()

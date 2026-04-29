@@ -24,6 +24,8 @@ def should_retry_unconsumed_split(
     retries_used: int,
     retry_after_s: int = 60,
     max_retries: int = 1,
+    owned_output_high_water: int = 0,
+    expected_count: int = 0,
 ) -> bool:
     """Return True when a split looks silently missed and is worth retrying once.
 
@@ -38,7 +40,30 @@ def should_retry_unconsumed_split(
         return False
     if outputs_selectable:
         return False
+    if expected_count > 0 and owned_output_high_water >= expected_count:
+        return False
     return pool_coin_visible and pool_coin_selectable
+
+
+def should_wait_for_pending_fee_inputs_before_split(
+    *,
+    is_cat: bool,
+    fee_mojos: int,
+    has_dedicated_fee_coin: bool = False,
+) -> bool:
+    """Return True when a split may need a separate XCH fee input.
+
+    Sage CAT splits built through /create_transaction spend the CAT source
+    plus an XCH coin when an explicit fee action is present. Submitting several
+    fee-paid CAT splits while earlier spends are still pending can make Sage
+    reuse, hide, or race the same XCH fee/change coin. A caller-provided
+    dedicated XCH fee coin removes that shared-input risk for this split.
+    """
+    try:
+        fee = int(fee_mojos or 0)
+    except (TypeError, ValueError):
+        fee = 0
+    return bool(is_cat and fee > 0 and not has_dedicated_fee_coin)
 
 
 def should_extend_pending_consumed_split_grace(

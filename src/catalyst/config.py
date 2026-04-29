@@ -340,6 +340,12 @@ class Config:
         self.REQUOTE_DRIFT_MID   = _decimal("REQUOTE_DRIFT_MID",   "0.008")   # 80 bps
         self.REQUOTE_DRIFT_FULL  = _decimal("REQUOTE_DRIFT_FULL",  "0.02")    # 200 bps
         self.REQUOTE_DRIFT_EMERGENCY = _decimal("REQUOTE_DRIFT_EMERGENCY", "0.05")  # 500 bps
+        # TibetSwap confirmed-reserve shock protection. Trigger is a percent
+        # move, not bps. 0 preserves auto mode: half MIN_EDGE_BPS, with a
+        # 0.50% floor. Positive values give operators a direct threshold.
+        self.TIBET_SHOCK_CANCEL_TRIGGER_PCT = _decimal("TIBET_SHOCK_CANCEL_TRIGGER_PCT", "0")
+        self.TIBET_SHOCK_CANCEL_MID_PCT = _decimal("TIBET_SHOCK_CANCEL_MID_PCT", "5")
+        self.TIBET_SHOCK_CANCEL_OUTER_PCT = _decimal("TIBET_SHOCK_CANCEL_OUTER_PCT", "10")
 
         # ----- Reserves -----
         #
@@ -780,6 +786,8 @@ class Config:
         # Requoting
         "AUTO_REQUOTE", "REQUOTE_BPS", "REQUOTE_COOLDOWN_SECS",
         "REQUOTE_BATCH_SIZE", "REQUOTE_COIN_FREE_WAIT",
+        "TIBET_SHOCK_CANCEL_TRIGGER_PCT",
+        "TIBET_SHOCK_CANCEL_MID_PCT", "TIBET_SHOCK_CANCEL_OUTER_PCT",
         # Reserves + topup pool (F49)
         "XCH_RESERVE", "CAT_RESERVE", "MZ_RESERVE",
         "TOPUP_POOL_PCT", "TOPUP_POOL_XCH", "TOPUP_POOL_CAT",
@@ -1048,6 +1056,17 @@ class Config:
             warnings.append(
                 f"REQUOTE_BPS={requote} is very high (>2000 bps) — requotes will only "
                 f"fire after a 20%+ price move; stale offers may fill at bad prices"
+            )
+
+        shock_trigger = getattr(self, "TIBET_SHOCK_CANCEL_TRIGGER_PCT", Decimal("0"))
+        if shock_trigger < Decimal("0"):
+            errors.append(
+                "TIBET_SHOCK_CANCEL_TRIGGER_PCT cannot be negative"
+            )
+        elif shock_trigger > Decimal("20"):
+            warnings.append(
+                "TIBET_SHOCK_CANCEL_TRIGGER_PCT is above 20% — defensive "
+                "TibetSwap shock cancels may react too late"
             )
 
         # XCH_RESERVE: warn only on truly implausible values (typos). The old

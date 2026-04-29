@@ -1,5 +1,9 @@
 import importlib
+import json
+import os
 import sys
+import tempfile
+import time
 import types
 import unittest
 from unittest.mock import patch
@@ -132,6 +136,95 @@ class WalletSyncFailClosedTests(unittest.TestCase):
         self.assertEqual(meta["consecutive_failures"], 1)
         self.assertIn("timed out", meta["last_error"])
         self.assertTrue(any(evt == "wallet_sync_cache" for _, evt, _, _ in self.logged))
+
+    def test_expected_empty_wallet_book_after_cancel_all_bypasses_cache(self):
+        manager = self.offer_manager.OfferManager()
+
+        def fake_get_all_offers(*args, **kwargs):
+            if not hasattr(fake_get_all_offers, "_calls"):
+                fake_get_all_offers._calls = 0
+            fake_get_all_offers._calls += 1
+            if fake_get_all_offers._calls == 1:
+                return [{"trade_id": "seed"}]
+            return []
+
+        def fake_classify(all_offers, _asset_id):
+            if all_offers:
+                return (
+                    [{"trade_id": f"buy-live-{i}"} for i in range(3)],
+                    [{"trade_id": f"sell-live-{i}"} for i in range(3)],
+                    [],
+                )
+            return ([], [], [])
+
+        with patch.object(self.offer_manager, "get_all_offers", new=fake_get_all_offers), \
+                patch.object(self.offer_manager, "classify_offers_from_list", side_effect=fake_classify):
+            fresh_buy, fresh_sell, _ = manager.sync_from_wallet()
+            manager.expect_empty_wallet_offer_book("manual_cancel_all")
+            empty_buy, empty_sell, _ = manager.sync_from_wallet()
+
+        self.assertEqual(len(fresh_buy), 3)
+        self.assertEqual(len(fresh_sell), 3)
+        self.assertEqual(empty_buy, [])
+        self.assertEqual(empty_sell, [])
+
+        meta = manager.get_wallet_sync_meta()
+        self.assertTrue(meta["fresh"])
+        self.assertFalse(meta["using_cache"])
+        self.assertEqual(meta["cache_size"], 0)
+        self.assertEqual(meta.get("expected_empty_reason"), "manual_cancel_all")
+
+    def test_worker_cancelled_ids_file_bypasses_empty_cache_guard(self):
+        manager = self.offer_manager.OfferManager()
+        cancelled_ids = {
+            *(f"buy-live-{i}" for i in range(3)),
+            *(f"sell-live-{i}" for i in range(3)),
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cancelled_path = os.path.join(tmp, "worker_cancelled_ids.json")
+            with open(cancelled_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "cancelled_ids": sorted(cancelled_ids),
+                    "timestamp": time.time(),
+                }, f)
+
+            fake_user_paths = types.ModuleType("user_paths")
+            fake_user_paths.worker_cancelled_ids_file = lambda: cancelled_path
+
+            def fake_get_all_offers(*args, **kwargs):
+                if not hasattr(fake_get_all_offers, "_calls"):
+                    fake_get_all_offers._calls = 0
+                fake_get_all_offers._calls += 1
+                if fake_get_all_offers._calls == 1:
+                    return [{"trade_id": "seed"}]
+                return []
+
+            def fake_classify(all_offers, _asset_id):
+                if all_offers:
+                    return (
+                        [{"trade_id": f"buy-live-{i}"} for i in range(3)],
+                        [{"trade_id": f"sell-live-{i}"} for i in range(3)],
+                        [],
+                    )
+                return ([], [], [])
+
+            with patch.dict(sys.modules, {"user_paths": fake_user_paths}), \
+                    patch.object(self.offer_manager, "get_all_offers", new=fake_get_all_offers), \
+                    patch.object(self.offer_manager, "classify_offers_from_list", side_effect=fake_classify):
+                fresh_buy, fresh_sell, _ = manager.sync_from_wallet()
+                empty_buy, empty_sell, _ = manager.sync_from_wallet()
+
+        self.assertEqual(len(fresh_buy), 3)
+        self.assertEqual(len(fresh_sell), 3)
+        self.assertEqual(empty_buy, [])
+        self.assertEqual(empty_sell, [])
+
+        meta = manager.get_wallet_sync_meta()
+        self.assertTrue(meta["fresh"])
+        self.assertFalse(meta["using_cache"])
+        self.assertEqual(meta["cache_size"], 0)
+        self.assertEqual(meta.get("expected_empty_reason"), "coin_prep_cancel_all")
 
     def test_mass_disappearance_is_blocked_while_wallet_sync_is_stale(self):
         class _FakeOfferManager:

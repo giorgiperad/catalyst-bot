@@ -1440,12 +1440,15 @@ def create_transaction_rpc(selected_coin_ids: list, actions: list,
 
 def sage_topup_split(source_coin_id: str, num_coins: int, trading_size_mojos: int,
                      own_address: str, fee_mojos: int = 0,
-                     is_cat: bool = False) -> Optional[Dict]:
+                     is_cat: bool = False,
+                     fee_coin_id: Optional[str] = None) -> Optional[Dict]:
     """One-step topup split using Sage's /create_transaction endpoint.
 
-    Spends ONLY the designated topup pool coin (source_coin_id) and creates
+    Spends the designated topup pool coin (source_coin_id) and creates
     num_coins output coins of exactly trading_size_mojos each in a single
     atomic transaction.  Change returns to the wallet automatically.
+    For fee-paid CAT topups, callers may also pass a dedicated XCH fee coin
+    so Sage does not auto-select a fee input.
 
     Using /create_transaction instead of /send_xch because /send_xch does NOT
     honour the coin_ids hint — Sage's SendXch struct has no such field, so the
@@ -1483,8 +1486,12 @@ def sage_topup_split(source_coin_id: str, num_coins: int, trading_size_mojos: in
             "amount": str(int(fee_mojos)),
         })
 
+    selected_coin_ids = [source_coin_id]
+    if fee_mojos > 0 and fee_coin_id:
+        selected_coin_ids.append(fee_coin_id)
+
     return create_transaction_rpc(
-        selected_coin_ids=[source_coin_id],
+        selected_coin_ids=selected_coin_ids,
         actions=actions,
         auto_submit=True,
     )

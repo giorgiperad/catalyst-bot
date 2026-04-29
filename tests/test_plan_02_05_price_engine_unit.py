@@ -318,6 +318,74 @@ class TestPricingStrategySelection(unittest.TestCase):
 
 
 @unittest.skipIf(_SKIP is not None, f"price_engine unavailable: {_SKIP}")
+class TestTibetCacheInjection(unittest.TestCase):
+    """Fresh reserve signals can update the Tibet cache without waiting for /pairs."""
+
+    def setUp(self):
+        self._p = patch.object(_pe_mod, "cfg", _CfgPatch())
+        self._p.start()
+        self._old_cache = {
+            "pairs": list(_pe_mod._tibet_cache.get("pairs", [])),
+            "fetched_at": _pe_mod._tibet_cache.get("fetched_at", 0),
+            "cache_ttl": _pe_mod._tibet_cache.get("cache_ttl", 120),
+        }
+
+    def tearDown(self):
+        with _pe_mod._tibet_lock:
+            _pe_mod._tibet_cache["pairs"] = self._old_cache["pairs"]
+            _pe_mod._tibet_cache["fetched_at"] = self._old_cache["fetched_at"]
+            _pe_mod._tibet_cache["cache_ttl"] = self._old_cache["cache_ttl"]
+        self._p.stop()
+
+    def test_inject_tibet_reserves_updates_matching_cached_pair(self):
+        with _pe_mod._tibet_lock:
+            _pe_mod._tibet_cache["pairs"] = [{
+                "pair_id": "pair-1",
+                "asset_id": "abc123",
+                "xch_reserve": 1000,
+                "token_reserve": 2000,
+            }]
+            _pe_mod._tibet_cache["fetched_at"] = 10
+
+        eng = _make_engine()
+        injected = eng.inject_tibet_reserves(
+            pair_id="pair-1",
+            xch_reserve=3000,
+            token_reserve=4000,
+            fetched_at=123,
+        )
+
+        self.assertTrue(injected)
+        with _pe_mod._tibet_lock:
+            pair = _pe_mod._tibet_cache["pairs"][0]
+            self.assertEqual(pair["xch_reserve"], 3000)
+            self.assertEqual(pair["token_reserve"], 4000)
+            self.assertEqual(_pe_mod._tibet_cache["fetched_at"], 123)
+
+    def test_inject_tibet_reserves_invalidates_cache_when_pair_missing(self):
+        with _pe_mod._tibet_lock:
+            _pe_mod._tibet_cache["pairs"] = [{
+                "pair_id": "pair-1",
+                "asset_id": "abc123",
+                "xch_reserve": 1000,
+                "token_reserve": 2000,
+            }]
+            _pe_mod._tibet_cache["fetched_at"] = 10
+
+        eng = _make_engine()
+        injected = eng.inject_tibet_reserves(
+            pair_id="missing",
+            xch_reserve=3000,
+            token_reserve=4000,
+            fetched_at=123,
+        )
+
+        self.assertFalse(injected)
+        with _pe_mod._tibet_lock:
+            self.assertEqual(_pe_mod._tibet_cache["fetched_at"], 0)
+
+
+@unittest.skipIf(_SKIP is not None, f"price_engine unavailable: {_SKIP}")
 class TestConstantProductFormula(unittest.TestCase):
     """_estimate_slippage_from_reserves — constant product AMM math.
 

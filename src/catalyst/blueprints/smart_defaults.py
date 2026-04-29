@@ -10,7 +10,7 @@ routes in blueprints/market.py call them via api_server.*).
 from __future__ import annotations
 
 import time
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from flask import Blueprint, jsonify, request
 
@@ -26,6 +26,135 @@ except Exception:
 
 
 bp = Blueprint("smart_defaults", __name__)
+
+
+def _smart_tibet_shock_trigger_pct(min_edge_bps) -> float:
+    """Derive the explicit TibetSwap shock cancel trigger for Smart Settings.
+
+    Runtime auto mode uses half of MIN_EDGE_BPS with a 0.50% floor. Smart
+    Settings writes the concrete value it just derived so the setup form shows
+    the actual defensive-cancel threshold instead of leaving a silent 0/auto.
+    """
+    try:
+        edge_bps = Decimal(str(min_edge_bps or "0"))
+    except (InvalidOperation, ValueError, TypeError):
+        edge_bps = Decimal("0")
+    trigger = max(Decimal("0.50"), edge_bps / Decimal("200"))
+    return float(trigger.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def _positive_int_or_none(value):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _nonnegative_int_or_none(value):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _smart_trade_vwap(trades: dict) -> float:
+    trade_list = (trades.get("trades") or []) if isinstance(trades, dict) else []
+    sum_pv = sum(
+        t.get("price", 0) * t.get("xch_amount", 0)
+        for t in trade_list
+        if t.get("price", 0) > 0 and t.get("xch_amount", 0) > 0
+    )
+    sum_v = sum(
+        t.get("xch_amount", 0)
+        for t in trade_list
+        if t.get("price", 0) > 0 and t.get("xch_amount", 0) > 0
+    )
+    return (sum_pv / sum_v) if sum_v > 0 else 0
+
+
+def _resolve_smart_mid_price(
+    ticker: dict,
+    tibet: dict,
+    spacescan: dict,
+    trades: dict,
+    orderbook: dict,
+    messages: list | None = None,
+) -> dict:
+    """Resolve the best CAT-specific mid price Smart Settings can use.
+
+    Prefer executable live markets. Fall back to Dexie orderbook and then
+    trade VWAP so CATs without a ticker row or Tibet pool still get a
+    conservative, token-specific plan when enough asset-id data exists.
+    """
+    messages = messages if messages is not None else []
+    dexie_price = ticker.get("price", 0) if isinstance(ticker, dict) else 0
+    tibet_price = tibet.get("price", 0) if isinstance(tibet, dict) and tibet.get("has_data") else 0
+    spacescan_price = (
+        spacescan.get("price_xch", 0)
+        if isinstance(spacescan, dict) and spacescan.get("has_data")
+        else 0
+    )
+    mid_price = 0
+    arb_gap_bps = 0
+    spacescan_gap_bps = 0
+    price_source = ""
+
+    has_both_prices = dexie_price > 0 and tibet_price > 0
+    if has_both_prices:
+        mid_price = (dexie_price + tibet_price) / 2
+        arb_gap_bps = abs(dexie_price - tibet_price) / mid_price * 10000
+        price_source = "dexie_tibet"
+        messages.append(f"Price: {mid_price:.8f} (Dexie + Tibet)")
+        if arb_gap_bps > 50:
+            messages.append(f"Arb gap: {api_server._bps_to_pct(arb_gap_bps)}")
+    elif dexie_price > 0:
+        mid_price = dexie_price
+        price_source = "dexie_ticker"
+        messages.append(f"Price: {mid_price:.8f} (Dexie only)")
+    elif tibet_price > 0:
+        mid_price = tibet_price
+        price_source = "tibet_pool"
+        messages.append(f"Price: {mid_price:.8f} (Tibet only)")
+    else:
+        best_bid = orderbook.get("best_bid", 0) if isinstance(orderbook, dict) else 0
+        best_ask = orderbook.get("best_ask", 0) if isinstance(orderbook, dict) else 0
+        if best_bid > 0 and best_ask > 0:
+            mid_price = (best_bid + best_ask) / 2
+            price_source = "dexie_orderbook"
+            messages.append(f"Price: {mid_price:.8f} (Dexie orderbook)")
+        elif best_ask > 0:
+            mid_price = best_ask
+            price_source = "dexie_orderbook_ask"
+            messages.append(f"Price: {mid_price:.8f} (Dexie orderbook ask)")
+        elif best_bid > 0:
+            mid_price = best_bid
+            price_source = "dexie_orderbook_bid"
+            messages.append(f"Price: {mid_price:.8f} (Dexie orderbook bid)")
+        else:
+            vwap_price = _smart_trade_vwap(trades)
+            if vwap_price > 0:
+                mid_price = vwap_price
+                price_source = "dexie_trade_vwap"
+                messages.append(f"Price: {mid_price:.8f} (Dexie trade VWAP)")
+
+    if price_source.startswith("dexie_") and dexie_price <= 0 and mid_price > 0:
+        dexie_price = mid_price
+
+    if spacescan_price > 0 and mid_price > 0:
+        spacescan_gap_bps = abs(spacescan_price - mid_price) / mid_price * 10000
+
+    return {
+        "dexie_price": dexie_price,
+        "tibet_price": tibet_price,
+        "mid_price": mid_price,
+        "arb_gap_bps": arb_gap_bps,
+        "spacescan_gap_bps": spacescan_gap_bps,
+        "has_both_prices": has_both_prices,
+        "price_source": price_source,
+        "vwap_price": _smart_trade_vwap(trades),
+    }
 
 
 def _smart_dbx_defaults(asset_id: str) -> dict:
@@ -345,12 +474,22 @@ def api_smart_defaults():
         if liquidity_mode not in ("two_sided", "buy_only", "sell_only"):
             liquidity_mode = "two_sided"
         dbx_cap = (request.args.get("dbx_cap", "false") or "").strip().lower() in ("1", "true", "yes")
+        asset_id = (request.args.get("asset_id", "") or "").strip()
+        cat_ticker_id = (request.args.get("cat_ticker_id", "") or "").strip()
+        cat_name = (request.args.get("cat_name", "") or "").strip()
+        cat_wallet_id = _positive_int_or_none(request.args.get("cat_wallet_id"))
+        cat_decimals = _nonnegative_int_or_none(request.args.get("cat_decimals"))
         return api_server._calculate_smart_defaults(
             xch_reserve=xch_res,
             cat_reserve=cat_res,
             risk_profile=risk_profile,
             liquidity_mode=liquidity_mode,
             dbx_cap=dbx_cap,
+            asset_id=asset_id or None,
+            cat_wallet_id=cat_wallet_id,
+            cat_decimals=cat_decimals,
+            cat_ticker_id=cat_ticker_id or None,
+            cat_name=cat_name or None,
         )
     except Exception as e:
         import traceback
@@ -359,7 +498,18 @@ def api_smart_defaults():
         log_event("error", "smart_defaults", f"Smart Settings failed: {e}")
         return jsonify({"error": "Smart Settings calculation failed", "code": "SERVER_ERROR"}), 500
 
-def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="balanced", liquidity_mode="two_sided", dbx_cap=False):
+def _calculate_smart_defaults(
+    xch_reserve=0.0,
+    cat_reserve=0.0,
+    risk_profile="balanced",
+    liquidity_mode="two_sided",
+    dbx_cap=False,
+    asset_id=None,
+    cat_wallet_id=None,
+    cat_decimals=None,
+    cat_ticker_id=None,
+    cat_name=None,
+):
     """Smart Defaults v2 — data-driven settings from 30 days of market data.
 
     Replaces v1's snapshot-only approach with deep analysis:
@@ -455,16 +605,21 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
     from decimal import Decimal
     from market_data_collector import collect_all_market_data, analyze_market_data
 
-    asset_id = api_server._active_cat.get("asset_id") or (cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else "")
-    decimals = api_server._active_cat.get("decimals") or getattr(cfg, "CAT_DECIMALS", 3)
-    ticker_id = api_server._active_cat.get("ticker_id") or (cfg.CAT_TICKER_ID if hasattr(cfg, "CAT_TICKER_ID") else "")
-    cat_wid = api_server._active_cat.get("wallet_id") or getattr(cfg, "CAT_WALLET_ID", 2)
+    active_cat = getattr(api_server, "_active_cat", {}) or {}
+    asset_id = (str(asset_id).strip() if asset_id else "") or active_cat.get("asset_id") or (cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else "")
+    decimals = cat_decimals if cat_decimals is not None else active_cat.get("decimals") or getattr(cfg, "CAT_DECIMALS", 3)
+    ticker_id = (str(cat_ticker_id).strip() if cat_ticker_id else "") or active_cat.get("ticker_id") or (cfg.CAT_TICKER_ID if hasattr(cfg, "CAT_TICKER_ID") else "")
+    cat_wid = cat_wallet_id or active_cat.get("wallet_id") or getattr(cfg, "CAT_WALLET_ID", 2)
+    cat_name = (str(cat_name).strip() if cat_name else "") or active_cat.get("name") or getattr(cfg, "CAT_NAME", "CAT")
+    if ticker_id and "_" not in ticker_id:
+        ticker_id = f"{ticker_id}_XCH"
 
     if not asset_id:
         return jsonify({"error": "No trading pair selected"})
 
     print("\n[SMART_DEFAULTS v2] === Gathering 30 days of market data ===")
-    log_event("info", "smart_defaults", "Smart Settings: gathering 30 days of market data")
+    log_event("info", "smart_defaults",
+              f"Smart Settings: gathering 30 days of market data for {cat_name}")
     messages = []
 
     # ---- 1. Wallet balances (same as v1 — always needed) ----
@@ -573,37 +728,24 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
     quality = analysis.get("data_quality", {})
     risk_level = health.get("risk_level", "moderate")
 
-    # ---- 3. Prices (from collected data) ----
-    dexie_price = ticker.get("price", 0)
-    tibet_price = tibet.get("price", 0) if tibet.get("has_data") else 0
-    spacescan_price = spacescan.get("price_xch", 0) if spacescan.get("has_data") else 0
-    mid_price = 0
-    arb_gap_bps = 0
-    spacescan_gap_bps = 0
-
-    has_both_prices = dexie_price > 0 and tibet_price > 0
-    if has_both_prices:
-        mid_price = (dexie_price + tibet_price) / 2
-        arb_gap_bps = abs(dexie_price - tibet_price) / mid_price * 10000
-        messages.append(f"Price: {mid_price:.8f} (Dexie + Tibet)")
-        if arb_gap_bps > 50:
-            messages.append(f"Arb gap: {api_server._bps_to_pct(arb_gap_bps)}")
-    elif dexie_price > 0:
-        mid_price = dexie_price
-        messages.append(f"Price: {mid_price:.8f} (Dexie only)")
-    elif tibet_price > 0:
-        mid_price = tibet_price
-        messages.append(f"Price: {mid_price:.8f} (Tibet only)")
-    else:
-        return jsonify({"error": "No price available from Dexie or TibetSwap"})
-
-    if spacescan_price > 0 and mid_price > 0:
-        spacescan_gap_bps = abs(spacescan_price - mid_price) / mid_price * 10000
-
-    # ---- 4. Competitor orderbook (still fetch live — changes fast) ----
+    # Fetch before price resolution: some CATs have no Dexie ticker or Tibet
+    # pool yet, but do have live asset-id orderbook offers we can price from.
     orderbook = _fetch_dexie_orderbook_standalone(asset_id)
     if orderbook["has_data"]:
         messages.append(f"Competitors: {orderbook['num_buy_offers']}B/{orderbook['num_sell_offers']}S")
+
+    # ---- 3. Prices (from collected data + orderbook/trade fallbacks) ----
+    price_info = _resolve_smart_mid_price(ticker, tibet, spacescan, trades, orderbook, messages)
+    dexie_price = price_info["dexie_price"]
+    tibet_price = price_info["tibet_price"]
+    mid_price = price_info["mid_price"]
+    arb_gap_bps = price_info["arb_gap_bps"]
+    spacescan_gap_bps = price_info["spacescan_gap_bps"]
+    has_both_prices = price_info["has_both_prices"]
+    price_source = price_info["price_source"]
+    vwap_price = price_info["vwap_price"]
+    if not mid_price:
+        return jsonify({"error": "No price available from Dexie or TibetSwap"})
 
     # ---- 5. Read user inputs (trade size, max offers) ----
     from flask import request as flask_request
@@ -981,6 +1123,11 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
     if arb_gap_bps > arb_alert_threshold_bps * 0.8:
         arb_alert_threshold_bps = max(arb_alert_threshold_bps, int(arb_gap_bps * 1.5))
     arb_alert_threshold_bps = min(arb_alert_threshold_bps, 1000)
+    tibet_shock_cancel_trigger_pct = _smart_tibet_shock_trigger_pct(inner_edge_bps)
+    messages.append(
+        f"Tibet shock cancel: {tibet_shock_cancel_trigger_pct:.2f}% "
+        f"(half of inner edge)"
+    )
 
     # ═══ LOOP SECONDS (volatility + fill-rate aware) ═══
     # Primary driver: volatility regime (price shock response speed).
@@ -2934,6 +3081,7 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
         "max_mid_move": round(max_mid_move, 1),
         "dynamic_limit_pct": dynamic_limit_pct,
         "max_step_change_pct": max_step_change_pct,
+        "tibet_shock_cancel_trigger_pct": tibet_shock_cancel_trigger_pct,
         "arb_alert_threshold_bps": int(round(arb_alert_threshold_bps)),  # env key is ARB_ALERT_THRESHOLD_BPS
         "min_mid": min_mid,
         "max_mid": max_mid,
@@ -3143,6 +3291,11 @@ def _calculate_smart_defaults(xch_reserve=0.0, cat_reserve=0.0, risk_profile="ba
         # V2 Metadata for toast + GUI
         "_data_sources": {
             "version": 2,
+            "asset_id": asset_id,
+            "cat_wallet_id": cat_wid,
+            "cat_decimals": decimals,
+            "cat_ticker_id": ticker_id,
+            "cat_name": cat_name,
             "risk_profile": _risk_profile_name,
             "has_wallet_balance": has_wallet,
             "has_both_prices": has_both_prices,

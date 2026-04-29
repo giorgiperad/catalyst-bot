@@ -44,7 +44,7 @@ except ImportError:
 from price_engine import PriceEngine
 from offer_manager import OfferManager
 from fill_tracker import FillTracker
-from dexie_manager import DexieManager
+from dexie_manager import DexieManager, get_offer_detail
 from splash_manager import SplashManager
 from splash_node import SplashNode
 from coinset_client import CoinsetClient
@@ -56,11 +56,19 @@ from market_intel import MarketIntel
 from runtime_monitor import RuntimeMonitor
 from amm_monitor import AMMMonitor
 from splash_receive import classify_offer_for_asset
+from shock_protection import evaluate_tibet_shock
 from wallet import get_all_offers, get_chia_health
 try:
     import mempool_watcher as _mempool_watcher_mod
 except ImportError:
     _mempool_watcher_mod = None
+
+
+DEXIE_STATUS_ACTIVE = 0
+DEXIE_STATUS_PENDING = 1
+DEXIE_STATUS_CANCELLED = 3
+DEXIE_STATUS_COMPLETED = 4
+DEXIE_STATUS_EXPIRED = 6
 
 
 def _bps_to_pct(val):
@@ -246,6 +254,10 @@ class BotLoop:
         self._loop_count: int = 0
         self._start_time: float = 0  # Set when bot starts, used for uptime
         self._last_loop_duration: float = 0
+        self._last_live_offer_edges: Dict[str, str] = {
+            "our_best_bid": "0",
+            "our_best_ask": "0",
+        }
 
         # ---- Ladder watchdog state ----
         # Fill-aware watchdog: skip violation checks for a window after any
@@ -426,9 +438,11 @@ class BotLoop:
             "change_pct": 0.0,
             "direction": "",
             "last_change_ts": 0,
+            "last_confirmed_price_xch": "0",
             "polls": 0,
             "triggers": 0,
         }
+        self._mempool_price_refresh_needed: bool = False
 
         # ---- Coin watcher state (lifecycle tracking) ----
         self._coin_watcher_thread: Optional[threading.Thread] = None
@@ -502,9 +516,23 @@ class BotLoop:
             "tiers": set(),
             "reason": "",
         }
+        self._last_tibet_shock: Dict = {
+            "at": 0.0,
+            "direction": "",
+            "pct": 0.0,
+            "sides": tuple(),
+            "tiers": tuple(),
+        }
         # How long to consider a defensive cancel still "in flight" — long
         # enough for the cancel to confirm on-chain and the coins to return.
         self._defensive_cancel_grace_secs: float = 90.0
+        self._pending_cancel_wallet_ids_by_side: Dict[str, set] = {
+            "buy": set(),
+            "sell": set(),
+        }
+        self._pending_cancel_settle_seen: Dict[str, Dict] = {}
+        self._pending_cancel_settle_retry_secs: float = 300.0
+        self._pending_cancel_settle_max_retries: int = 5
 
         # ---- Degraded-mode recovery tracking ----
         # When the bot stays materially under target or Sage visibility is
@@ -1173,7 +1201,8 @@ class BotLoop:
         return None
 
     def _get_market_aware_probe_prices(self, tibet_price: Decimal,
-                                       buffer_bps: Decimal) -> Dict[str, Decimal]:
+                                       buffer_bps: Decimal,
+                                       offer_edges: Optional[Dict] = None) -> Dict[str, Decimal]:
         """Derive probe prices from Tibet while nudging onto the live Dexie book."""
         result = {
             "buy_price": Decimal("0"),
@@ -1188,6 +1217,8 @@ class BotLoop:
         buffer_mult = Decimal("1") + buffer_bps / Decimal("10000")
         buy_price = tibet_price / buffer_mult
         sell_price = tibet_price * buffer_mult
+        amm_safe_buy_ceiling = buy_price
+        amm_safe_sell_floor = sell_price
 
         orderbook = {}
         if getattr(self, "market_intel", None) and hasattr(self.market_intel, "refresh_orderbook"):
@@ -1198,6 +1229,28 @@ class BotLoop:
 
         overall_best_bid = Decimal(str(orderbook.get("overall_best_bid") or 0))
         overall_best_ask = Decimal(str(orderbook.get("overall_best_ask") or 0))
+        offer_edges = offer_edges or {}
+
+        def _edge_decimal(source, key):
+            try:
+                return Decimal(str((source or {}).get(key) or 0))
+            except Exception:
+                return Decimal("0")
+
+        our_best_bid = _edge_decimal(offer_edges, "our_best_bid")
+        our_best_ask = _edge_decimal(offer_edges, "our_best_ask")
+        if our_best_bid <= 0:
+            our_best_bid = _edge_decimal(orderbook, "our_best_bid")
+        if our_best_ask <= 0:
+            our_best_ask = _edge_decimal(orderbook, "our_best_ask")
+
+        if our_best_bid > overall_best_bid:
+            overall_best_bid = our_best_bid
+        if our_best_ask > 0:
+            if overall_best_ask <= 0:
+                overall_best_ask = our_best_ask
+            else:
+                overall_best_ask = min(overall_best_ask, our_best_ask)
 
         improve_bps = max(
             Decimal("0"),
@@ -1211,6 +1264,13 @@ class BotLoop:
             best_ask_probe = overall_best_ask / improve_mult
             if best_ask_probe > 0:
                 sell_price = min(sell_price, best_ask_probe)
+
+        # Dexie can be crossed, stale, or already arbable during a shock.  The
+        # probe is meant to discover the AMM-safe edge, so top-book nudging must
+        # never move a buy above the Tibet-safe ceiling or a sell below the
+        # Tibet-safe floor.
+        buy_price = min(buy_price, amm_safe_buy_ceiling)
+        sell_price = max(sell_price, amm_safe_sell_floor)
 
         result.update({
             "buy_price": buy_price,
@@ -1342,6 +1402,105 @@ class BotLoop:
         age = max(0.0, now_ts - anchor_at)
         return max(0.0, float(linger_secs) - age)
 
+    def _classify_probe_offer(self, side: str, trade_id: Optional[str],
+                              open_ids) -> Dict:
+        """Classify a probe using both wallet visibility and Dexie state."""
+        open_ids = set(open_ids or set())
+        wallet_alive = bool(trade_id and trade_id in open_ids)
+        state = {
+            "side": side,
+            "trade_id": trade_id or "",
+            "wallet_alive": wallet_alive,
+            "confirmable": wallet_alive,
+            "taken": False,
+            "unverified": False,
+            "reason": "wallet_open" if wallet_alive else "wallet_missing",
+            "dexie_id": "",
+            "dexie_status": None,
+        }
+        if not trade_id:
+            state.update({
+                "confirmable": False,
+                "reason": "not_placed",
+            })
+            return state
+
+        if not bool(getattr(cfg, "DEXIE_AUTO_POST", True)):
+            return state
+
+        dexie_id = ""
+        try:
+            local_offer = get_offer(trade_id) or {}
+            dexie_id = str(local_offer.get("dexie_id") or "").strip()
+        except Exception as e:
+            state["dexie_error"] = str(e)
+
+        if not dexie_id:
+            if wallet_alive:
+                state.update({
+                    "confirmable": False,
+                    "unverified": True,
+                    "reason": "dexie_id_missing",
+                })
+            return state
+
+        state["dexie_id"] = dexie_id
+        try:
+            try:
+                dexie_offer = get_offer_detail(
+                    dexie_id,
+                    timeout=4,
+                    cache_ttl_secs=2,
+                )
+            except TypeError:
+                dexie_offer = get_offer_detail(dexie_id)
+        except Exception as e:
+            dexie_offer = None
+            state["dexie_error"] = str(e)
+
+        if not isinstance(dexie_offer, dict):
+            if wallet_alive:
+                state.update({
+                    "confirmable": False,
+                    "unverified": True,
+                    "reason": "dexie_unreachable",
+                })
+            return state
+
+        raw_status = dexie_offer.get("status")
+        try:
+            status = int(raw_status)
+        except (TypeError, ValueError):
+            status = raw_status
+        state["dexie_status"] = status
+
+        if status == DEXIE_STATUS_ACTIVE:
+            state.update({
+                "confirmable": wallet_alive,
+                "unverified": not wallet_alive,
+                "reason": "dexie_active" if wallet_alive else "wallet_missing_dexie_active",
+            })
+        elif status in (DEXIE_STATUS_PENDING, DEXIE_STATUS_COMPLETED):
+            state.update({
+                "confirmable": False,
+                "taken": True,
+                "unverified": False,
+                "reason": "dexie_pending" if status == DEXIE_STATUS_PENDING else "dexie_completed",
+            })
+        elif status in (DEXIE_STATUS_CANCELLED, DEXIE_STATUS_EXPIRED):
+            state.update({
+                "confirmable": False,
+                "unverified": False,
+                "reason": "dexie_cancelled" if status == DEXIE_STATUS_CANCELLED else "dexie_expired",
+            })
+        else:
+            state.update({
+                "confirmable": False,
+                "unverified": wallet_alive,
+                "reason": f"dexie_status_{status}",
+            })
+        return state
+
     def _confirmed_probe_slot_offsets(self, current_buy_ids=None,
                                       current_sell_ids=None) -> Dict[str, int]:
         """Exclude lingering confirmed probes from the main ladder slot count."""
@@ -1430,8 +1589,11 @@ class BotLoop:
             open_ids = current_buy_ids | current_sell_ids
             buy_tid = probe.get("buy_tid")
             sell_tid = probe.get("sell_tid")
-            buy_alive = bool(buy_tid and buy_tid in open_ids)
-            sell_alive = bool(sell_tid and sell_tid in open_ids)
+            buy_state = self._classify_probe_offer("buy", buy_tid, open_ids)
+            sell_state = self._classify_probe_offer("sell", sell_tid, open_ids)
+            buy_alive = bool(buy_state.get("confirmable"))
+            sell_alive = bool(sell_state.get("confirmable"))
+            probe_taken = bool(buy_state.get("taken") or sell_state.get("taken"))
             remaining_hold = self._probe_hold_seconds_remaining(probe, time.time())
 
             # For a buy-only probe (sell_tid=None), treat buy-alive as "all expected alive"
@@ -1442,6 +1604,8 @@ class BotLoop:
                 time.sleep(min(float(poll_secs), float(remaining_hold)))
                 first_pass = False
                 continue
+            if probe_taken:
+                break
 
             probe_age = max(0.0, time.time() - float(probe.get("launched_at") or time.time()))
             # Only wait for visibility if at least one expected probe isn't visible yet
@@ -1479,8 +1643,10 @@ class BotLoop:
                 current_sell_ids,
             )
         open_ids = current_buy_ids | current_sell_ids
-        buy_alive = bool(buy_tid and buy_tid in open_ids)
-        sell_alive = bool(sell_tid and sell_tid in open_ids)
+        buy_state = self._classify_probe_offer("buy", buy_tid, open_ids)
+        sell_state = self._classify_probe_offer("sell", sell_tid, open_ids)
+        buy_alive = bool(buy_state.get("confirmable"))
+        sell_alive = bool(sell_state.get("confirmable"))
 
         # If sell was never placed (no CAT sniper coins), treat buy-only as sufficient
         sell_required = bool(sell_tid)
@@ -1489,17 +1655,17 @@ class BotLoop:
 
         missing_sides = []
         if buy_tid and not buy_alive:
-            missing_sides.append("buy")
+            missing_sides.append(f"buy:{buy_state.get('reason', 'not_confirmable')}")
         if sell_tid and not sell_alive:
-            missing_sides.append("sell")
+            missing_sides.append(f"sell:{sell_state.get('reason', 'not_confirmable')}")
         if not missing_sides:
             return current_buy_ids, current_sell_ids, False
 
         self._mark_recovery_probe_churn()
         self._probe_warn(
             "probe_edge_lost",
-            f"Confirmed probe edge disappeared before ladder creation: "
-            f"{'+'.join(missing_sides)} missing. Re-arming probe first.",
+            f"Confirmed probe edge became unsafe before ladder creation: "
+            f"{'+'.join(missing_sides)}. Re-arming probe first.",
         )
         log_event(
             "info",
@@ -1548,9 +1714,12 @@ class BotLoop:
         buy_tid = probe["buy_tid"]
         sell_tid = probe["sell_tid"]
         now_ts = time.time()
+        open_ids = current_buy_ids | current_sell_ids
 
-        buy_alive = buy_tid and buy_tid in (current_buy_ids | current_sell_ids)
-        sell_alive = sell_tid and sell_tid in (current_buy_ids | current_sell_ids)
+        buy_state = self._classify_probe_offer("buy", buy_tid, open_ids)
+        sell_state = self._classify_probe_offer("sell", sell_tid, open_ids)
+        buy_alive = bool(buy_state.get("confirmable"))
+        sell_alive = bool(sell_state.get("confirmable"))
 
         # If sell was never placed (no CAT sniper coins), treat buy-only as sufficient
         sell_required = bool(sell_tid)
@@ -1585,24 +1754,44 @@ class BotLoop:
                           "Price confirmed - deploying main offers behind live probes")
                 self._clear_alert("probe_status")
         else:
+            active_states = [buy_state]
+            if sell_required:
+                active_states.append(sell_state)
+            taken_state_sides = [
+                s.get("side")
+                for s in active_states
+                if s.get("taken")
+            ]
+            unverified_sides = [
+                f"{s.get('side')}:{s.get('reason', 'unverified')}"
+                for s in active_states
+                if s.get("unverified") and not s.get("taken")
+            ]
+            if unverified_sides and not taken_state_sides:
+                last_notice_at = float(probe.get("last_wait_log_at") or 0)
+                if (now_ts - last_notice_at) >= 5:
+                    log_event(
+                        "info",
+                        "probe_state_wait",
+                        "Probe edge not yet verified on Dexie "
+                        f"({'+'.join(unverified_sides)}) - waiting before "
+                        "main ladder deploy",
+                    )
+                    probe["last_wait_log_at"] = now_ts
+                log_event("debug", "probe_hold_status",
+                          "Probe pair still awaiting Dexie verification")
+                return {
+                    "buy_ids": current_buy_ids,
+                    "sell_ids": current_sell_ids,
+                    "sniper_fired": sniper_fired,
+                }
+
             poll_secs = max(1, int(getattr(cfg, "SNIPER_POLL_SECS", 5) or 5))
             visibility_grace = max(float(poll_secs), 10.0)
             probe_age = max(0.0, now_ts - float(probe.get("launched_at") or now_ts))
-            if probe_age < visibility_grace and (buy_tid or sell_tid):
+            if not taken_state_sides and probe_age < visibility_grace and (buy_tid or sell_tid):
                 log_event("debug", "probe_visibility_wait",
                           f"Probe offers not fully visible yet ({probe_age:.1f}s old) - waiting")
-            elif probe["attempt"] >= probe["max_attempts"]:
-                survived_price = probe["sell_price"] if sell_alive else (
-                    probe["buy_price"] if buy_alive else probe["tibet_price"])
-                probe["confirmed_price"] = survived_price
-                probe["confirmed_at"] = now_ts
-                probe["active"] = False
-                self._probe_warn("probe_max_retries",
-                                 f"Probe gave up after {probe['attempt']} attempts. "
-                                 f"Using best available price: {survived_price:.8f}")
-                self._probe_warn("probe_timeout_status",
-                                 "Probe timed out - deploying main offers from best probe edge")
-                self._clear_alert("probe_status")
             else:
                 # ----------------------------------------------------------
                 # PROBE-FILL = BOUNDARY NOT FOUND — widen and retry
@@ -1622,9 +1811,15 @@ class BotLoop:
                 # ----------------------------------------------------------
 
                 taken_sides = []
-                if not buy_alive and buy_tid:
+                if buy_tid and (
+                    buy_state.get("taken")
+                    or (not buy_alive and not buy_state.get("unverified"))
+                ):
                     taken_sides.append("buy")
-                if not sell_alive and sell_tid:
+                if sell_tid and (
+                    sell_state.get("taken")
+                    or (not sell_alive and not sell_state.get("unverified"))
+                ):
                     taken_sides.append("sell")
 
                 arb_gap_bps_float = float(arb_gap or 0)
@@ -1632,6 +1827,18 @@ class BotLoop:
                 if taken_sides or not (buy_alive or sell_alive):
                     # Probe was taken — the edge is further out than we tested.
                     # Widen the buffer and retry to find the safe boundary.
+                    if probe["attempt"] >= probe["max_attempts"]:
+                        self._mark_recovery_probe_churn()
+                        self._probe_warn(
+                            "probe_max_retries",
+                            f"Probe still unsafe after {probe['attempt']} attempts. "
+                            "Continuing to back off; main ladder remains held.",
+                        )
+                        self._probe_warn(
+                            "probe_timeout_status",
+                            "Probe still unsafe - main ladder held until an edge survives",
+                        )
+                        probe["max_attempts"] = int(probe["attempt"]) + 5
                     attempt = probe["attempt"] + 1
                     base_buffer = getattr(cfg, "SNIPER_BUFFER_BPS", Decimal("50"))
                     adjusted_buffer = base_buffer + Decimal(str(attempt * 50))
@@ -1639,6 +1846,7 @@ class BotLoop:
                     probe_prices = self._get_market_aware_probe_prices(
                         tibet_p,
                         adjusted_buffer,
+                        offer_edges=self._last_live_offer_edges,
                     )
 
                     log_event("info", "probe_retry",
@@ -2283,8 +2491,17 @@ class BotLoop:
             "change_pct": 0.0,
             "direction": "",
             "last_change_ts": 0,
+            "last_confirmed_price_xch": "0",
             "polls": 0,
             "triggers": 0,
+        }
+        self._mempool_price_refresh_needed = False
+        self._last_tibet_shock = {
+            "at": 0.0,
+            "direction": "",
+            "pct": 0.0,
+            "sides": tuple(),
+            "tiers": tuple(),
         }
         self._last_bulk_create_time = 0
         self._force_requote = {"buy": False, "sell": False}
@@ -2897,6 +3114,163 @@ class BotLoop:
         """Backwards-compat wrapper — cancel inner tier only."""
         return self._defensive_cancel_tiers(("inner",), reason)
 
+    def _pending_cancel_wallet_ids(self, side: str) -> set:
+        """Return wallet-visible offers excluded from normal DB-open views.
+
+        These are usually lifecycle=pending-cancel rows. They should not count
+        as deployable ladder slots, but Sage can still fill them until the
+        cancel confirms, so create-first replacement paths must wait.
+        """
+        try:
+            pending = getattr(self, "_pending_cancel_wallet_ids_by_side", {}) or {}
+            ids = pending.get((side or "").lower(), set()) or set()
+            return set(ids)
+        except Exception:
+            return set()
+
+    def _pending_cancel_settle_first_seen(self, trade_id: str, now: float) -> float:
+        """Prefer DB cancel-attempt age when starting a settle-watch entry."""
+        try:
+            offer = get_offer(trade_id) or {}
+        except Exception:
+            offer = {}
+        for key in ("cancel_last_attempt_at", "updated_at", "last_seen", "created_at"):
+            raw = (offer or {}).get(key)
+            if not raw:
+                continue
+            try:
+                from datetime import datetime, timezone
+                dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                ts = float(dt.timestamp())
+                if ts > 0:
+                    return ts
+            except Exception:
+                continue
+        return now
+
+    def _track_pending_cancel_settle_watchdog(self, pending_by_side: Dict[str, set]) -> None:
+        """Queue stale wallet-active pending cancels back into cancel retries.
+
+        The anti-stack guard treats wallet-visible / DB-cancelled offers as
+        still fillable, which is correct. But if the DB already moved them out
+        of the open pending-cancel lifecycle, bot_health will not re-drive them.
+        This watchdog keeps creation blocked while nudging stale IDs back
+        through OfferManager's retry path after a conservative settle window.
+        """
+        now = time.time()
+        retry_secs = float(getattr(self, "_pending_cancel_settle_retry_secs", 300.0) or 300.0)
+        max_retries = int(getattr(self, "_pending_cancel_settle_max_retries", 5) or 5)
+
+        active: Dict[str, str] = {}
+        for side, ids in (pending_by_side or {}).items():
+            side_norm = str(side or "").strip().lower()
+            if side_norm not in ("buy", "sell"):
+                continue
+            for raw_tid in ids or set():
+                tid = str(raw_tid or "").strip()
+                if tid:
+                    active[tid] = side_norm
+
+        seen = getattr(self, "_pending_cancel_settle_seen", {}) or {}
+        for tid in list(seen.keys()):
+            if tid not in active:
+                seen.pop(tid, None)
+
+        retry_map = getattr(getattr(self, "offer_manager", None), "_pending_cancel_retries", None)
+        for tid, side in active.items():
+            if tid not in seen:
+                seen[tid] = {
+                    "side": side,
+                    "first_seen": self._pending_cancel_settle_first_seen(tid, now),
+                    "last_retry": 0.0,
+                    "retries": 0,
+                }
+            info = seen[tid]
+            info["side"] = side
+            first_seen = float(info.get("first_seen") or now)
+            age = now - first_seen
+            if age < retry_secs:
+                continue
+
+            retries = int(info.get("retries") or 0)
+            if retries >= max_retries:
+                if not info.get("exhausted_logged"):
+                    log_event(
+                        "warning",
+                        "pending_cancel_settle_retry_exhausted",
+                        f"{side} offer {tid[:16]}... still wallet-active after "
+                        f"{int(age)}s and {retries} retry nudge(s); keeping "
+                        f"creation blocked until Sage stops reporting it active",
+                        data={"trade_id": tid, "side": side, "age_secs": int(age),
+                              "retries": retries},
+                    )
+                    info["exhausted_logged"] = True
+                continue
+
+            last_retry = float(info.get("last_retry") or 0.0)
+            if last_retry > 0 and now - last_retry < retry_secs:
+                continue
+            if isinstance(retry_map, dict) and tid not in retry_map:
+                retry_map[tid] = {
+                    "attempts": 0,
+                    "first_failed": first_seen,
+                    "reason": "wallet_active_pending_cancel_settle",
+                }
+                info["last_retry"] = now
+                info["retries"] = retries + 1
+                log_event(
+                    "warning",
+                    "pending_cancel_settle_retry_queued",
+                    f"{side} offer {tid[:16]}... has stayed wallet-active for "
+                    f"{int(age)}s after DB cancel; queued a cancel retry and "
+                    f"kept new {side} creation blocked",
+                    data={"trade_id": tid, "side": side, "age_secs": int(age),
+                          "retry_count": info["retries"]},
+                )
+
+        self._pending_cancel_settle_seen = seen
+
+    def _recent_tibet_shock_guard(self, side: str) -> Optional[Dict]:
+        """Return recent shock details when side should avoid create-first requote.
+
+        A confirmed Tibet shock only makes one side urgent: price down exposes
+        buys, price up exposes sells. The other side can wait because
+        ``requote_side`` creates replacements before old cancels settle, which
+        temporarily stacks fillable offers in Sage.
+        """
+        try:
+            shock = getattr(self, "_last_tibet_shock", {}) or {}
+            at = float(shock.get("at") or 0)
+            if at <= 0:
+                return None
+
+            guard_secs = max(
+                float(getattr(self, "_defensive_cancel_grace_secs", 90.0) or 90.0),
+                float(getattr(cfg, "LOOP_SECONDS", 60) or 60) * 3.0,
+            )
+            age = time.time() - at
+            if age > guard_secs:
+                return None
+
+            protected_sides = {
+                str(s or "").strip().lower()
+                for s in (shock.get("sides") or ())
+                if str(s or "").strip()
+            }
+            side_norm = str(side or "").strip().lower()
+            if not protected_sides or side_norm in protected_sides:
+                return None
+
+            details = dict(shock)
+            details["age_secs"] = age
+            details["guard_secs"] = guard_secs
+            details["protected_sides"] = tuple(sorted(protected_sides))
+            return details
+        except Exception:
+            return None
+
     def _defensive_cancel_tiers(self, tiers: tuple, reason: str,
                                 sides: tuple = ("buy", "sell")) -> int:
         """F83: bulk-cancel offers in the given tiers.
@@ -2973,6 +3347,113 @@ class BotLoop:
                       f"_defensive_cancel_tiers exception: {e}")
             return 0
 
+    def _record_confirmed_price_move(self, sig: Dict, in_cycle: bool) -> None:
+        """Publish confirmed reserve moves to pricing and recent-swap state."""
+        try:
+            new_xch = sig.get("new_xch_reserve")
+            new_tok = sig.get("new_tok_reserve")
+            old_xch = sig.get("old_xch_reserve")
+            old_tok = sig.get("old_tok_reserve")
+            now_ts = time.time()
+
+            with self._watcher_lock:
+                self._watcher_data["triggered"] = True
+                self._watcher_data["change_pct"] = abs(float(sig.get("magnitude_pct", 0) or 0))
+                self._watcher_data["direction"] = str(sig.get("direction", "") or "")
+                self._watcher_data["last_change_ts"] = now_ts
+                self._watcher_data["triggers"] = int(self._watcher_data.get("triggers", 0) or 0) + 1
+                if new_xch is not None:
+                    self._watcher_data["last_xch_reserve"] = int(new_xch)
+                elif old_xch is not None:
+                    self._watcher_data["last_xch_reserve"] = int(old_xch)
+                if new_tok is not None:
+                    self._watcher_data["last_token_reserve"] = int(new_tok)
+                elif old_tok is not None:
+                    self._watcher_data["last_token_reserve"] = int(old_tok)
+                if sig.get("new_price_xch") is not None:
+                    self._watcher_data["last_confirmed_price_xch"] = str(sig.get("new_price_xch"))
+
+            injected = False
+            if new_xch is not None and new_tok is not None:
+                inject = getattr(self.price_engine, "inject_tibet_reserves", None)
+                if callable(inject):
+                    injected = bool(inject(
+                        pair_id=sig.get("pair_id"),
+                        asset_id=getattr(cfg, "CAT_ASSET_ID", None),
+                        xch_reserve=new_xch,
+                        token_reserve=new_tok,
+                        fetched_at=now_ts,
+                    ))
+            if not injected:
+                invalidate = getattr(self.price_engine, "invalidate_tibet_cache", None)
+                if callable(invalidate):
+                    invalidate()
+
+            if in_cycle:
+                self._mempool_price_refresh_needed = True
+        except Exception as e:
+            log_event("debug", "mempool_price_cache_refresh_failed",
+                      f"Could not refresh Tibet cache from confirmed reserves: {e}")
+
+    def _refresh_price_if_mempool_move_pending(self, mid_price: Decimal,
+                                               arb_gap: Decimal):
+        """Refresh the current cycle's price after an in-cycle reserve move."""
+        if not getattr(self, "_mempool_price_refresh_needed", False):
+            return mid_price, arb_gap, None
+
+        self._mempool_price_refresh_needed = False
+        try:
+            fresh_price = self.price_engine.get_price(
+                cfg.CAT_ASSET_ID, cfg.CAT_DECIMALS, cfg.CAT_TICKER_ID
+            )
+            if not fresh_price:
+                return mid_price, arb_gap, None
+
+            fresh_mid = Decimal(str(fresh_price.get("mid_price", 0) or 0))
+            if fresh_mid <= 0:
+                return mid_price, arb_gap, fresh_price
+
+            fresh_arb = Decimal(str(fresh_price.get("arb_gap_bps", arb_gap) or 0))
+            old_mid = mid_price
+            self._current_mid_price = fresh_mid
+            self._set_state(mid_price=str(fresh_mid), arb_gap_bps=str(fresh_arb))
+            self.risk_manager.update_arb_gap(fresh_arb)
+            log_event(
+                "info",
+                "mempool_reprice_applied",
+                f"Applied confirmed reserve price before trading decisions: "
+                f"{old_mid:.8f} -> {fresh_mid:.8f}",
+                data={
+                    "old_mid": str(old_mid),
+                    "new_mid": str(fresh_mid),
+                    "arb_gap_bps": str(fresh_arb),
+                    "tibet_price": str(fresh_price.get("tibet_price", "")),
+                },
+            )
+            self._emit("price_update", {
+                "mid_price": str(fresh_mid),
+                "dexie_price": str(fresh_price.get("dexie_price", "")),
+                "tibet_price": str(fresh_price.get("tibet_price", "")),
+                "arb_gap_bps": str(fresh_arb),
+                "spread_bps": self._bot_state.get("spread_bps", "0"),
+            })
+            return fresh_mid, fresh_arb, fresh_price
+        except Exception as e:
+            log_event("warning", "mempool_reprice_failed",
+                      f"Could not refresh price after confirmed reserve move: {e}")
+            return mid_price, arb_gap, None
+
+    def _refresh_cycle_price_after_mempool_move(self, price_data: Dict,
+                                                mid_price: Decimal,
+                                                arb_gap: Decimal):
+        """Refresh both cycle scalars and the source price_data dict."""
+        refreshed_mid, refreshed_arb, fresh_price = (
+            self._refresh_price_if_mempool_move_pending(mid_price, arb_gap)
+        )
+        if fresh_price:
+            return fresh_price, refreshed_mid, refreshed_arb
+        return price_data, refreshed_mid, refreshed_arb
+
     def _drain_mempool_signals(self, in_cycle: bool = False) -> None:
         """Drain pending mempool watcher signals and act on them.
 
@@ -3029,6 +3510,7 @@ class BotLoop:
                     log_event("info", "mempool_price_confirmed",
                               f"Pool reserves confirmed: {direction} {pct:.3f}% "
                               f"(XCH {sig.get('delta_xch', 0):+d} mojos)")
+                    self._record_confirmed_price_move(sig, in_cycle=in_cycle)
                     # F82 (2026-04-18): defensive cancel on confirmed pool
                     # move. F81 only fired on imminent_swap which missed
                     # swaps that confirmed before the 5s mempool poll caught
@@ -3048,36 +3530,30 @@ class BotLoop:
                     # inner offers were still 177 bps in-edge and
                     # profitable). Floor at 50 bps so we still react on
                     # very tight books where min-edge is small.
+                    # Operators can override the auto threshold with
+                    # TIBET_SHOCK_CANCEL_TRIGGER_PCT when a pair needs a
+                    # more explicit AMM-shock trigger.
                     try:
                         _min_edge = float(getattr(cfg, "MIN_EDGE_BPS", 100) or 100)
                     except Exception:
                         _min_edge = 100.0
-                    trigger_pct = max(0.50, _min_edge / 200.0)
-                    if pct >= trigger_pct:
+                    action = evaluate_tibet_shock(pct, direction, cfg)
+                    trigger_pct = action.trigger_pct
+                    if action.cancel:
                         # F83 (2026-04-18): graduated tier set based on
                         # magnitude. Big AMM moves expose more than just
                         # the inner tier. Test 3 saw 3 mid-tier buy fills
                         # 7 min after a -13.1% Tibet drop because F82
                         # only cancelled inner. The mid offers were still
                         # profitable arbs against the new mid.
-                        if pct >= 10.0:
-                            tiers = ("inner", "mid", "outer")
-                        elif pct >= 5.0:
-                            tiers = ("inner", "mid")
-                        else:
-                            tiers = ("inner",)
+                        tiers = action.tiers
                         # 2026-04-22: narrow cancels to the at-risk side.
                         # direction "up"   → CAT price rising → our SELL
                         #                    offers now cheap → cancel sells.
                         # direction "down" → CAT price falling → our BUY
                         #                    offers now expensive → cancel buys.
                         # Unknown direction → fall back to both sides.
-                        if direction == "up":
-                            at_risk_sides = ("sell",)
-                        elif direction == "down":
-                            at_risk_sides = ("buy",)
-                        else:
-                            at_risk_sides = ("buy", "sell")
+                        at_risk_sides = action.sides
                         try:
                             n = self._defensive_cancel_tiers(
                                 tiers=tiers,
@@ -3094,9 +3570,18 @@ class BotLoop:
                             # opposite side (not at risk, not cancelled) isn't
                             # wrongly deferred by the requote path.
                             try:
+                                now_ts = time.time()
                                 self._last_defensive_cancel = {
-                                    "at": time.time(),
+                                    "at": now_ts,
                                     "tiers": {(t, s) for t in tiers for s in at_risk_sides},
+                                    "reason": f"mempool_price_move_{pct:.2f}pct_{direction}",
+                                }
+                                self._last_tibet_shock = {
+                                    "at": now_ts,
+                                    "direction": str(direction or ""),
+                                    "pct": pct,
+                                    "sides": tuple(at_risk_sides),
+                                    "tiers": tuple(tiers),
                                     "reason": f"mempool_price_move_{pct:.2f}pct_{direction}",
                                 }
                             except Exception:
@@ -4500,6 +4985,7 @@ class BotLoop:
         open_buys, open_sells, closed = self.offer_manager.sync_from_wallet()
         wallet_sync_meta = self.offer_manager.get_wallet_sync_meta()
         self._wallet_sync_stale_cycle = not bool(wallet_sync_meta.get("fresh", True))
+        self._last_live_offer_edges = self._get_live_offer_edges(open_buys, open_sells)
 
         current_buy_ids = {o.get("trade_id", "") for o in open_buys if o.get("trade_id")}
         current_sell_ids = {o.get("trade_id", "") for o in open_sells if o.get("trade_id")}
@@ -4534,6 +5020,13 @@ class BotLoop:
             _main_wallet_sell_ids = current_sell_ids - _db_sniper_ids
             _zombie_buys  = len(_main_wallet_buy_ids)  - len(_db_open_buy_ids  & _main_wallet_buy_ids)
             _zombie_sells = len(_main_wallet_sell_ids) - len(_db_open_sell_ids & _main_wallet_sell_ids)
+            self._pending_cancel_wallet_ids_by_side = {
+                "buy": _main_wallet_buy_ids - _db_open_buy_ids,
+                "sell": _main_wallet_sell_ids - _db_open_sell_ids,
+            }
+            self._track_pending_cancel_settle_watchdog(
+                self._pending_cancel_wallet_ids_by_side
+            )
             if _zombie_buys > 0 or _zombie_sells > 0:
                 log_event("info", "zombie_wallet_offers",
                           f"Wallet has {_zombie_buys} zombie buy / {_zombie_sells} zombie sell "
@@ -4541,6 +5034,10 @@ class BotLoop:
         except Exception as _dbo_err:
             _db_open_buy_ids = current_buy_ids
             _db_open_sell_ids = current_sell_ids
+            self._pending_cancel_wallet_ids_by_side = {
+                "buy": set(),
+                "sell": set(),
+            }
             log_event("debug", "db_open_ids_fallback",
                       f"DB-open cap filter failed (non-critical): {_dbo_err}")
 
@@ -4690,6 +5187,11 @@ class BotLoop:
             self._drain_mempool_signals(in_cycle=True)
         except Exception:
             pass  # Non-critical
+        price_data, mid_price, arb_gap = self._refresh_cycle_price_after_mempool_move(
+            price_data,
+            mid_price,
+            arb_gap,
+        )
         print("   [4] Checking fills...", end="", flush=True)
         fill_result = self.fill_tracker.detect_fills(
             current_buy_ids, current_sell_ids,
@@ -5086,9 +5588,11 @@ class BotLoop:
             )
             now_ts = time.time()
 
-            # Check which probes survived (still in wallet open offers)
-            buy_alive = buy_tid and buy_tid in (current_buy_ids | current_sell_ids)
-            sell_alive = sell_tid and sell_tid in (current_buy_ids | current_sell_ids)
+            open_ids = current_buy_ids | current_sell_ids
+            buy_state = self._classify_probe_offer("buy", buy_tid, open_ids)
+            sell_state = self._classify_probe_offer("sell", sell_tid, open_ids)
+            buy_alive = bool(buy_state.get("confirmable"))
+            sell_alive = bool(sell_state.get("confirmable"))
 
             # If sell was never placed (no CAT sniper coins), buy-only probe is sufficient
             sell_required = bool(sell_tid)
@@ -5133,20 +5637,27 @@ class BotLoop:
                               "Price confirmed — deploying main offers behind live probes")
                     self._clear_alert("probe_status")
 
-            elif probe["attempt"] >= probe["max_attempts"]:
-                # Too many retries — use whatever we have and proceed
-                survived_price = probe["sell_price"] if sell_alive else (
-                    probe["buy_price"] if buy_alive else probe["tibet_price"])
-                probe["confirmed_price"] = survived_price
-                probe["confirmed_at"] = now_ts
-                probe["active"] = False
-                self._mark_recovery_probe_churn()
-                self._probe_warn("probe_max_retries",
-                                 f"Probe gave up after {probe['attempt']} attempts. "
-                                 f"Using best available price: {survived_price:.8f}")
-                self._probe_warn("probe_timeout_status",
-                                 "Probe timed out — deploying main offers from best probe edge")
-                self._clear_alert("probe_status")
+            elif (
+                any(s.get("unverified") for s in ([buy_state] + ([sell_state] if sell_required else [])))
+                and not any(s.get("taken") for s in ([buy_state] + ([sell_state] if sell_required else [])))
+            ):
+                last_notice_at = float(probe.get("last_wait_log_at") or 0)
+                if (now_ts - last_notice_at) >= 5:
+                    unverified_sides = [
+                        f"{s.get('side')}:{s.get('reason', 'unverified')}"
+                        for s in ([buy_state] + ([sell_state] if sell_required else []))
+                        if s.get("unverified")
+                    ]
+                    log_event(
+                        "info",
+                        "probe_state_wait",
+                        "Probe edge not yet verified on Dexie "
+                        f"({'+'.join(unverified_sides)}) - waiting before "
+                        "main ladder deploy",
+                    )
+                    probe["last_wait_log_at"] = now_ts
+                log_event("debug", "probe_hold_status",
+                          "Probe pair still awaiting Dexie verification")
 
             else:
                 # At least one probe was taken — adjust and retry.
@@ -5166,6 +5677,18 @@ class BotLoop:
                             f"Floor sits between {taken_buffer} and {safe_buffer} bps "
                             f"from Tibet — tightening stopped.",
                         )
+                if probe["attempt"] >= probe["max_attempts"]:
+                    self._mark_recovery_probe_churn()
+                    self._probe_warn(
+                        "probe_max_retries",
+                        f"Probe still unsafe after {probe['attempt']} attempts. "
+                        "Continuing to back off; main ladder remains held.",
+                    )
+                    self._probe_warn(
+                        "probe_timeout_status",
+                        "Probe still unsafe - main ladder held until an edge survives",
+                    )
+                    probe["max_attempts"] = int(probe["attempt"]) + 5
                 attempt = probe["attempt"] + 1
                 base_buffer = getattr(cfg, "SNIPER_BUFFER_BPS", Decimal("50"))
                 # Widen buffer by 50 BPS per failed attempt
@@ -5174,12 +5697,19 @@ class BotLoop:
                 probe_prices = self._get_market_aware_probe_prices(
                     tibet_p,
                     adjusted_buffer,
+                    offer_edges=self._last_live_offer_edges,
                 )
 
                 taken_sides = []
-                if not buy_alive and buy_tid:
+                if buy_tid and (
+                    buy_state.get("taken")
+                    or (not buy_alive and not buy_state.get("unverified"))
+                ):
                     taken_sides.append("buy")
-                if not sell_alive and sell_tid:
+                if sell_tid and (
+                    sell_state.get("taken")
+                    or (not sell_alive and not sell_state.get("unverified"))
+                ):
                     taken_sides.append("sell")
 
                 log_event("info", "probe_retry",
@@ -5308,6 +5838,7 @@ class BotLoop:
                     probe_prices = self._get_market_aware_probe_prices(
                         tibet_p,
                         sniper_buffer_bps,
+                        offer_edges=self._last_live_offer_edges,
                     )
                     sell_price = probe_prices["sell_price"]
                     buy_price = probe_prices["buy_price"]
@@ -5527,6 +6058,22 @@ class BotLoop:
                 )
 
                 if is_vulnerable and move_bps > cfg.ARB_ALERT_THRESHOLD_BPS:
+                    _pending_settle = self._pending_cancel_wallet_ids(eq_side)
+                    if _pending_settle:
+                        self._force_requote[eq_side] = True
+                        log_event(
+                            "warning",
+                            "emergency_requote_deferred_pending_cancel_settle",
+                            f"Emergency {eq_side} requote deferred — "
+                            f"{len(_pending_settle)} wallet-active pending cancel(s) "
+                            f"must settle before replacement offers are created",
+                            data={
+                                "side": eq_side,
+                                "pending_count": len(_pending_settle),
+                                "move_bps": str(move_bps),
+                            },
+                        )
+                        continue
                     _backoff_remaining = self._requote_backoff_remaining(eq_side)
                     if _backoff_remaining > 0:
                         log_event(
@@ -6523,6 +7070,54 @@ class BotLoop:
             should_requote = severity != RequoteSeverity.NONE
 
             if should_requote:
+                _shock_guard = self._recent_tibet_shock_guard(side)
+                if _shock_guard:
+                    self._force_requote[side] = True
+                    _remaining = max(
+                        0.0,
+                        float(_shock_guard.get("guard_secs", 0) or 0)
+                        - float(_shock_guard.get("age_secs", 0) or 0),
+                    )
+                    _protected = "+".join(_shock_guard.get("protected_sides") or ())
+                    log_event(
+                        "info",
+                        "requote_deferred_tibet_shock_guard",
+                        f"Requote {side} deferred - recent Tibet "
+                        f"{_shock_guard.get('direction', 'unknown')} shock "
+                        f"protected {_protected or 'at-risk'} side; waiting "
+                        f"{_remaining:.0f}s before create-first replacement "
+                        f"on the non-vulnerable side",
+                        data={
+                            "side": side,
+                            "direction": _shock_guard.get("direction", ""),
+                            "pct": _shock_guard.get("pct", 0),
+                            "protected_sides": _shock_guard.get("protected_sides", ()),
+                            "remaining_secs": round(_remaining, 1),
+                            "severity": severity.value,
+                            "forced": bool(forced),
+                        },
+                    )
+                    continue
+
+                _pending_settle = self._pending_cancel_wallet_ids(side)
+                if _pending_settle:
+                    if forced:
+                        self._force_requote[side] = True
+                    log_event(
+                        "info",
+                        "requote_deferred_pending_cancel_settle",
+                        f"Requote {side} deferred - {len(_pending_settle)} "
+                        f"wallet-active pending cancel(s) must settle before "
+                        f"replacement offers are created",
+                        data={
+                            "side": side,
+                            "pending_count": len(_pending_settle),
+                            "severity": severity.value,
+                            "forced": bool(forced),
+                        },
+                    )
+                    continue
+
                 reason = (f"convergence tightening [{severity.value}]"
                           if forced
                           else f"price moved {last_price:.8f} -> {compare_mid:.8f} [{severity.value}]")
@@ -6855,6 +7450,28 @@ class BotLoop:
                             "effective_count": effective_sell_count,
                             "target": int(cfg.MAX_ACTIVE_SELL_OFFERS),
                             "recently_created": self.offer_manager.get_recently_created_count("sell")})
+
+        _pending_buy_settle = self._pending_cancel_wallet_ids("buy")
+        if _pending_buy_settle and not skip_buy:
+            skip_buy = True
+            log_event(_skip_level(_buy_under), "create_skip_pending_cancel_settle",
+                      f"Skipping buy creation - {len(_pending_buy_settle)} "
+                      f"wallet-active pending cancel(s) still settling",
+                      data={"side": "buy",
+                            "pending_count": len(_pending_buy_settle),
+                            "effective_count": effective_buy_count,
+                            "target": int(cfg.MAX_ACTIVE_BUY_OFFERS)})
+
+        _pending_sell_settle = self._pending_cancel_wallet_ids("sell")
+        if _pending_sell_settle and not skip_sell:
+            skip_sell = True
+            log_event(_skip_level(_sell_under), "create_skip_pending_cancel_settle",
+                      f"Skipping sell creation - {len(_pending_sell_settle)} "
+                      f"wallet-active pending cancel(s) still settling",
+                      data={"side": "sell",
+                            "pending_count": len(_pending_sell_settle),
+                            "effective_count": effective_sell_count,
+                            "target": int(cfg.MAX_ACTIVE_SELL_OFFERS)})
 
         _buy_backoff = self._requote_backoff_remaining("buy")
         if _buy_backoff > 0:

@@ -136,6 +136,19 @@ def validate_config(cfg) -> ValidationReport:
     if min_edge >= spread and spread > Decimal("0"):
         warn("MIN_EDGE_BPS", f"MIN_EDGE_BPS ({min_edge}) >= SPREAD_BPS ({spread}) — edge cannot exceed spread")
 
+    shock_trigger = getattr(cfg, "TIBET_SHOCK_CANCEL_TRIGGER_PCT", Decimal("0"))
+    try:
+        shock_trigger = Decimal(str(shock_trigger))
+        if shock_trigger < Decimal("0"):
+            err("TIBET_SHOCK_CANCEL_TRIGGER_PCT",
+                "TIBET_SHOCK_CANCEL_TRIGGER_PCT cannot be negative")
+        elif shock_trigger > Decimal("20"):
+            warn("TIBET_SHOCK_CANCEL_TRIGGER_PCT",
+                 "TIBET_SHOCK_CANCEL_TRIGGER_PCT above 20% may react too late to TibetSwap shocks")
+    except (InvalidOperation, TypeError, ValueError):
+        err("TIBET_SHOCK_CANCEL_TRIGGER_PCT",
+            "TIBET_SHOCK_CANCEL_TRIGGER_PCT is not a valid decimal number")
+
     # Dynamic spreads cross-check
     if getattr(cfg, "DYNAMIC_SPREAD_ENABLED", False):
         min_sp = getattr(cfg, "MIN_SPREAD_BPS", Decimal("0"))

@@ -375,6 +375,18 @@ class TestConfigExportEnv(_FlaskBase):
         text = resp.data.decode("utf-8", errors="replace")
         self.assertIn("CATalyst", text)
 
+    def test_response_body_contains_gui_offer_limits(self):
+        resp = self._get("/api/config/export-env")
+        text = resp.data.decode("utf-8", errors="replace")
+        self.assertIn("MAX_ACTIVE_BUY=", text)
+        self.assertIn("MAX_ACTIVE_SELL=", text)
+
+    def test_response_body_contains_tibet_shock_trigger(self):
+        resp = self._get("/api/config/export-env")
+        text = resp.data.decode("utf-8", errors="replace")
+        self.assertIn("TIBET_SHOCK_CANCEL_TRIGGER_PCT=", text)
+        self.assertIn("ARB_ALERT_THRESHOLD_BPS=", text)
+
     def test_no_auth_required(self):
         # Export is a read-only GET
         resp = self._get("/api/config/export-env")

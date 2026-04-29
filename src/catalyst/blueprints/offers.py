@@ -250,6 +250,8 @@ def api_cancel_all():
             from wallet import get_all_offers, cancel_offers_batch, is_offer_time_expired
             all_offers = get_all_offers(include_completed=False, end=500)
             if not all_offers:
+                if bot and getattr(bot, "offer_manager", None):
+                    bot.offer_manager.expect_empty_wallet_offer_book("manual_cancel_all_no_offers")
                 _set_cancel_all_state(
                     running=False,
                     complete=True,
@@ -283,6 +285,8 @@ def api_cancel_all():
                             open_ids.append(tid)
 
             if not open_ids:
+                if bot and getattr(bot, "offer_manager", None):
+                    bot.offer_manager.expect_empty_wallet_offer_book("manual_cancel_all_no_active_offers")
                 _set_cancel_all_state(
                     running=False,
                     complete=True,
@@ -356,6 +360,8 @@ def api_cancel_all():
                         message=f"Cancel all complete: {_w_cancelled} succeeded, {_w_failed} failed.",
                     )
                     api_server.events.emit("offers_cancelled", {"count": _w_cancelled, "reason": "manual_cancel_all"})
+                    if _w_cancelled > 0 and _w_failed == 0 and bot and getattr(bot, "offer_manager", None):
+                        bot.offer_manager.expect_empty_wallet_offer_book("manual_cancel_all")
                     log_event("info", "cancel_all_complete",
                               f"Cancel all finished: {_w_cancelled} succeeded, {_w_failed} failed")
                     # Reset gap closer state if active

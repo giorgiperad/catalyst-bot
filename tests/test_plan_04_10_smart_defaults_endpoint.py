@@ -11,6 +11,7 @@ Tests GET /api/smart-defaults:
 import os
 import sys
 import unittest
+from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -147,6 +148,162 @@ class TestSmartDefaults(_FlaskBase):
             )
         self.assertEqual(str(captured.get("xch_reserve")), "0.5")
         self.assertEqual(str(captured.get("cat_reserve")), "100")
+
+    def test_selected_cat_params_forwarded(self):
+        captured = {}
+
+        def capture(**kwargs):
+            captured.update(kwargs)
+            return _fake_defaults_response(**kwargs)
+
+        with patch.object(api_server, "_calculate_smart_defaults",
+                          side_effect=capture):
+            self.client.get(
+                "/api/smart-defaults?"
+                "asset_id=abc123&cat_wallet_id=7&cat_decimals=5&"
+                "cat_ticker_id=FOO_XCH&cat_name=Foo",
+                environ_base=self._LOOPBACK,
+            )
+
+        self.assertEqual(captured.get("asset_id"), "abc123")
+        self.assertEqual(captured.get("cat_wallet_id"), 7)
+        self.assertEqual(captured.get("cat_decimals"), 5)
+        self.assertEqual(captured.get("cat_ticker_id"), "FOO_XCH")
+        self.assertEqual(captured.get("cat_name"), "Foo")
+
+    def test_zero_cat_decimals_are_forwarded(self):
+        captured = {}
+
+        def capture(**kwargs):
+            captured.update(kwargs)
+            return _fake_defaults_response(**kwargs)
+
+        with patch.object(api_server, "_calculate_smart_defaults",
+                          side_effect=capture):
+            self.client.get(
+                "/api/smart-defaults?asset_id=abc123&cat_decimals=0",
+                environ_base=self._LOOPBACK,
+            )
+
+        self.assertEqual(captured.get("cat_decimals"), 0)
+
+
+class TestSmartDefaultsSourceContract(unittest.TestCase):
+
+    def test_tibet_shock_trigger_derives_from_inner_edge(self):
+        from blueprints.smart_defaults import _smart_tibet_shock_trigger_pct
+
+        self.assertEqual(_smart_tibet_shock_trigger_pct(324), 1.62)
+        self.assertEqual(_smart_tibet_shock_trigger_pct(50), 0.5)
+
+    def test_price_resolver_uses_orderbook_when_ticker_and_tibet_missing(self):
+        from blueprints.smart_defaults import _resolve_smart_mid_price
+
+        messages = []
+        resolved = _resolve_smart_mid_price(
+            ticker={},
+            tibet={},
+            spacescan={},
+            trades={},
+            orderbook={"best_bid": 0.90, "best_ask": 1.10},
+            messages=messages,
+        )
+
+        self.assertEqual(resolved["mid_price"], 1.0)
+        self.assertEqual(resolved["dexie_price"], 1.0)
+        self.assertEqual(resolved["price_source"], "dexie_orderbook")
+        self.assertIn("Dexie orderbook", messages[0])
+
+    def test_price_resolver_uses_trade_vwap_as_last_resort(self):
+        from blueprints.smart_defaults import _resolve_smart_mid_price
+
+        messages = []
+        resolved = _resolve_smart_mid_price(
+            ticker={},
+            tibet={},
+            spacescan={},
+            trades={"trades": [
+                {"price": 2.0, "xch_amount": 1.0},
+                {"price": 4.0, "xch_amount": 3.0},
+                {"price": 10.0, "xch_amount": 0.0},
+            ]},
+            orderbook={},
+            messages=messages,
+        )
+
+        self.assertEqual(resolved["mid_price"], 3.5)
+        self.assertEqual(resolved["dexie_price"], 3.5)
+        self.assertEqual(resolved["price_source"], "dexie_trade_vwap")
+        self.assertIn("Dexie trade VWAP", messages[0])
+
+    def test_response_contract_includes_safety_fields(self):
+        root = Path(__file__).resolve().parents[1]
+        src = (root / "src" / "catalyst" / "blueprints" / "smart_defaults.py").read_text(encoding="utf-8")
+        result_block = src.split("    result = {\n        # Smart Pricing", 1)[1].split(
+            'print(f"[SMART_DEFAULTS v2]', 1
+        )[0]
+
+        self.assertIn('"tibet_shock_cancel_trigger_pct"', result_block)
+        self.assertIn('"arb_alert_threshold_bps"', result_block)
+
+    def test_frontend_has_safety_fields_and_matches_backend_keys(self):
+        root = Path(__file__).resolve().parents[1]
+        html = (root / "bot_gui.html").read_text(encoding="utf-8")
+
+        self.assertIn('id="configTibetShockCancelPct"', html)
+        self.assertIn('id="configArbThreshold"', html)
+        self.assertIn("data.tibet_shock_cancel_trigger_pct", html)
+        self.assertIn("data.arb_alert_threshold_bps", html)
+        self.assertNotIn("data.arb_threshold_bps", html)
+        self.assertIn("'ARB_ALERT_THRESHOLD_BPS':    'configArbThreshold'", html)
+
+    def test_frontend_sends_selected_cat_to_smart_settings(self):
+        root = Path(__file__).resolve().parents[1]
+        html = (root / "bot_gui.html").read_text(encoding="utf-8")
+        smart_block = html.split("async function getSmartDefaults()", 1)[1].split(
+            "const resp = await apiFetch(`${API_URL}/smart-defaults?${params}`);", 1
+        )[0]
+
+        for key in (
+            "asset_id",
+            "cat_wallet_id",
+            "cat_decimals",
+            "cat_ticker_id",
+            "cat_name",
+        ):
+            self.assertIn(key, smart_block)
+        self.assertIn("selectedCAT.decimals ?? 3", smart_block)
+        self.assertIn("currentCAT = { ...selectedCAT }", smart_block)
+
+    def test_frontend_smart_settings_watches_safety_fields(self):
+        root = Path(__file__).resolve().parents[1]
+        html = (root / "bot_gui.html").read_text(encoding="utf-8")
+        watched = html.split("const SMART_SETTINGS_WATCHED_INPUTS = [", 1)[1].split("];", 1)[0]
+
+        for field_id in (
+            "configBaseSpreadBps",
+            "configMinEdgeBps",
+            "configRequoteBps",
+            "configRequoteCooldown",
+            "configDynamicLimitPct",
+            "configMaxStepChange",
+            "configTibetShockCancelPct",
+            "configArbThreshold",
+            "configCompetitorEnabled",
+            "configDbxMaxSpreadBps",
+            "configTopupPoolXch",
+            "configTopupPoolCat",
+            "configBuyInnerSizeXch",
+            "configBuyExtremeSizeXch",
+            "configSniperRearmPriceMovePct",
+            "configSniperRearmGapMovePct",
+            "configTransactionFeeTargetSecs",
+            "configSplashEnabled",
+            "configCoinPrepEnabled",
+            "configRuntimeCoinHealth",
+            "configSageChangeAddress",
+        ):
+            self.assertIn(field_id, watched)
 
 
 if __name__ == "__main__":

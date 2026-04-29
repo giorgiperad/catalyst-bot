@@ -226,6 +226,105 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
 
         self.assertTrue(result)
 
+    def test_sage_topup_split_passes_fee_coin_to_create_transaction(self):
+        import wallet_sage
+
+        with patch.object(wallet_sage, "_require_signing_capability", return_value=True), \
+             patch.object(wallet_sage, "_get_cat_asset_id", return_value="0xasset"), \
+             patch.object(wallet_sage, "create_transaction_rpc", return_value={"success": True}) as create_tx:
+            result = wallet_sage.sage_topup_split(
+                source_coin_id="0xsource",
+                num_coins=1,
+                trading_size_mojos=100,
+                own_address="xch1testaddress",
+                fee_mojos=13,
+                is_cat=True,
+                fee_coin_id="0xfee",
+            )
+
+        self.assertEqual(result, {"success": True})
+        create_tx.assert_called_once()
+        self.assertEqual(
+            create_tx.call_args.kwargs["selected_coin_ids"],
+            ["0xsource", "0xfee"],
+        )
+
+    def test_cat_one_step_topup_reserves_fee_pool_coin(self):
+        manager = self._make_manager()
+        manager.fee_pool.refresh([_record("0xfee", 1000)])
+
+        with patch("wallet_sage.sage_topup_split", return_value={"transaction_id": "fee123"}) as split_mock, \
+             patch.object(coin_manager, "get_next_address", return_value={"success": True, "address": "xch1testaddress"}), \
+             patch.object(manager, "_fee_pool_enabled", return_value=True), \
+             patch.object(manager, "_tx_fee_mojos", return_value=13), \
+             patch.object(manager, "_get_owned_coin_amount_map", side_effect=[
+                 {"0xsource": 600},
+                 {"0xsource": 600, "0xa": 100},
+             ]), \
+             patch.object(manager, "_get_strict_selectable_coin_id_set", return_value={"0xa"}), \
+             patch.object(manager, "_get_transaction_confirmation_state", return_value={
+                 "known": False,
+                 "confirmed": False,
+                 "confirmed_count": 0,
+                 "total": 1,
+                 "height": 0,
+             }), \
+             patch.object(coin_manager, "log_event"), \
+             patch.object(coin_manager.time, "sleep", return_value=None):
+            result = manager._sage_one_step_split(
+                name="CAT-inner",
+                wallet_id=2,
+                source_coin_id="0xsource",
+                num_to_create=1,
+                trading_size_mojos=100,
+                is_cat=True,
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(split_mock.call_args.kwargs["fee_coin_id"], "0xfee")
+        self.assertEqual(manager.fee_pool.available_count, 0)
+
+    def test_sage_one_step_split_stamps_sniper_outputs(self):
+        manager = self._make_manager()
+
+        with patch("wallet_sage.sage_topup_split", return_value={"transaction_id": "sniper123"}), \
+             patch("database.upsert_coin") as upsert_coin, \
+             patch("database.set_coin_designation") as set_designation, \
+             patch.object(coin_manager, "get_next_address", return_value={"success": True, "address": "xch1testaddress"}), \
+             patch.object(manager, "_get_owned_coin_amount_map", side_effect=[
+                 {"0xsource": 600},
+                 {"0xsource": 600, "0xa": 100, "0xb": 100},
+             ]), \
+             patch.object(manager, "_get_strict_selectable_coin_id_set", return_value={"0xa", "0xb"}), \
+             patch.object(manager, "_get_transaction_confirmation_state", return_value={
+                 "known": False,
+                 "confirmed": False,
+                 "confirmed_count": 0,
+                 "total": 1,
+                 "height": 0,
+             }), \
+             patch.object(coin_manager, "log_event"), \
+             patch.object(coin_manager.time, "sleep", return_value=None):
+            result = manager._sage_one_step_split(
+                name="XCH-sniper",
+                wallet_id=1,
+                source_coin_id="0xsource",
+                num_to_create=2,
+                trading_size_mojos=100,
+                is_cat=False,
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(upsert_coin.call_count, 2)
+        for call in upsert_coin.call_args_list:
+            self.assertEqual(call.kwargs["wallet_type"], "xch")
+            self.assertEqual(call.kwargs["designation"], "tier_spare")
+            self.assertEqual(call.kwargs["assigned_tier"], "sniper")
+        self.assertEqual(
+            {call.args for call in set_designation.call_args_list},
+            {("0xa", "tier_spare", "sniper"), ("0xb", "tier_spare", "sniper")},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

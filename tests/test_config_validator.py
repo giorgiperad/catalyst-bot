@@ -20,6 +20,7 @@ def _make_cfg(**overrides):
         "DEFAULT_TRADE_XCH": Decimal("0.0275"),
         "SPREAD_BPS": Decimal("800"),
         "MIN_EDGE_BPS": Decimal("300"),
+        "TIBET_SHOCK_CANCEL_TRIGGER_PCT": Decimal("3"),
         "DYNAMIC_SPREAD_ENABLED": False,
         "MIN_SPREAD_BPS": Decimal("300"),
         "MAX_SPREAD_BPS": Decimal("3000"),
@@ -127,6 +128,13 @@ class TestConfigValidator(unittest.TestCase):
         ))
         self.assertTrue(report.is_valid)
         self.assertTrue(any("MIN_EDGE_BPS" in w.key for w in report.warnings))
+
+    def test_negative_tibet_shock_trigger_is_error(self):
+        report = validate_config(_make_cfg(
+            TIBET_SHOCK_CANCEL_TRIGGER_PCT=Decimal("-1"),
+        ))
+        self.assertFalse(report.is_valid)
+        self.assertTrue(any("TIBET_SHOCK_CANCEL_TRIGGER_PCT" in e.key for e in report.errors))
 
     def test_tier_enabled_zero_counts_is_warning(self):
         report = validate_config(_make_cfg(TIER_ENABLED=True))

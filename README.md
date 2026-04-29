@@ -59,7 +59,7 @@ CATalyst handles all of that. You tell it the CAT you want to trade and your cap
 - Cross-platform: Windows 10/11 (64-bit), macOS, and Linux. Prebuilt binaries for all three ship with every release; see the [Releases page](https://github.com/Lowestofttim/catalyst-bot/releases).
 - [Sage wallet](https://sage.rigidnetwork.io) installed with RPC enabled (Settings → Advanced → Enable RPC).
 - XCH for fees and inventory, plus the CAT token you want to trade.
-- Python 3.10+ only if running from source. The packaged release has no external runtime requirements.
+- Python 3.12 only if running from source. The packaged release has no external runtime requirements.
 
 ---
 
@@ -201,13 +201,22 @@ Tag a commit as `v*` to trigger the GitHub Actions build-release pipeline, which
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest tests -q --ignore=tests/e2e --disable-warnings
+python -m pytest tests -q --ignore=tests/test_coin_prep.py --ignore=tests/test_coin_prep_v2.py --ignore=tests/test_offer_create.py
 python -m ruff check . --select E9,F821
 python -m bandit -r src --ini .bandit -ll
 python scripts/check_tracked_secrets.py
 ```
 
-Integration tests that hit live APIs are excluded via `conftest.py` by default.
+Standalone live-wallet scripts are excluded by `tests/conftest.py` and the explicit ignores above.
+
+---
+
+## Contributing and security
+
+- Bug reports, feature ideas, and pull requests: see [CONTRIBUTING.md](CONTRIBUTING.md).
+- Security reports: see [SECURITY.md](SECURITY.md). Do not open public issues for suspected vulnerabilities.
+- General support: see [SUPPORT.md](SUPPORT.md).
+- Community expectations: see [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
 ---
 

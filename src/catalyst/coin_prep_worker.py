@@ -46,6 +46,7 @@ from wallet import (
 )
 from coin_prep_utils import (
     should_extend_pending_consumed_split_grace,
+    should_wait_for_pending_fee_inputs_before_split,
     should_retry_unconsumed_split,
 )
 from tx_fees import (
@@ -848,10 +849,20 @@ class CoinPrepWorker:
 
         # Tolerance: 1% of the plan amount, or a minimum of 10M mojos
         # (0.00001 XCH) to cover typical single-tx fees on tiny fee coins.
+        # For XCH, also allow one full configured transaction-fee delta:
+        # Sage can spread the fee across the smallest fee-tier outputs, which
+        # made two 0.00115 XCH fee coins land as 0.0011369209 XCH.
+        fee_abs_tol = 0
+        if wallet_type == "xch":
+            try:
+                fee_abs_tol = max(0, int(self._tx_fee_mojos() or 0)) + 1_000_000
+            except Exception:
+                fee_abs_tol = 0
+
         def _within_tolerance(coin_amount: int, plan_amount: int) -> bool:
             if plan_amount <= 0:
                 return False
-            abs_tol = max(int(plan_amount * 0.01), 10_000_000)
+            abs_tol = max(int(plan_amount * 0.01), 10_000_000, fee_abs_tol)
             return abs(coin_amount - plan_amount) <= abs_tol
 
         # Sort coins by amount descending so biggest tiers get first pick
@@ -2437,7 +2448,8 @@ class CoinPrepWorker:
         """
         from wallet_sage import (get_next_address, send_transaction,
                                  send_transaction_multi, send_cat_multi,
-                                 split_coins_rpc, get_pending_transactions)
+                                 split_coins_rpc, sage_topup_split,
+                                 get_pending_transactions)
 
         self.log(f"\n{'='*60}")
         self.log("⚡ SAGE MULTI-SEND TIERED SPLITTING")
@@ -3093,7 +3105,8 @@ class CoinPrepWorker:
         # ================================================================
         # SUBMIT-ONLY: Submit a split (no polling). Returns coin_id or None.
         # ================================================================
-        def _submit_split(wallet_id, tier_name, count, pool_mojos, side_label, is_cat, preselected_pool_coin=None):
+        def _submit_split(wallet_id, tier_name, count, pool_mojos, side_label, is_cat,
+                          preselected_pool_coin=None, fee_coin_id=None):
             """Find the pool coin, confirm spendable, submit split. Returns submit details or None."""
             pool_coin = None
             if preselected_pool_coin:
@@ -3138,16 +3151,46 @@ class CoinPrepWorker:
                 return None
 
             self.log(f"   Splitting {side_label} {tier_name}: {coin_id[:16]}... into {count} pieces")
+            cat_fee_mojos = self._tx_fee_mojos() if is_cat else 0
+            if should_wait_for_pending_fee_inputs_before_split(
+                is_cat=is_cat,
+                fee_mojos=cat_fee_mojos,
+                has_dedicated_fee_coin=bool(fee_coin_id),
+            ):
+                self.log(
+                    f"      Waiting for pending transactions to clear before fee-paid CAT {tier_name} split..."
+                )
+                if not _wait_for_pending_clear(f"CAT {tier_name} fee-input-ready", timeout_s=300):
+                    self.log(
+                        f"      Pending transactions did not clear before CAT {tier_name} split"
+                    )
+                    return None
+            if is_cat and cat_fee_mojos > 0 and fee_coin_id:
+                _fee_coin_short = fee_coin_id.replace("0x", "")[:16]
+                self.log(f"      Using dedicated XCH fee coin {_fee_coin_short}... for CAT {tier_name}")
+
             for attempt in range(3):
                 try:
-                    result = split_coins_rpc(
-                        wallet_id=wallet_id,
-                        target_coin_id=coin_id,
-                        num_coins=count,
-                        amount_per_coin=0,
-                        fee_mojos=self._split_tx_fee_mojos(),
-                        is_cat=is_cat,
-                    )
+                    if is_cat:
+                        amount_per_coin = pool_mojos // count
+                        result = sage_topup_split(
+                            source_coin_id=coin_id,
+                            num_coins=count,
+                            trading_size_mojos=amount_per_coin,
+                            own_address=address,
+                            fee_mojos=cat_fee_mojos,
+                            is_cat=True,
+                            fee_coin_id=fee_coin_id,
+                        )
+                    else:
+                        result = split_coins_rpc(
+                            wallet_id=wallet_id,
+                            target_coin_id=coin_id,
+                            num_coins=count,
+                            amount_per_coin=0,
+                            fee_mojos=self._split_tx_fee_mojos(),
+                            is_cat=False,
+                        )
                     if result is None:
                         self.log(f"      Split returned None (attempt {attempt + 1}/3)")
                         _wait_for_pending_clear(f"{side_label} {tier_name} split-retry", timeout_s=60)
@@ -3183,6 +3226,100 @@ class CoinPrepWorker:
 
             self.log(f"      {side_label} {tier_name} split failed after 3 attempts")
             return None
+
+        def _prepare_cat_split_fee_coins(needed_count, base_fee_coin_mojos):
+            """Create temporary XCH fee inputs so CAT splits do not share one fee coin.
+
+            These coins are intentionally not part of the final tier target.
+            Each CAT split gets one dedicated XCH fee input; any change from
+            those inputs is merged back into reserve during the final cleanup.
+            If this pre-funding path cannot produce selectable coins, callers
+            fall back to the older serialized CAT split path.
+            """
+            cat_fee_mojos = self._tx_fee_mojos()
+            needed_count = int(needed_count or 0)
+            if needed_count <= 0 or cat_fee_mojos <= 0:
+                return []
+
+            base_fee_coin_mojos = int(base_fee_coin_mojos or 0)
+            fee_coin_mojos = max(base_fee_coin_mojos, cat_fee_mojos * 4, 1_000_000_000)
+            # Keep temporary fee inputs outside the final fee-tier tolerance
+            # band so unused inputs or CAT-fee change cannot be mistaken for
+            # prepared fee spares during the final designation sweep.
+            fee_coin_mojos += max(cat_fee_mojos * 3, 100_000_000)
+
+            before_ids = set()
+            try:
+                for coin in self._get_owned_coins_via_rpc(self.xch_wallet_id, "cat-fee-input-before") or []:
+                    coin_id = coin.get("coin_id", "").replace("0x", "").lower()
+                    if coin_id and int(coin.get("amount", 0) or 0) == fee_coin_mojos:
+                        before_ids.add(coin_id)
+            except Exception:
+                before_ids = set()
+
+            self.log(
+                f"   Preparing {needed_count} dedicated XCH fee input coin(s) "
+                f"for CAT splits ({fee_coin_mojos:,} mojos each)"
+            )
+            payments = [{"address": address, "amount": fee_coin_mojos} for _ in range(needed_count)]
+            try:
+                result = send_transaction_multi(payments, fee_mojos=cat_fee_mojos)
+            except Exception as e:
+                self.log(f"   Dedicated CAT fee-input multi_send exception: {e}")
+                return []
+            if result is None:
+                self.log("   Dedicated CAT fee-input multi_send returned None; using serialized fallback")
+                return []
+            if isinstance(result, dict) and result.get("error"):
+                err = str(result.get("error", ""))[:160]
+                self.log(f"   Dedicated CAT fee-input multi_send error: {err}; using serialized fallback")
+                return []
+
+            tx_ids = self._extract_sage_transaction_ids(result)
+            tx_logged = False
+            started_at = time.time()
+            for poll in range(60):
+                if tx_ids and not tx_logged:
+                    tx_state = self._get_transaction_confirmation_state(tx_ids)
+                    if tx_state["confirmed"]:
+                        self.log(
+                            "      Dedicated CAT fee-input transaction confirmed"
+                            + (f" at height {tx_state['height']}" if tx_state["height"] else "")
+                        )
+                        tx_logged = True
+
+                owned_coins = self._get_owned_coins_via_rpc(self.xch_wallet_id, "cat-fee-input-owned")
+                selectable_ids = self._get_strict_selectable_coin_id_set(
+                    self.xch_wallet_id,
+                    "cat-fee-input-selectable",
+                )
+                candidates = []
+                for coin in owned_coins or []:
+                    coin_id = coin.get("coin_id", "").replace("0x", "").lower()
+                    if not coin_id or coin_id in before_ids:
+                        continue
+                    if int(coin.get("amount", 0) or 0) != fee_coin_mojos:
+                        continue
+                    if coin_id in selectable_ids:
+                        candidates.append(coin_id)
+                candidates = sorted(set(candidates))
+                if len(candidates) >= needed_count:
+                    elapsed_s = int(time.time() - started_at)
+                    self.log(
+                        f"      Dedicated CAT fee inputs selectable after {elapsed_s}s "
+                        f"({len(candidates)}/{needed_count})"
+                    )
+                    return candidates[:needed_count]
+                if poll > 0 and poll % 4 == 0:
+                    elapsed_s = int(time.time() - started_at)
+                    self.log(
+                        f"      {elapsed_s}s - waiting for dedicated CAT fee inputs "
+                        f"({len(candidates)}/{needed_count} selectable)"
+                    )
+                time.sleep(5)
+
+            self.log("   Dedicated CAT fee inputs did not become selectable; using serialized fallback")
+            return []
 
         # ================================================================
         # PARALLEL POLL: Wait for ALL splits to confirm simultaneously
@@ -3446,9 +3583,12 @@ class CoinPrepWorker:
                         )
                         anomaly_reported.add(idx)
 
+                    high_water_complete = owned_high_water.get(idx, 0) >= cnt
+
                     force_retry_now = (
                         later_same_batch_confirmed and
                         retry_counts.get(idx, 0) < 1 and
+                        not high_water_complete and
                         split_state["pool_still_visible"] and
                         split_state["pool_still_selectable"] and
                         not split_state["outputs_selectable"]
@@ -3462,6 +3602,8 @@ class CoinPrepWorker:
                         retries_used=retry_counts.get(idx, 0),
                         retry_after_s=retry_after_s,
                         max_retries=1,
+                        owned_output_high_water=owned_high_water.get(idx, 0),
+                        expected_count=cnt,
                     ):
                         # ────────────────────────────────────────────────────────
                         # AUTHORITATIVE on-chain check (Option B fix 2026-04-07):
@@ -3538,14 +3680,39 @@ class CoinPrepWorker:
                         )
                         retry_counts[idx] = retry_counts.get(idx, 0) + 1
                         try:
-                            result = split_coins_rpc(
-                                wallet_id=wid,
-                                target_coin_id=split_state["pool_coin_id"],
-                                num_coins=cnt,
-                                amount_per_coin=0,
-                                fee_mojos=self._split_tx_fee_mojos(),
+                            cat_retry_fee_mojos = self._tx_fee_mojos() if ic else 0
+                            if should_wait_for_pending_fee_inputs_before_split(
                                 is_cat=ic,
-                            )
+                                fee_mojos=cat_retry_fee_mojos,
+                            ):
+                                self.log(
+                                    f"      Waiting for pending transactions to clear before retrying fee-paid CAT {tn} split..."
+                                )
+                                if not _wait_for_pending_clear(
+                                    f"CAT {tn} retry-fee-input-ready", timeout_s=300
+                                ):
+                                    self.log(
+                                        f"      Pending transactions did not clear before CAT {tn} retry"
+                                    )
+                                    continue
+                            if ic:
+                                result = sage_topup_split(
+                                    source_coin_id=split_state["pool_coin_id"],
+                                    num_coins=cnt,
+                                    trading_size_mojos=pm // cnt,
+                                    own_address=address,
+                                    fee_mojos=cat_retry_fee_mojos,
+                                    is_cat=True,
+                                )
+                            else:
+                                result = split_coins_rpc(
+                                    wallet_id=wid,
+                                    target_coin_id=split_state["pool_coin_id"],
+                                    num_coins=cnt,
+                                    amount_per_coin=0,
+                                    fee_mojos=self._split_tx_fee_mojos(),
+                                    is_cat=False,
+                                )
                             if result is None:
                                 self.log(f"      ❌ {sl} {tn} retry split returned None")
                             elif isinstance(result, dict) and result.get("error"):
@@ -3828,10 +3995,41 @@ class CoinPrepWorker:
             else:
                 self.log(f"   ⚠️ XCH {tier_name} pool coin still selectable after 15s — proceeding anyway")
 
+        cat_fee_coin_ids = []
+        if cat_tier_details and self._tx_fee_mojos() > 0:
+            base_cat_fee_input_mojos = 0
+            for fee_tier_name, fee_count, fee_pool_mojos in xch_tier_details_ordered:
+                if fee_tier_name == "fees" and fee_count > 0:
+                    base_cat_fee_input_mojos = fee_pool_mojos // fee_count
+                    break
+            cat_fee_coin_ids = _prepare_cat_split_fee_coins(
+                len(cat_tier_details),
+                base_cat_fee_input_mojos,
+            )
+            if len(cat_fee_coin_ids) < len(cat_tier_details):
+                self.log(
+                    f"   Dedicated CAT fee inputs unavailable "
+                    f"({len(cat_fee_coin_ids)}/{len(cat_tier_details)}); "
+                    "remaining CAT splits will use serialized fee-input waits"
+                )
+
+        cat_fee_coin_idx = 0
         for tier_name, count, pool_mojos in cat_tier_details:
             split_submit = None
+            fee_coin_id = None
+            if cat_fee_coin_idx < len(cat_fee_coin_ids):
+                fee_coin_id = cat_fee_coin_ids[cat_fee_coin_idx]
             for _split_attempt in range(3):
-                split_submit = _submit_split(self.cat_wallet_id, tier_name, count, pool_mojos, "CAT", True, preselected_pool_coin=cat_pool_coin_map.get(tier_name))
+                split_submit = _submit_split(
+                    self.cat_wallet_id,
+                    tier_name,
+                    count,
+                    pool_mojos,
+                    "CAT",
+                    True,
+                    preselected_pool_coin=cat_pool_coin_map.get(tier_name),
+                    fee_coin_id=fee_coin_id,
+                )
                 if split_submit is not None:
                     break
                 if _split_attempt < 2:
@@ -3840,6 +4038,8 @@ class CoinPrepWorker:
             if split_submit is None:
                 self.log(f"   ❌ CAT {tier_name} split submit failed!")
                 return False
+            if fee_coin_id:
+                cat_fee_coin_idx += 1
             pending_splits.append((self.cat_wallet_id, tier_name, count, pool_mojos, split_submit["pool_coin_id"], "CAT", True, split_submit.get("tx_ids", [])))
             split_submit_idx += 1
             submit_progress = 0.55 + (split_submit_idx / max(total_split_submits, 1)) * 0.15

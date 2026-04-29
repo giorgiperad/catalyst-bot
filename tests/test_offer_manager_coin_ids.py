@@ -153,8 +153,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
         self.assertEqual(cancelled_msgs, ["Cancelled 1 offers (reason: test)"])
 
     def test_requote_side_cancels_most_at_risk_first(self):
-        """Single-pass requote creates using spare coins and cancels the
-        most-at-risk old offers (closest to mid) in one shot."""
+        """Single-pass requote cancels the most-at-risk old offers first."""
         manager = offer_manager.OfferManager()
         cancel_batches = []
         open_offers = [
@@ -218,6 +217,43 @@ class OfferManagerCoinIdTests(unittest.TestCase):
         self.assertEqual(len(cancel_batches), 1)
         # Most-at-risk first: inner (closest to mid), then mid
         self.assertEqual(cancel_batches[0], ["inner-trade", "mid-trade"])
+
+    def test_requote_side_does_not_create_when_cancel_is_pending(self):
+        manager = offer_manager.OfferManager()
+        open_offers = [{
+            "trade_id": "old-sell",
+            "tier": "inner",
+            "price_xch": "0.1200",
+            "created_at": "2026-03-29T00:00:01+00:00",
+        }]
+        calls = []
+
+        def fake_create_ladder(*args, **kwargs):
+            calls.append("create")
+            return [{"trade_id": "new-sell"}]
+
+        def fake_cancel_offers(trade_ids, reason="requote", skip_confirmation=False):
+            calls.append("cancel")
+            return {
+                "old-sell": {
+                    "success": True,
+                    "method": "submitted_pending_confirm",
+                }
+            }
+
+        _one_spare_coin = [{"designation": "tier_spare", "assigned_tier": "inner"}]
+
+        with patch.object(offer_manager, "get_open_offers", return_value=open_offers), \
+                patch("database.get_free_coins", return_value=_one_spare_coin), \
+                patch.object(manager, "create_ladder", side_effect=fake_create_ladder), \
+                patch.object(manager, "cancel_offers", side_effect=fake_cancel_offers), \
+                patch.object(offer_manager, "log_event"):
+            result = manager.requote_side("sell", Decimal("0.1200"))
+
+        self.assertEqual(calls, ["cancel"])
+        self.assertEqual(result["offers"], [])
+        self.assertEqual(result["replaced_count"], 0)
+        self.assertFalse(result["fully_replaced"])
 
     def test_retry_failed_cancels_exhaustion_does_not_mark_cancelled(self):
         manager = offer_manager.OfferManager()
