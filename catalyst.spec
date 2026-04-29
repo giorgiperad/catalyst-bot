@@ -69,7 +69,7 @@ _image_files = [
               'dexie_logo_official.png', 'dexie_logo_official.ico',
               'sage_logo_official.png', 'tibetswap_logo_official.png',
               'MonkeyZoo_Logo.png', 'monkeyzoo-logo-1.gif',
-              'spacescan-logo-192.webp')
+              'spacescan-logo-192.webp', 'sage_rpc_advanced.png')
     if os.path.isfile(os.path.join(_assets_dir, f))
 ]
 # Also check root for backward compat
