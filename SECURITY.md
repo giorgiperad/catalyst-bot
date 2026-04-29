@@ -5,16 +5,18 @@ security reports as sensitive until a fix is available.
 
 ## Supported Versions
 
-Security fixes are handled for the latest tagged release and the current
-`master` branch.
+Security fixes are handled for the latest tagged release and the current default
+branch, `master`.
 
 ## Reporting a Vulnerability
 
 Please do not open a public issue for suspected vulnerabilities.
 
-Instead, use GitHub's private vulnerability reporting if it is available on the
-repository, or contact the maintainer privately through the contact route listed
-on the GitHub profile.
+Use GitHub private vulnerability reporting when available:
+https://github.com/Lowestofttim/catalyst-bot/security/advisories/new
+
+If GitHub does not allow private reporting for your account, contact the
+maintainer privately through the contact route listed on the GitHub profile.
 
 Useful details include:
 

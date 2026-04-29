@@ -39,11 +39,21 @@ Maintainers will convert accepted Ideas into tracked Issues.
 ## Submitting code
 
 1. Fork the repo and create a branch from `master`.
-2. Follow the conventions in [CLAUDE.md](CLAUDE.md): `Decimal` for prices, `slog()` for logging, DB access via `database.py`, etc.
-3. Install developer dependencies: `pip install -r requirements-dev.txt`.
-4. Run the tests: `python -m pytest tests -q --ignore=tests/e2e --disable-warnings`.
-5. Run the static checks: `python -m ruff check . --select E9,F821`, `python -m bandit -r src --ini .bandit -ll`, `python scripts/check_env_example.py`, and `python scripts/check_tracked_secrets.py`.
-6. Open a PR with a clear description of **why** the change is needed.
+2. Use Python 3.12, which is what CI and the release builds use.
+3. Follow the project conventions below.
+4. Install developer dependencies: `pip install -r requirements-dev.txt`.
+5. Run the tests: `python -m pytest tests -q --ignore=tests/test_coin_prep.py --ignore=tests/test_coin_prep_v2.py --ignore=tests/test_offer_create.py`.
+6. Run the static checks: `python -m ruff check . --select E9,F821`, `python -m bandit -r src --ini .bandit -ll`, `python scripts/check_env_example.py`, and `python scripts/check_tracked_secrets.py`.
+7. Open a PR with a clear description of **why** the change is needed.
+
+Core conventions:
+
+- Use `Decimal` for prices and amounts; coin amounts are mojos as integers.
+- Use `from config import cfg` for settings and `from super_log import slog` for logging.
+- Keep database access inside `database.py`; do not add raw SQL in other modules.
+- Use the `wallet.py` adapter for wallet calls instead of importing wallet backends directly.
+- App bridge methods should return `{"success": True/False, ...}` dictionaries rather than raising into JavaScript.
+- Escape server-sourced data before rendering it into HTML; prefer event delegation over inline handlers.
 
 Small, focused PRs get reviewed faster. If you're unsure whether an approach will be accepted, open a Discussion first.
 
