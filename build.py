@@ -117,11 +117,8 @@ def _post_build():
     # Confirm HTML files are bundled (quick sanity check). PyInstaller 6
     # onedir builds place data files under _internal; older layouts kept
     # them next to the executable.
-    html_candidates = [
-        os.path.join(OUTPUT_DIR, 'bot_gui.html'),
-        os.path.join(OUTPUT_DIR, '_internal', 'bot_gui.html'),
-    ]
-    if not any(os.path.isfile(path) for path in html_candidates):
+    data_roots = (OUTPUT_DIR, os.path.join(OUTPUT_DIR, '_internal'))
+    if not any(os.path.isfile(os.path.join(root, 'bot_gui.html')) for root in data_roots):
         print("\n  WARNING: bot_gui.html not found in the bundle.")
         print("  The app may fail to load the GUI. Check the .spec datas list.")
     else:
