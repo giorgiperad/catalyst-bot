@@ -1379,6 +1379,47 @@ class BotLoop:
             "our_best_ask": str(best_ask),
         }
 
+    def _apply_immediate_sweep_protection(self, buy_fills, sell_fills):
+        """Pause same-side creation immediately when one cycle sees a fill burst."""
+        try:
+            min_fills = max(2, int(getattr(cfg, "SWEEP_MIN_FILLS", 3) or 3))
+        except Exception:
+            min_fills = 3
+
+        try:
+            protection_secs = float(getattr(cfg, "SWEEP_PROTECTION_SECS", 90) or 90)
+        except Exception:
+            protection_secs = 90.0
+
+        if protection_secs <= 0:
+            return set()
+
+        now_ts = time.time()
+        protected = set()
+        for side, fills in (("buy", buy_fills or []), ("sell", sell_fills or [])):
+            if len(fills) < min_fills:
+                continue
+            expiry = now_ts + protection_secs
+            current_expiry = float(self._sweep_protection.get(side, 0) or 0)
+            self._sweep_protection[side] = max(current_expiry, expiry)
+            protected.add(side)
+
+        if protected:
+            log_event(
+                "info",
+                "sweep_protection_immediate",
+                f"Same-cycle sweep protection: pausing {sorted(protected)} "
+                f"offer creation after fill burst",
+                data={
+                    "protected_sides": sorted(protected),
+                    "buy_fills": len(buy_fills or []),
+                    "sell_fills": len(sell_fills or []),
+                    "protection_secs": round(protection_secs, 1),
+                },
+            )
+
+        return protected
+
     def _probe_has_matured(self, probe: Optional[Dict] = None,
                            now_ts: Optional[float] = None) -> bool:
         """True once a probe pair has survived for the minimum hold time."""
@@ -5223,6 +5264,7 @@ class BotLoop:
             # Without this, recorded fills change net_position but the
             # stale baseline drifts, spamming position_sanity_drift warnings.
             self._position_baseline_cat = None
+            self._apply_immediate_sweep_protection(buy_fills, sell_fills)
 
         if not buy_fills and not sell_fills:
             print(" none", flush=True)

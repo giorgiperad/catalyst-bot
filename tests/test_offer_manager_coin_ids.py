@@ -54,6 +54,7 @@ fake_database = types.ModuleType("database")
 fake_database.add_offer = lambda *args, **kwargs: None
 fake_database.update_offer_status = lambda *args, **kwargs: None
 fake_database.update_offer_coin_id = lambda *args, **kwargs: None
+fake_database.update_offer_bech32 = lambda *args, **kwargs: None
 fake_database.get_open_offers = lambda *args, **kwargs: []
 fake_database.get_offer = lambda *args, **kwargs: None
 fake_database.get_free_coins = lambda *args, **kwargs: []
@@ -342,6 +343,41 @@ class OfferManagerCoinIdTests(unittest.TestCase):
 
         self.assertCountEqual(seen, preselected)
         self.assertEqual([offer["coin_id"] for offer in created], preselected)
+
+    def test_create_ladder_caches_offer_bech32_for_splash_repost(self):
+        manager = offer_manager.OfferManager()
+
+        def fake_create_offer_with_retry(self, offer_dict, max_retries=2,
+                                         expiry_offset=0, expiry_secs=None,
+                                         used_coins=None, coin_ids_enabled=False,
+                                         selected_coin_id=None, preferred_tier=None,
+                                         strict_preferred_tier=False):
+            return {
+                "success": True,
+                "trade_id": "trade-cache",
+                "trade_record": {"trade_id": "trade-cache"},
+                "locked_coin_id": selected_coin_id,
+                "offer": "offer1cachedbech32",
+            }
+
+        with patch.object(offer_manager.OfferManager, "_select_coin_for_offer",
+                          return_value="0xcoin-cache"), \
+                patch.object(offer_manager.OfferManager, "create_offer_with_retry",
+                             new=fake_create_offer_with_retry), \
+                patch.object(offer_manager, "add_offer"), \
+                patch.object(offer_manager, "update_offer_bech32", create=True) as update_bech32, \
+                patch.object(offer_manager, "log_event"), \
+                patch("builtins.print"), \
+                patch("database.lock_coin"):
+            created = manager.create_ladder(
+                mid_price=Decimal("0.001"),
+                side="buy",
+                num_offers=1,
+                coin_ids_enabled=True,
+            )
+
+        self.assertEqual(created[0]["offer_bech32"], "offer1cachedbech32")
+        update_bech32.assert_called_once_with("trade-cache", "offer1cachedbech32")
 
     def test_create_ladder_tier_mode_skips_when_no_preselected_coin(self):
         manager = offer_manager.OfferManager()

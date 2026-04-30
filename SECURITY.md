@@ -6,7 +6,17 @@ security reports as sensitive until a fix is available.
 ## Supported Versions
 
 Security fixes are handled for the latest tagged release and the current default
-branch, `master`.
+branch, `main`.
+
+## Automated Checks
+
+Every push or pull request to `main` and `test` runs the normal quality gate:
+syntax checks, crash-class Ruff linting, tests, a tracked-secret scan, Bandit,
+and Python dependency auditing with `pip-audit`.
+
+A separate deep security workflow runs Semgrep SAST and Gitleaks secret scanning
+on pushes, pull requests, weekly schedules, and manual dispatches. Dependabot
+alerts and automated security fixes are enabled for dependency updates.
 
 ## Reporting a Vulnerability
 

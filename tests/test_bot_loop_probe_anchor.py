@@ -436,6 +436,25 @@ class ProbeAnchorTests(unittest.TestCase):
             arb_gap=Decimal("1"),
         )
 
+    def test_immediate_sweep_protection_pauses_filled_side_same_cycle(self):
+        loop = bot_loop.BotLoop()
+        loop._sweep_protection = {}
+
+        buy_fills = [
+            {"trade_id": "buy-1"},
+            {"trade_id": "buy-2"},
+            {"trade_id": "buy-3"},
+        ]
+
+        with patch.object(fake_config.cfg, "SWEEP_MIN_FILLS", 3, create=True), \
+                patch.object(fake_config.cfg, "SWEEP_PROTECTION_SECS", 90, create=True), \
+                patch.object(bot_loop.time, "time", return_value=1000.0):
+            protected = loop._apply_immediate_sweep_protection(buy_fills, [])
+
+        self.assertEqual(protected, {"buy"})
+        self.assertEqual(loop._sweep_protection["buy"], 1090.0)
+        self.assertNotIn("sell", loop._sweep_protection)
+
     def test_probe_hold_requires_min_age_before_confirmation(self):
         loop = bot_loop.BotLoop()
 

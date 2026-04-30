@@ -27,7 +27,8 @@ from config import cfg
 from database import (
     add_offer, update_offer_status,
     transition_offer, mark_cancel_attempted,
-    get_open_offers, log_event, lock_coin
+    get_open_offers, log_event, lock_coin,
+    update_offer_bech32,
 )
 from wallet import (
     create_offer, cancel_offer, cancel_offers_batch,
@@ -2101,6 +2102,7 @@ class OfferManager:
                 offer_bech32 = get_offer_bech32(trade_id) or ""
             if offer_bech32:
                 offer_detail["offer_bech32"] = offer_bech32
+                update_offer_bech32(trade_id, offer_bech32)
 
             self._offer_details_cache[trade_id] = offer_detail
             self._recently_created[trade_id] = time.time()

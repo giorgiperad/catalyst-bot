@@ -15500,6 +15500,7 @@
             // while the Live tab is up so the sticky chrome doesn't imply
             // "press Save to persist Live tweaks" (they auto-persist).
             if (footer) footer.style.display = showLive ? 'none' : '';
+            try { updateSettingsRestartBannerVisibility(); } catch (_) {}
         }
 
         // Ensure the live-controls DOM lives inside the Settings > Live sub-view.
@@ -15517,12 +15518,19 @@
             panel.classList.remove('dashboard-section-hidden');
         }
 
-        function updateSettingsLock() {
+        function updateSettingsRestartBannerVisibility() {
             const isRunning = bot_state?.running || false;
             const banner = document.getElementById('settingsRestartBanner');
+            const setupView = document.getElementById('settingsSetupView');
+            const setupActive = !!(setupView && setupView.classList.contains('is-active'));
+
+            if (banner) banner.classList.toggle('is-visible', isRunning && setupActive);
+        }
+
+        function updateSettingsLock() {
+            const isRunning = bot_state?.running || false;
             const liveHintText = document.getElementById('settingsSubtabLiveHintText');
 
-            if (banner) banner.classList.toggle('is-visible', isRunning);
             if (liveHintText) liveHintText.textContent = isRunning ? 'Running' : 'Idle';
 
             // Auto-select a sensible sub-tab if the user hasn't already
@@ -15530,6 +15538,7 @@
             if (!_settingsSubviewUserPicked) {
                 settingsSwitchSubview(isRunning ? 'live' : 'setup', { auto: true });
             }
+            updateSettingsRestartBannerVisibility();
 
             // Update Save button label so the user knows mid-run saves
             // don't take effect until restart.

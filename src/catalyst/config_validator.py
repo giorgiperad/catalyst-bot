@@ -100,6 +100,7 @@ def validate_config(cfg) -> ValidationReport:
     min_trade = getattr(cfg, "MIN_TRADE_XCH", Decimal("0"))
     max_trade = getattr(cfg, "MAX_TRADE_XCH", Decimal("0"))
     default_trade = getattr(cfg, "DEFAULT_TRADE_XCH", Decimal("0"))
+    tier_enabled = getattr(cfg, "TIER_ENABLED", False)
 
     if min_trade <= Decimal("0"):
         err("MIN_TRADE_XCH", f"MIN_TRADE_XCH={min_trade} must be positive")
@@ -107,25 +108,8 @@ def validate_config(cfg) -> ValidationReport:
         err("MAX_TRADE_XCH", f"MAX_TRADE_XCH={max_trade} must be positive")
     if min_trade > Decimal("0") and max_trade > Decimal("0") and min_trade > max_trade:
         err("MIN_TRADE_XCH/MAX_TRADE_XCH", f"MIN_TRADE_XCH ({min_trade}) > MAX_TRADE_XCH ({max_trade})")
-    if default_trade > Decimal("0") and max_trade > Decimal("0") and default_trade > max_trade:
+    if not tier_enabled and default_trade > Decimal("0") and max_trade > Decimal("0") and default_trade > max_trade:
         warn("DEFAULT_TRADE_XCH", f"DEFAULT_TRADE_XCH ({default_trade}) exceeds MAX_TRADE_XCH ({max_trade})")
-
-    # ---- Tier sizes vs MAX_TRADE_XCH ----
-    # When tier mode is active, offer sizes come from the tier config, not
-    # DEFAULT_TRADE_XCH. A misconfigured tier can create offers much larger
-    # than the user intended without any other warning.
-    if max_trade > Decimal("0") and getattr(cfg, "TIER_ENABLED", False):
-        tier_size_keys = [
-            ("INNER_SIZE_XCH", getattr(cfg, "INNER_SIZE_XCH", Decimal("0"))),
-            ("MID_SIZE_XCH",   getattr(cfg, "MID_SIZE_XCH",   Decimal("0"))),
-            ("OUTER_SIZE_XCH", getattr(cfg, "OUTER_SIZE_XCH", Decimal("0"))),
-            ("EXTREME_SIZE_XCH", getattr(cfg, "EXTREME_SIZE_XCH", Decimal("0"))),
-        ]
-        for tier_key, tier_size in tier_size_keys:
-            if tier_size > Decimal("0") and tier_size > max_trade:
-                warn(tier_key,
-                     f"{tier_key} ({tier_size} XCH) exceeds MAX_TRADE_XCH ({max_trade} XCH) — "
-                     f"offers will be larger than your configured maximum trade size")
 
     # ---- Spread & Pricing ----
     spread = getattr(cfg, "SPREAD_BPS", Decimal("0"))
@@ -227,7 +211,6 @@ def validate_config(cfg) -> ValidationReport:
         err("CAT_RESERVE", f"CAT_RESERVE={cat_reserve} cannot be negative")
 
     # ---- Tiered Orders ----
-    tier_enabled = getattr(cfg, "TIER_ENABLED", False)
     if tier_enabled:
         tier_counts = (
             getattr(cfg, "INNER_TIER_COUNT", 0) +

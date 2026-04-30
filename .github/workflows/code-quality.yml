@@ -1,16 +1,16 @@
 name: Code Quality
 
-# Runs on every push to master/test and on pull requests targeting them.
-# `master` should be the public default branch. The `test` branch remains
-# covered while older workflow branches are still in use.
+# Runs on every push to main/test and on pull requests targeting them.
+# `main` is the public default branch. The `test` branch remains covered
+# while older workflow branches are still in use.
 permissions:
   contents: read
 
 on:
   push:
-    branches: [test, master]
+    branches: [main, test]
   pull_request:
-    branches: [test, master]
+    branches: [main, test]
 
 jobs:
   lint-and-syntax:
@@ -129,6 +129,9 @@ jobs:
 
       - name: Bandit static security scan
         run: python -m bandit -r src --ini .bandit -ll
+
+      - name: Python dependency vulnerability audit
+        run: python -m pip_audit -r requirements.txt -r requirements-dev.txt
 
       - name: Check .gitignore covers sensitive files
         run: |

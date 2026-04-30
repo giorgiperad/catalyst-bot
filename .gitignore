@@ -131,6 +131,9 @@ trigger_coin_prep.py
 wait_for_bot.py
 /null
 version_info.txt
+.playwright-cli/
+outputs/
+capture_screenshots.py
 
 # --- Claude Code agent scratch ---
 .claude/

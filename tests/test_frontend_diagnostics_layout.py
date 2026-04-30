@@ -59,3 +59,13 @@ def test_min_spread_clamp_copy_is_diagnostic_not_directive():
     assert "configured minimum clamp" in text
     assert "normalizeMarketConditionText" in html
     assert "raise MIN_SPREAD_BPS" not in html
+
+
+def test_running_settings_restart_warning_is_setup_only():
+    html = GUI.read_text(encoding="utf-8", errors="replace")
+
+    assert "function updateSettingsRestartBannerVisibility()" in html
+    assert "const setupActive = !!(setupView && setupView.classList.contains('is-active'));" in html
+    assert "isRunning && setupActive" in html
+    assert "try { updateSettingsRestartBannerVisibility(); } catch (_) {}" in html
+    assert "banner.classList.toggle('is-visible', isRunning);" not in html

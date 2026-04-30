@@ -94,35 +94,51 @@ jobs:
       - name: Package (Windows zip)
         if: matrix.os == 'windows-latest'
         shell: pwsh
+        env:
+          ARTIFACT_NAME: ${{ matrix.artifact }}
+          RELEASE_REF: ${{ github.ref_name }}
+          PACKAGE_EXT: ${{ matrix.ext }}
         run: |
-          Compress-Archive -Path dist/Catalyst/* -DestinationPath "${{ matrix.artifact }}-${{ github.ref_name }}${{ matrix.ext }}"
+          $package = "${env:ARTIFACT_NAME}-${env:RELEASE_REF}${env:PACKAGE_EXT}"
+          Compress-Archive -Path dist/Catalyst/* -DestinationPath $package
 
       - name: Build Windows Installer
         if: matrix.os == 'windows-latest'
+        env:
+          RELEASE_REF: ${{ github.ref_name }}
         run: |
           # Install Inno Setup
           choco install innosetup --yes --no-progress
           # Update version in installer script to match tag
-          $version = "${{ github.ref_name }}".TrimStart("v")
+          $version = $env:RELEASE_REF.TrimStart("v")
           (Get-Content installer.iss) -replace 'MyAppVersion     ".*"', "MyAppVersion     `"$version`"" | Set-Content installer.iss
           # Build installer
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
           # Rename output to match release naming
-          Move-Item "Output\Catalyst-Setup-$version.exe" "Catalyst-Setup-${{ github.ref_name }}.exe"
+          Move-Item "Output\Catalyst-Setup-$version.exe" "Catalyst-Setup-$($env:RELEASE_REF).exe"
         shell: pwsh
 
       - name: Package (macOS)
         if: matrix.os == 'macos-latest'
+        env:
+          ARTIFACT_NAME: ${{ matrix.artifact }}
+          RELEASE_REF: ${{ github.ref_name }}
+          PACKAGE_EXT: ${{ matrix.ext }}
         run: |
+          package="../${ARTIFACT_NAME}-${RELEASE_REF}${PACKAGE_EXT}"
           # If PyInstaller produced a .app bundle, package it; otherwise fall back to folder
           if [ -d "dist/CATalyst.app" ]; then
-            cd dist && zip -r "../${{ matrix.artifact }}-${{ github.ref_name }}${{ matrix.ext }}" CATalyst.app/
+            cd dist && zip -r "$package" CATalyst.app/
           else
-            cd dist && zip -r "../${{ matrix.artifact }}-${{ github.ref_name }}${{ matrix.ext }}" Catalyst/
+            cd dist && zip -r "$package" Catalyst/
           fi
 
       - name: Package (Linux)
         if: matrix.os == 'ubuntu-latest'
+        env:
+          ARTIFACT_NAME: ${{ matrix.artifact }}
+          RELEASE_REF: ${{ github.ref_name }}
+          PACKAGE_EXT: ${{ matrix.ext }}
         run: |
           # Add .desktop file for Linux desktop integration
           cat > dist/Catalyst/catalyst.desktop << 'DESKTOP'
@@ -135,7 +151,8 @@ jobs:
           Terminal=false
           Categories=Finance;Network;
           DESKTOP
-          cd dist && tar -czf "../${{ matrix.artifact }}-${{ github.ref_name }}${{ matrix.ext }}" Catalyst/
+          package="../${ARTIFACT_NAME}-${RELEASE_REF}${PACKAGE_EXT}"
+          cd dist && tar -czf "$package" Catalyst/
 
       - name: Upload zip/tar to Release
         uses: softprops/action-gh-release@v2

@@ -141,6 +141,31 @@ class TestConfigValidator(unittest.TestCase):
         self.assertTrue(report.is_valid)
         self.assertTrue(any("TIER" in w.key for w in report.warnings))
 
+    def test_tier_mode_ignores_legacy_max_trade_cap_for_ladder_sizes(self):
+        report = validate_config(_make_cfg(
+            TIER_ENABLED=True,
+            INNER_TIER_COUNT=7,
+            MID_TIER_COUNT=7,
+            OUTER_TIER_COUNT=6,
+            EXTREME_TIER_COUNT=4,
+            DEFAULT_TRADE_XCH=Decimal("1.798"),
+            MAX_TRADE_XCH=Decimal("0.2"),
+            INNER_SIZE_XCH=Decimal("4.7615"),
+            MID_SIZE_XCH=Decimal("3.9679"),
+            OUTER_SIZE_XCH=Decimal("2.9759"),
+            EXTREME_SIZE_XCH=Decimal("1.5872"),
+        ))
+
+        self.assertTrue(report.is_valid)
+        noisy_keys = {
+            "DEFAULT_TRADE_XCH",
+            "INNER_SIZE_XCH",
+            "MID_SIZE_XCH",
+            "OUTER_SIZE_XCH",
+            "EXTREME_SIZE_XCH",
+        }
+        self.assertFalse(noisy_keys.intersection({w.key for w in report.warnings}))
+
     def test_tier_with_zero_size_is_error(self):
         report = validate_config(_make_cfg(
             TIER_ENABLED=True,
