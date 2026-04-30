@@ -1,0 +1,21 @@
+flowchart LR
+    BL["Bot Loop"] -->|create / cancel / requote| OM["Offer Manager"]
+    CM["Coin Manager"] -->|tier coins + fee coins| OM
+    RM["Risk Manager"] -->|spread + skew limits| OM
+
+    OM -->|make/cancel offers| W["Sage / Chia wallet RPC"]
+    OM -->|offer rows + locked coins| DB[("SQLite WAL state")]
+    OM -->|offer bech32| DM["Dexie Manager"]
+    OM -->|offer bech32| SM["Splash Manager"]
+
+    DM -->|post offers + Dexie IDs| DX["Dexie"]
+    SM -->|broadcast offers| SP["Splash P2P"]
+    SP -->|incoming peer offers| SR["Splash receive listener"]
+    SR -->|classified inbound offers| DB
+
+    W -->|live/closed offer status| FT["Fill Tracker"]
+    DX -->|offer detail + terminal status| FT
+    SC["Spacescan"] -->|on-chain verification| FT
+    FT -->|verified fills + PnL matches| DB
+    FT -->|fill events| BL
+    DB -->|inventory + fill history| RM

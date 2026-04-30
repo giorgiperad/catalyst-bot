@@ -228,29 +228,40 @@ fields afterwards.
 
 ## How It Works
 
-```mermaid
-flowchart TD
-    PE[Price Engine] -->|reference price| RM[Risk Manager]
-    RM -->|quote targets| OM[Offer Manager]
-    OM -->|offer files| SW[Sage Wallet]
-    OM -->|posts offers| DX[Dexie]
-    SW --> CP[Coin Prep]
-    DX --> FT[Fill Tracker]
-    SW --> FT
-    FT --> OM
-```
+CATalyst runs locally. The UI talks to the local Flask API, the bot loop
+coordinates pricing, risk, offers, coins, and fills, and external services are
+used for wallet RPC, market data, offer posting, and on-chain verification.
 
-The trading loop runs every 45 to 90 seconds:
+### App flow
 
-1. Fetch the latest mid price from TibetSwap and Dexie.
-2. Check each side of the book for new fills and verify them on-chain.
-3. Decide whether the book needs to be requoted because of price drift,
-   inventory skew, or tier exhaustion.
-4. Cancel stale offers, create replacements, and post them to Dexie and Splash.
-5. Top up UTXOs when a tier is running low.
+![CATalyst app flow](docs/diagrams/catalyst-app-flow.svg)
 
-Between cycles, the coin prep subprocess runs asynchronously and the mempool
-watcher polls for TibetSwap swaps that may move the market.
+### Offer and fill flow
+
+![CATalyst offer and fill flow](docs/diagrams/catalyst-offer-fill-flow.svg)
+
+### Coin prep and topup flow
+
+![CATalyst coin prep and topup flow](docs/diagrams/catalyst-coin-prep-topup-flow.svg)
+
+The editable Mermaid source files live in `docs/diagrams/` next to the rendered
+SVG and PNG assets.
+
+The trading loop runs on the configurable `LOOP_SECONDS` cadence, defaulting
+to 90 seconds:
+
+1. Fetch and blend TibetSwap and Dexie pricing, then update market intelligence.
+2. Check risk limits, circuit breakers, inventory skew, and live market depth.
+3. Sync live offers from the wallet and detect fills using wallet, Dexie, and
+   Spacescan evidence.
+4. Cancel, requote, refill, or create offers through Sage/Chia wallet RPC.
+5. Persist offer state locally, then post/broadcast offer bech32 strings through
+   Dexie and Splash.
+6. Reconcile coins, top up tier spares, and run runtime health checks.
+
+Between cycles, coin prep/topup reshapes the wallet coin set, AMM monitoring
+keeps TibetSwap reserves fresh, and the mempool watcher can wake the loop early
+when pending spends suggest a fill or price shock.
 
 ---
 

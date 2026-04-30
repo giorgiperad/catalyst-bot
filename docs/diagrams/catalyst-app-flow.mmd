@@ -1,0 +1,20 @@
+flowchart LR
+    UI["Desktop / browser UI"] -->|REST + bridge calls| API["Flask API + AppBridge"]
+    API -->|settings + commands| CFG["Config + Smart Settings"]
+    CFG --> BL["Bot Loop"]
+    BL <--> DB[("SQLite WAL state")]
+
+    TS["TibetSwap pool data"] --> PE["Price Engine"]
+    DXM["Dexie market data"] --> PE
+    DXM --> MI["Market Intel"]
+    PE -->|mid price + arb gap| BL
+    MI -->|order book + depth| BL
+
+    BL --> RM["Risk Manager"]
+    RM -->|spreads + safety gates| BL
+    BL --> OM["Offer Manager"]
+    BL --> CM["Coin Manager"]
+    BL --> FT["Fill Tracker"]
+
+    DB -->|dashboard state| API
+    API -->|JSON + SSE updates| UI
