@@ -254,7 +254,7 @@ to 90 seconds:
 2. Check risk limits, circuit breakers, inventory skew, and live market depth.
 3. Sync live offers from the wallet and detect fills using wallet, Dexie, and
    Spacescan evidence.
-4. Cancel, requote, refill, or create offers through Sage/Chia wallet RPC.
+4. Cancel, requote, refill, or create offers through Sage wallet RPC.
 5. Persist offer state locally, then post/broadcast offer bech32 strings through
    Dexie and Splash.
 6. Reconcile coins, top up tier spares, and run runtime health checks.

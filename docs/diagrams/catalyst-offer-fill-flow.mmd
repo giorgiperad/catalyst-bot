@@ -1,24 +1,24 @@
 flowchart TB
-    CS["Coinset.org / local full node"] -->|pending spends| MW["Mempool watcher"]
-    MW -->|fill-imminent signal| BL["Bot Loop"]
+    CS["Coinset.org"] -->|pending spends| MW["Mempool watcher"]
+    MW -->|fill signal| BL["Bot Loop"]
 
     BL -->|create / cancel / requote| OM["Offer Manager"]
-    CM["Coin Manager"] -->|tier coins + fee coins| OM
-    RM["Risk Manager"] -->|spread + skew limits| OM
+    CM["Coin Manager"] -->|coins + fees| OM
+    RM["Risk Manager"] -->|spread + skew| OM
 
-    OM -->|make/cancel offers| W["Sage / Chia wallet RPC"]
-    OM -->|offer rows + locked coins| DB[("SQLite WAL state")]
-    OM -->|offer bech32| DM["Dexie Manager"]
-    OM -->|offer bech32| SM["Splash Manager"]
+    OM -->|wallet offers| W["Sage wallet RPC"]
+    OM -->|offer state| DB[("SQLite WAL state")]
+    OM -->|bech32| DM["Dexie Manager"]
+    OM -->|bech32| SM["Splash Manager"]
 
-    DM -->|post offers + Dexie IDs| DX["Dexie"]
+    DM -->|post + IDs| DX["Dexie"]
     SM -->|broadcast offers| SP["Splash P2P"]
-    SP -->|incoming peer offers| SR["Splash receive listener"]
-    SR -->|classified inbound offers| DB
+    SP -->|peer offers| SR["Splash receive listener"]
+    SR -->|inbound offers| DB
 
-    W -->|live/closed offer status| FT["Fill Tracker"]
-    DX -->|offer detail + terminal status| FT
-    SC["Spacescan"] -->|on-chain verification| FT
-    FT -->|verified fills + PnL matches| DB
-    FT -->|fill events| BL
-    DB -->|inventory + fill history| RM
+    W -->|offer status| FT["Fill Tracker"]
+    DX -->|terminal status| FT
+    SC["Spacescan"] -->|on-chain check| FT
+    FT -->|fills + PnL| DB
+    FT -->|fill event| BL
+    DB -->|inventory| RM

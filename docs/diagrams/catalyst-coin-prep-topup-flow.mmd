@@ -1,17 +1,16 @@
 flowchart TB
     BL["Bot Loop"] -->|prep/topup decisions| CM["Coin Manager"]
-    W["Sage / Chia wallet RPC"] -->|balances + spendable / confirmed coins| CM
-    CS["Coinset.org"] -->|optional fast coin lookup| CM
-    DB[("SQLite WAL state")] -->|coin designations + locks| CM
+    W["Sage wallet RPC"] -->|balances + coins| CM
+    CS["Coinset.org"] -->|fast coin lookup| CM
+    CM <-->|coin labels + locks| DB[("SQLite WAL state")]
 
-    CM -->|tier readiness + spare counts| BL
-    CM -->|fee coin pool| OM["Offer Manager"]
-    CM -->|split / consolidate plan| CP["Coin Prep worker"]
+    CM -->|spare counts| BL
+    CM -->|fee coins| OM["Offer Manager"]
+    CM -->|split plan| CP["Coin Prep worker"]
     CS -->|split landed checks| CP
-    CP -->|wallet transactions| W
-    CP -->|progress JSON + log mirror| API["Flask API"]
+    CP -->|wallet txs| W
+    CP -->|progress log| API["Flask API"]
 
-    CM -->|reserve / tier_spare / small / locked| DB
-    API -->|prep progress + coin counts| UI["Dashboard UI"]
+    API -->|prep status| UI["Dashboard UI"]
 
-    CM -->|topup + reconcile RPC calls| W
+    CM -->|topup + reconcile| W

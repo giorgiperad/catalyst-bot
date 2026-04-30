@@ -1,12 +1,12 @@
 flowchart LR
-    UI["Desktop / browser UI"] -->|REST + bridge calls| API["Flask API + AppBridge"]
-    API -->|settings + commands| CFG["Config + Smart Settings"]
+    UI["Desktop / browser UI"] -->|REST / bridge| API["Flask API + AppBridge"]
+    API -->|settings| CFG["Config + Smart Settings"]
     CFG --> BL["Bot Loop"]
 
     subgraph External["External market signals"]
         TS["TibetSwap pool data"]
         DXM["Dexie market data"]
-        CS["Coinset.org / local full node"]
+        CS["Coinset.org"]
     end
 
     subgraph Intelligence["Pricing and risk intelligence"]
@@ -19,23 +19,23 @@ flowchart LR
 
     TS --> PE
     TS --> AMM
-    AMM -->|fresh reserves + drift| PE
+    AMM -->|fresh reserves| PE
     DXM --> PE
     DXM --> MI
     CS --> MW
 
-    PE -->|mid price + arb gap| BL
-    PE -->|price + volatility| RM
-    MI -->|competitor depth| RM
-    BL -->|inventory + cycle state| RM
-    AMM -->|shock / requote signal| BL
-    MW -->|pending spends| BL
-    RM -->|spreads + safety gates| BL
+    PE -->|mid + arb gap| BL
+    PE -->|price risk| RM
+    MI -->|depth| RM
+    BL -->|inventory| RM
+    AMM -->|shock signal| BL
+    MW -->|mempool signal| BL
+    RM -->|spreads + gates| BL
 
     BL <--> DB[("SQLite WAL state")]
     BL --> OM["Offer Manager"]
     BL --> CM["Coin Manager"]
     BL --> FT["Fill Tracker"]
 
-    DB -->|dashboard state| API
-    API -->|JSON + SSE updates| UI
+    DB -->|dashboard| API
+    API -->|JSON + SSE| UI
