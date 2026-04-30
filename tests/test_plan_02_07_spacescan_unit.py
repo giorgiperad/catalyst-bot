@@ -123,7 +123,13 @@ class TestTierHelpers(_SS):
             self.assertNotIn("x-api-key", headers)
 
     def test_should_check_balance_true_on_pro(self):
-        self.assertTrue(should_check_balance())
+        pro_non_sage = SimpleNamespace(**vars(_PRO_CFG))
+        pro_non_sage.WALLET_TYPE = "chia"
+        with patch.object(_ss_mod, "cfg", pro_non_sage):
+            self.assertTrue(should_check_balance())
+
+    def test_should_check_balance_false_on_sage_even_with_pro_key(self):
+        self.assertFalse(should_check_balance())
 
     def test_should_check_balance_false_on_free(self):
         with patch.object(_ss_mod, "cfg", _FREE_CFG):
