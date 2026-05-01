@@ -21,6 +21,9 @@ def test_tibet_price_shift_events_are_visible_in_system_logs():
         "defensive_cancel_start",
         "mempool_defensive_cancel_done",
         "mempool_defensive_cancel_deferred_pending_cancel_settle",
+        "mempool_preconfirm_defensive_cancel_done",
+        "mempool_preconfirm_cancel_below_trigger",
+        "mempool_preconfirm_cancel_deferred_pending_cancel_settle",
         "amm_drift_detected",
         "amm_drift_requote_triggered",
         "tibet_swap_detected",
@@ -41,6 +44,9 @@ def test_tibet_price_shift_events_have_activity_copy():
         "mempool_price_move",
         "mempool_defensive_cancel_done",
         "mempool_defensive_cancel_deferred_pending_cancel_settle",
+        "mempool_preconfirm_defensive_cancel_done",
+        "mempool_preconfirm_cancel_below_trigger",
+        "mempool_preconfirm_cancel_deferred_pending_cancel_settle",
         "amm_drift_requote_triggered",
     ]
 

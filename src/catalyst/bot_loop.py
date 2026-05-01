@@ -4200,6 +4200,149 @@ class BotLoop:
             return fresh_price, refreshed_mid, refreshed_arb
         return price_data, refreshed_mid, refreshed_arb
 
+    def _handle_tibet_shock_defensive_cancel(
+            self,
+            *,
+            pct: float,
+            direction: str,
+            sig: Dict,
+            reason_prefix: str,
+            done_event: str,
+            deferred_event: str,
+            below_event: str,
+            suppressed_event: str,
+            source_label: str,
+    ) -> None:
+        try:
+            _min_edge = float(getattr(cfg, "MIN_EDGE_BPS", 100) or 100)
+        except Exception:
+            _min_edge = 100.0
+
+        action = evaluate_tibet_shock(pct, direction, cfg)
+        trigger_pct = action.trigger_pct
+        if not action.cancel:
+            log_event("info", below_event,
+                      f"{source_label} moved {pct:.3f}% - below defensive-cancel "
+                      f"trigger of {trigger_pct:.2f}% (scales with "
+                      f"MIN_EDGE_BPS={_min_edge:.0f}). Holding offers.")
+            return
+
+        tiers = action.tiers
+        at_risk_sides = action.sides
+        reason = f"{reason_prefix}_{pct:.2f}pct_{direction}"
+        pending_counts = self._pending_cancel_settle_counts()
+        pending_total = sum(pending_counts.values())
+        if pending_total > 0:
+            for _side in at_risk_sides:
+                _side_norm = str(_side or "").strip().lower()
+                if _side_norm in self._force_requote:
+                    self._force_requote[_side_norm] = True
+            log_event(
+                "info",
+                deferred_event,
+                f"Defensive cancel deferred for {'+'.join(at_risk_sides)} - "
+                f"{pending_total} wallet-active pending cancel(s) must "
+                "settle before another shock cancel wave",
+                data={
+                    "direction": str(direction or ""),
+                    "pct": pct,
+                    "tiers": tuple(tiers),
+                    "at_risk_sides": tuple(at_risk_sides),
+                    "pending_cancel_counts": pending_counts,
+                    "pending_cancel_total": pending_total,
+                    "source": source_label,
+                },
+            )
+            self._remember_tibet_shock(
+                direction=direction,
+                pct=pct,
+                sides=at_risk_sides,
+                tiers=tiers,
+                reason=reason,
+            )
+            return
+
+        guarded_sides = []
+        cancel_sides = []
+        for _side in at_risk_sides:
+            _guard = self._recent_shock_requote_guard(
+                _side,
+                direction,
+                sig.get("new_price_xch"),
+            )
+            if _guard:
+                guarded_sides.append((_side, _guard))
+            else:
+                cancel_sides.append(_side)
+        if guarded_sides:
+            try:
+                guarded_details = [
+                    {
+                        "side": _side,
+                        "age_secs": round(float(_guard.get("age_secs") or 0), 1),
+                        "remaining_bps": str(_guard.get("remaining_bps") or "0"),
+                        "allowed_bps": str(_guard.get("allowed_bps") or "0"),
+                        "source": _guard.get("source", ""),
+                    }
+                    for _side, _guard in guarded_sides
+                ]
+            except Exception:
+                guarded_details = []
+            guarded_label = "+".join(_side for _side, _guard in guarded_sides)
+            log_event(
+                "info",
+                suppressed_event,
+                f"Defensive cancel suppressed for {guarded_label}: "
+                "recent shock requote already repriced the at-risk side "
+                "and the residual move is still inside edge",
+                data={
+                    "direction": str(direction or ""),
+                    "pct": pct,
+                    "tiers": tuple(tiers),
+                    "guarded": guarded_details,
+                    "source": source_label,
+                },
+            )
+            self._remember_tibet_shock(
+                direction=direction,
+                pct=pct,
+                sides=at_risk_sides,
+                tiers=tiers,
+                reason=reason,
+            )
+        if not cancel_sides:
+            return
+
+        try:
+            n = self._defensive_cancel_tiers(
+                tiers=tiers,
+                sides=tuple(cancel_sides),
+                reason=reason)
+            log_event("info", done_event,
+                      f"{source_label} {pct:.2f}% {direction} - "
+                      f"cancelled {n} {'+'.join(cancel_sides)} offers "
+                      f"across {'+'.join(tiers)}")
+            try:
+                now_ts = time.time()
+                self._last_defensive_cancel = {
+                    "at": now_ts,
+                    "tiers": {(t, s) for t in tiers for s in cancel_sides},
+                    "reason": reason,
+                }
+                self._remember_tibet_shock(
+                    direction=direction,
+                    pct=pct,
+                    sides=at_risk_sides,
+                    tiers=tiers,
+                    reason=reason,
+                    at=now_ts,
+                )
+            except Exception:
+                pass
+        except Exception as _dc_err:
+            log_event("warning", "mempool_defensive_cancel_failed",
+                      f"{source_label} defensive cancel failed: {_dc_err}")
+
     def _drain_mempool_signals(self, in_cycle: bool = False) -> None:
         """Drain pending mempool watcher signals and act on them.
 
@@ -4219,21 +4362,58 @@ class BotLoop:
             for sig in w.get_pending_signals():
                 sig_type = sig.get("type")
                 if sig_type == "imminent_swap":
+                    direction = str(sig.get("direction", "unknown") or "unknown").strip().lower()
+                    pct = abs(float(sig.get("magnitude_pct", 0) or 0))
+                    projected = (
+                        sig.get("source") == "mempool_projected_reserves"
+                        and direction in ("up", "down")
+                        and pct > 0
+                    )
+                    if projected:
+                        self._handle_tibet_shock_defensive_cancel(
+                            pct=pct,
+                            direction=direction,
+                            sig=sig,
+                            reason_prefix="mempool_preconfirm_price_move",
+                            done_event="mempool_preconfirm_defensive_cancel_done",
+                            deferred_event=(
+                                "mempool_preconfirm_cancel_deferred_pending_cancel_settle"
+                            ),
+                            below_event="mempool_preconfirm_cancel_below_trigger",
+                            suppressed_event=(
+                                "mempool_defensive_cancel_suppressed_recent_requote"
+                            ),
+                            source_label="preconfirm_price_move",
+                        )
+                    wake_msg = (
+                        f"Mempool: pending pool-coin spend projected {direction} "
+                        f"{pct:.3f}% - pre-confirm protection evaluated"
+                        if projected else
+                        "Mempool: pending pool-coin spend detected - "
+                        "waking bot; will evaluate magnitude once reserves confirm"
+                    )
                     log_event("info", "mempool_imminent_wake",
-                              "Mempool: pending pool-coin spend detected — "
-                              "waking bot; will evaluate magnitude once reserves confirm",
-                              data={"pool_coin_id": (sig.get("pool_coin_id") or "")[:24]})
-                    # 2026-04-22: no longer cancels pre-confirmation. The
-                    # mempool signal has no magnitude info, so the prior
+                              wake_msg,
+                              data={
+                                  "pool_coin_id": (sig.get("pool_coin_id") or "")[:24],
+                                  "direction": direction,
+                                  "pct": pct,
+                                  "source": sig.get("source", ""),
+                                  "confidence": sig.get("confidence", ""),
+                              })
+                    # 2026-05-01: direction-aware mempool signals can cancel
+                    # the vulnerable side before confirmation. Unknown
+                    # signals stay wake-only because they have no magnitude
+                    # or side direction. The prior
                     # inner-tier blanket cancel fired on every tiny TibetSwap
                     # trade (20 cancels per trigger) even when inner offers
                     # were still well inside the edge. On Chia, cancels cost
                     # real money (one spend + fee coin each, ~19s confirm),
                     # and nothing lands faster than the next block anyway,
                     # so the previous behaviour paid to race a race we can
-                    # never win. The confirmed price_move handler below now
-                    # owns defensive cancels — it has magnitude and uses
-                    # MIN_EDGE_BPS-aware trigger + tier scaling. The wake
+                    # never win. The confirmed price_move handler below still
+                    # backs this up when pre-confirm direction is unavailable,
+                    # using magnitude-aware tier scaling. The wake
                     # below is still useful: it lets fill detection run
                     # immediately if the spend was a taker hitting us.
                     if not in_cycle:

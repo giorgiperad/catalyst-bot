@@ -26,10 +26,13 @@ class TestEventTaxonomy(unittest.TestCase):
         self.assertEqual(categorize_event("no_price"), EventCategory.PRICING)
         self.assertEqual(categorize_event("mempool_price_confirmed"), EventCategory.PRICING)
         self.assertEqual(categorize_event("mempool_swap_detected"), EventCategory.PRICING)
+        self.assertEqual(categorize_event("mempool_preconfirm_cancel_below_trigger"), EventCategory.PRICING)
 
     def test_tibet_protection_offer_events(self):
         self.assertEqual(categorize_event("defensive_cancel_start"), EventCategory.OFFER)
         self.assertEqual(categorize_event("mempool_defensive_cancel_done"), EventCategory.OFFER)
+        self.assertEqual(categorize_event("mempool_preconfirm_defensive_cancel_done"), EventCategory.OFFER)
+        self.assertEqual(categorize_event("mempool_preconfirm_cancel_deferred_pending_cancel_settle"), EventCategory.OFFER)
         self.assertEqual(categorize_event("pending_cancel_settle_retry_queued"), EventCategory.OFFER)
 
     def test_wallet_events(self):

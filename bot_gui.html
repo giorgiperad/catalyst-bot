@@ -24967,6 +24967,9 @@
             mempool_price_move: '📈', defensive_cancel_start: '🛡️',
             mempool_defensive_cancel_done: '🛡️',
             mempool_defensive_cancel_deferred_pending_cancel_settle: '⏳',
+            mempool_preconfirm_defensive_cancel_done: '🛡️',
+            mempool_preconfirm_cancel_below_trigger: '📈',
+            mempool_preconfirm_cancel_deferred_pending_cancel_settle: '⏳',
             amm_drift_detected: '📈', amm_drift_requote_triggered: '🔄',
             splash_node_started: '🌐', splash_node_stopped: '🌐',
             probe_launch_status: '🎯', probe_confirmed_status: '✅',
@@ -25826,6 +25829,21 @@
             }
             if (eventType === 'mempool_defensive_cancel_deferred_pending_cancel_settle') {
                 return { icon: '⏳', msg: 'Tibet move noticed — waiting for current cancels to settle', cls: 'la-info' };
+            }
+            if (eventType === 'mempool_preconfirm_defensive_cancel_done') {
+                const side = (m.match(/cancelled\s+\d+\s+(\w+)/i) || [,''])[1];
+                const count = (m.match(/cancelled\s+(\d+)/i) || [,''])[1];
+                return {
+                    icon: '🛡️',
+                    msg: 'Tibet swap spotted early — protected ' + (side || '') + ' side before confirmation' + (count ? ' (' + count + ' offers)' : ''),
+                    cls: 'la-info'
+                };
+            }
+            if (eventType === 'mempool_preconfirm_cancel_below_trigger') {
+                return { icon: '📈', msg: 'Tibet swap spotted early — move below cancel threshold', cls: 'la-info' };
+            }
+            if (eventType === 'mempool_preconfirm_cancel_deferred_pending_cancel_settle') {
+                return { icon: '⏳', msg: 'Tibet swap spotted early — waiting for current cancels to settle', cls: 'la-info' };
             }
             if (eventType === 'amm_drift_detected') {
                 const drift = (m.match(/drifted\s+([0-9.]+bps)/i) || [,''])[1];

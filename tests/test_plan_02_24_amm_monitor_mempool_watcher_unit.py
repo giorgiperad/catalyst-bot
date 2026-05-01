@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 try:
     from mempool_watcher import _encode_amount, compute_coin_id
+    import mempool_watcher as _mempool_watcher
     _SKIP_MW = None
 except ModuleNotFoundError as exc:
     _SKIP_MW = str(exc)
@@ -114,6 +115,91 @@ class TestComputeCoinId(unittest.TestCase):
         r2 = compute_coin_id("0x" + zero_parent, _PUZZLE, 100)
         self.assertEqual(r1, r2)
         self.assertNotEqual(r1, "")
+
+
+@unittest.skipIf(_SKIP_MW is not None, f"mempool_watcher unavailable: {_SKIP_MW}")
+class TestInferPendingPoolMove(unittest.TestCase):
+    def _coin(self, puzzle_hash, amount):
+        return {
+            "parent_coin_info": "11" * 32,
+            "puzzle_hash": puzzle_hash,
+            "amount": amount,
+        }
+
+    def test_xch_reserve_increase_infers_price_up(self):
+        xch_ph = "aa" * 32
+        tok_ph = "bb" * 32
+        item = {
+            "removals": [
+                self._coin(xch_ph, 126_610_400_180_848),
+                self._coin(tok_ph, 945_042_996),
+                self._coin("cc" * 32, 1),
+            ],
+            "additions": [
+                self._coin(xch_ph, 141_610_400_133_678),
+                self._coin(tok_ph, 845_566_825),
+                self._coin("cc" * 32, 1),
+            ],
+        }
+
+        move = _mempool_watcher.infer_pending_pool_move(
+            item,
+            current_xch_reserve=126_610_400_180_848,
+            current_tok_reserve=945_042_996,
+        )
+
+        self.assertIsNotNone(move)
+        self.assertEqual(move["direction"], "up")
+        self.assertEqual(move["old_xch_reserve"], 126_610_400_180_848)
+        self.assertEqual(move["new_xch_reserve"], 141_610_400_133_678)
+        self.assertGreater(move["delta_xch"], 0)
+        self.assertGreater(move["magnitude_pct"], 20.0)
+        self.assertEqual(move["source"], "mempool_projected_reserves")
+        self.assertEqual(move["confidence"], "xch_and_token_reserves")
+
+    def test_xch_reserve_decrease_infers_price_down(self):
+        xch_ph = "aa" * 32
+        tok_ph = "bb" * 32
+        item = {
+            "removals": [
+                self._coin(xch_ph, 141_610_400_133_678),
+                self._coin(tok_ph, 845_566_825),
+                self._coin("cc" * 32, 1),
+            ],
+            "additions": [
+                self._coin(xch_ph, 135_844_800_284_611),
+                self._coin(tok_ph, 881_707_825),
+                self._coin("cc" * 32, 1),
+            ],
+        }
+
+        move = _mempool_watcher.infer_pending_pool_move(
+            item,
+            current_xch_reserve=141_610_400_133_678,
+            current_tok_reserve=845_566_825,
+        )
+
+        self.assertIsNotNone(move)
+        self.assertEqual(move["direction"], "down")
+        self.assertEqual(move["new_xch_reserve"], 135_844_800_284_611)
+        self.assertLess(move["delta_xch"], 0)
+        self.assertGreater(move["magnitude_pct"], 5.0)
+        self.assertLess(move["magnitude_pct"], 10.0)
+        self.assertEqual(move["confidence"], "xch_and_token_reserves")
+
+    def test_returns_none_when_current_xch_reserve_coin_is_not_spent(self):
+        item = {
+            "removals": [self._coin("aa" * 32, 999)],
+            "additions": [self._coin("aa" * 32, 1000)],
+        }
+
+        move = _mempool_watcher.infer_pending_pool_move(
+            item,
+            current_xch_reserve=126_610_400_180_848,
+            current_tok_reserve=945_042_996,
+        )
+
+        self.assertIsNone(move)
 
 
 # ---------------------------------------------------------------------------

@@ -61,6 +61,143 @@ def compute_coin_id(parent_coin_info: str, puzzle_hash: str, amount: int) -> str
         return ""
 
 
+def _coin_amount(coin: Dict) -> Optional[int]:
+    try:
+        raw = coin.get("amount")
+        if isinstance(raw, str):
+            raw = raw.strip()
+            if raw.lower().startswith("0x"):
+                return int(raw, 16)
+        return int(raw)
+    except Exception:
+        return None
+
+
+def _coin_puzzle_hash(coin: Dict) -> str:
+    try:
+        return str(coin.get("puzzle_hash") or "").removeprefix("0x").lower()
+    except Exception:
+        return ""
+
+
+def _find_same_puzzle_amount_change(
+    removals: List[Dict],
+    additions: List[Dict],
+    current_amount: Optional[int],
+) -> Optional[Dict]:
+    if current_amount is None:
+        return None
+
+    matching_removals = [
+        coin for coin in removals
+        if isinstance(coin, dict) and _coin_amount(coin) == current_amount
+    ]
+    if not matching_removals:
+        return None
+
+    best = None
+    best_delta_abs = -1
+    for removal in matching_removals:
+        puzzle_hash = _coin_puzzle_hash(removal)
+        if not puzzle_hash:
+            continue
+        for addition in additions:
+            if not isinstance(addition, dict):
+                continue
+            if _coin_puzzle_hash(addition) != puzzle_hash:
+                continue
+            new_amount = _coin_amount(addition)
+            if new_amount is None or new_amount == current_amount:
+                continue
+            delta = new_amount - current_amount
+            delta_abs = abs(delta)
+            if delta_abs > best_delta_abs:
+                best_delta_abs = delta_abs
+                best = {
+                    "puzzle_hash": puzzle_hash,
+                    "old_amount": current_amount,
+                    "new_amount": new_amount,
+                    "delta": delta,
+                }
+    return best
+
+
+def infer_pending_pool_move(
+    item: Dict,
+    current_xch_reserve: Optional[int],
+    current_tok_reserve: Optional[int],
+) -> Optional[Dict]:
+    """Infer pending Tibet price direction from reserve coin children.
+
+    Tibet's pool singleton amount is 1 mojo, so the spent pool coin alone
+    only tells us a swap is pending. In the same mempool item, the XCH
+    reserve coin is also spent and recreated under the same puzzle hash with
+    the projected new reserve amount. That delta tells us the side to protect
+    before the block confirms.
+    """
+    if not isinstance(item, dict):
+        return None
+    try:
+        old_xch = int(current_xch_reserve)
+    except Exception:
+        return None
+    try:
+        old_tok = int(current_tok_reserve) if current_tok_reserve is not None else None
+    except Exception:
+        old_tok = None
+
+    removals = item.get("removals") or []
+    additions = item.get("additions") or []
+    if not isinstance(removals, list) or not isinstance(additions, list):
+        return None
+
+    xch_move = _find_same_puzzle_amount_change(removals, additions, old_xch)
+    if not xch_move:
+        return None
+
+    new_xch = int(xch_move["new_amount"])
+    delta_xch = int(xch_move["delta"])
+    if delta_xch == 0:
+        return None
+
+    token_move = _find_same_puzzle_amount_change(removals, additions, old_tok)
+    new_tok = int(token_move["new_amount"]) if token_move else None
+
+    direction = "up" if delta_xch > 0 else "down"
+    confidence = "xch_reserve_only"
+    magnitude_source = "xch_reserve_pct"
+    try:
+        if old_tok and new_tok and old_tok > 0 and new_tok > 0:
+            old_price = Decimal(old_xch) / Decimal(old_tok)
+            new_price = Decimal(new_xch) / Decimal(new_tok)
+            signed_pct = ((new_price - old_price) / old_price) * Decimal("100")
+            confidence = "xch_and_token_reserves"
+            magnitude_source = "projected_price_pct"
+        else:
+            signed_pct = (Decimal(delta_xch) / Decimal(old_xch)) * Decimal("100")
+        magnitude_pct = abs(signed_pct)
+    except Exception:
+        return None
+
+    result = {
+        "direction": direction,
+        "magnitude_pct": round(float(magnitude_pct), 4),
+        "signed_pct": round(float(signed_pct), 4),
+        "source": "mempool_projected_reserves",
+        "confidence": confidence,
+        "magnitude_source": magnitude_source,
+        "old_xch_reserve": old_xch,
+        "new_xch_reserve": new_xch,
+        "delta_xch": delta_xch,
+    }
+    if old_tok is not None:
+        result["old_tok_reserve"] = old_tok
+    if new_tok is not None:
+        result["new_tok_reserve"] = new_tok
+        result["delta_tok"] = new_tok - old_tok
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Main class
 # ---------------------------------------------------------------------------
@@ -482,9 +619,11 @@ class MempoolWatcher:
         # Single-pass scan: compute each removal's coin ID and check against
         # the Tibet pool coin AND the set of watched offer coins.
         pool_found = False
+        pool_item: Optional[Dict] = None
         fill_hits: List[str] = []  # offer coin IDs found in mempool
 
         unwatched_offers = watched_offers - already_warned_fills
+        current_pool_coin_norm = str(current_pool_coin or "").removeprefix("0x").lower()
 
         for item in items:
             if not isinstance(item, dict):
@@ -495,14 +634,15 @@ class MempoolWatcher:
                     continue
                 parent = str(removal.get("parent_coin_info") or "")
                 ph = str(removal.get("puzzle_hash") or "")
-                amount = int(removal.get("amount") or 0)
-                if not parent or not ph:
+                amount = _coin_amount(removal)
+                if not parent or not ph or amount is None:
                     continue
                 computed_id = compute_coin_id(parent, ph, amount)
 
                 if pool_check_needed and not pool_found:
-                    if computed_id == current_pool_coin:
+                    if computed_id == current_pool_coin_norm:
                         pool_found = True
+                        pool_item = item
 
                 if unwatched_offers and computed_id in unwatched_offers:
                     fill_hits.append(computed_id)
@@ -529,13 +669,26 @@ class MempoolWatcher:
                 "current_xch_reserve": xch_res,
                 "current_tok_reserve": tok_res,
             }
+            projected = infer_pending_pool_move(pool_item or {}, xch_res, tok_res)
+            if projected:
+                signal.update(projected)
+                signal["current_xch_reserve"] = xch_res
+                signal["current_tok_reserve"] = tok_res
             with self._lock:
                 self._signals.append(signal)
             self._wake_bot()
 
-            log_event("info", "mempool_swap_detected",
-                      f"PENDING swap detected in mempool for pool coin "
-                      f"{current_pool_coin[:16]}... — pre-emptive sniper window open.")
+            if projected:
+                log_event("info", "mempool_swap_detected",
+                          f"PENDING swap detected in mempool for pool coin "
+                          f"{current_pool_coin[:16]}... - projected "
+                          f"{projected['direction']} {projected['magnitude_pct']:.3f}% "
+                          f"(XCH {xch_res}->{projected['new_xch_reserve']}); "
+                          "pre-confirm protection window open.")
+            else:
+                log_event("info", "mempool_swap_detected",
+                          f"PENDING swap detected in mempool for pool coin "
+                          f"{current_pool_coin[:16]}... — pre-emptive sniper window open.")
 
         # --- Emit fill_imminent signals for our offer coins ---
         if fill_hits:

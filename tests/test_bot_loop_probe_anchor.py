@@ -1249,6 +1249,158 @@ class ProbeAnchorTests(unittest.TestCase):
         self.assertTrue(invalidated)
         self.assertFalse(loop._mempool_price_refresh_needed)
 
+    def test_projected_imminent_swap_xch_inflow_cancels_sell_side(self):
+        loop = bot_loop.BotLoop()
+        loop._running = True
+        cancel_calls = []
+        events = []
+
+        class _Watcher:
+            def get_pending_signals(self):
+                return [{
+                    "type": "imminent_swap",
+                    "direction": "up",
+                    "magnitude_pct": 15.0,
+                    "source": "mempool_projected_reserves",
+                    "timestamp": 123.0,
+                    "pool_coin_id": "pool-1",
+                    "current_xch_reserve": 126_610_400_180_848,
+                    "current_tok_reserve": 945_042_996,
+                    "new_xch_reserve": 141_610_400_133_678,
+                    "new_tok_reserve": 845_566_825,
+                }]
+
+        def _cancel_tiers(*args, **kwargs):
+            cancel_calls.append((args, kwargs))
+            return 20
+
+        def _log_event(severity, event_type, message, data=None):
+            events.append((severity, event_type, message, data or {}))
+
+        fake_mempool = types.SimpleNamespace(_watcher_instance=_Watcher())
+        loop._defensive_cancel_tiers = _cancel_tiers
+
+        with patch.object(bot_loop, "_mempool_watcher_mod", fake_mempool), \
+                patch.object(bot_loop, "log_event", side_effect=_log_event):
+            loop._drain_mempool_signals(in_cycle=False)
+
+        self.assertEqual(len(cancel_calls), 1)
+        self.assertEqual(cancel_calls[0][1]["sides"], ("sell",))
+        self.assertEqual(cancel_calls[0][1]["tiers"], ("inner", "mid", "outer"))
+        self.assertTrue(any(
+            event_type == "mempool_preconfirm_defensive_cancel_done"
+            for _, event_type, _, _ in events
+        ))
+        self.assertEqual(loop._last_tibet_shock["sides"], ("sell",))
+
+    def test_projected_imminent_swap_xch_outflow_cancels_buy_side(self):
+        loop = bot_loop.BotLoop()
+        loop._running = True
+        cancel_calls = []
+
+        class _Watcher:
+            def get_pending_signals(self):
+                return [{
+                    "type": "imminent_swap",
+                    "direction": "down",
+                    "magnitude_pct": 7.0,
+                    "source": "mempool_projected_reserves",
+                    "timestamp": 123.0,
+                    "pool_coin_id": "pool-1",
+                    "current_xch_reserve": 141_610_400_133_678,
+                    "current_tok_reserve": 845_566_825,
+                    "new_xch_reserve": 135_844_800_284_611,
+                    "new_tok_reserve": 881_707_825,
+                }]
+
+        def _cancel_tiers(*args, **kwargs):
+            cancel_calls.append((args, kwargs))
+            return 12
+
+        fake_mempool = types.SimpleNamespace(_watcher_instance=_Watcher())
+        loop._defensive_cancel_tiers = _cancel_tiers
+
+        with patch.object(bot_loop, "_mempool_watcher_mod", fake_mempool):
+            loop._drain_mempool_signals(in_cycle=False)
+
+        self.assertEqual(len(cancel_calls), 1)
+        self.assertEqual(cancel_calls[0][1]["sides"], ("buy",))
+        self.assertEqual(cancel_calls[0][1]["tiers"], ("inner", "mid"))
+
+    def test_unknown_imminent_swap_does_not_cancel_preconfirmation(self):
+        loop = bot_loop.BotLoop()
+        loop._running = True
+        cancel_calls = []
+
+        class _Watcher:
+            def get_pending_signals(self):
+                return [{
+                    "type": "imminent_swap",
+                    "direction": "unknown",
+                    "magnitude_pct": 0.0,
+                    "source": "mempool_detected",
+                    "timestamp": 123.0,
+                    "pool_coin_id": "pool-1",
+                }]
+
+        def _cancel_tiers(*args, **kwargs):
+            cancel_calls.append((args, kwargs))
+            return 1
+
+        fake_mempool = types.SimpleNamespace(_watcher_instance=_Watcher())
+        loop._defensive_cancel_tiers = _cancel_tiers
+
+        with patch.object(bot_loop, "_mempool_watcher_mod", fake_mempool):
+            loop._drain_mempool_signals(in_cycle=False)
+
+        self.assertEqual(cancel_calls, [])
+
+    def test_projected_imminent_swap_defers_while_pending_cancel_settles(self):
+        loop = bot_loop.BotLoop()
+        loop._running = True
+        loop._pending_cancel_wallet_ids_by_side = {
+            "buy": set(),
+            "sell": {"pending-sell"},
+        }
+        cancel_calls = []
+        events = []
+
+        class _Watcher:
+            def get_pending_signals(self):
+                return [{
+                    "type": "imminent_swap",
+                    "direction": "up",
+                    "magnitude_pct": 15.0,
+                    "source": "mempool_projected_reserves",
+                    "timestamp": 123.0,
+                    "pool_coin_id": "pool-1",
+                    "current_xch_reserve": 126_610_400_180_848,
+                    "current_tok_reserve": 945_042_996,
+                    "new_xch_reserve": 141_610_400_133_678,
+                    "new_tok_reserve": 845_566_825,
+                }]
+
+        def _cancel_tiers(*args, **kwargs):
+            cancel_calls.append((args, kwargs))
+            return 20
+
+        def _log_event(severity, event_type, message, data=None):
+            events.append((severity, event_type, message, data or {}))
+
+        fake_mempool = types.SimpleNamespace(_watcher_instance=_Watcher())
+        loop._defensive_cancel_tiers = _cancel_tiers
+
+        with patch.object(bot_loop, "_mempool_watcher_mod", fake_mempool), \
+                patch.object(bot_loop, "log_event", side_effect=_log_event):
+            loop._drain_mempool_signals(in_cycle=False)
+
+        self.assertEqual(cancel_calls, [])
+        self.assertTrue(loop._force_requote["sell"])
+        self.assertTrue(any(
+            event_type == "mempool_preconfirm_cancel_deferred_pending_cancel_settle"
+            for _, event_type, _, _ in events
+        ))
+
     def test_mempool_price_move_respects_configured_shock_trigger(self):
         loop = bot_loop.BotLoop()
         loop._running = True
