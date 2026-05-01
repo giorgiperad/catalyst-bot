@@ -55,3 +55,49 @@ def test_tibet_price_shift_events_have_activity_copy():
 
     assert "Tibet swap spotted early" in activity_translator
     assert "Tibet price shift confirmed" in activity_translator
+
+
+def test_controlled_recovery_activity_events_are_info_not_warning():
+    html = GUI.read_text(encoding="utf-8", errors="replace")
+    activity_translator = _section(html, "function laTranslate(", "function laHandleEvent(")
+
+    assert "eventType === 'recovery_mode_enter'" in activity_translator
+    recovery_section = activity_translator.split(
+        "eventType === 'recovery_mode_enter'", 1
+    )[1].split("eventType === 'recovery_mode_exit'", 1)[0]
+    assert "Recovery mode" in recovery_section
+    assert "cls: 'la-info'" in recovery_section
+
+    assert "eventType === 'pending_cancel_settle_retry_queued'" in activity_translator
+    retry_section = activity_translator.split(
+        "eventType === 'pending_cancel_settle_retry_queued'", 1
+    )[1].split("if (eventType === 'cancel_retries')", 1)[0]
+    assert "Cancel settlement retry queued" in retry_section
+    assert "cls: 'la-info'" in retry_section
+
+
+def test_coin_topup_events_are_visible_in_system_logs():
+    html = GUI.read_text(encoding="utf-8", errors="replace")
+    icon_map = _section(html, "const SYSTEM_LOG_EVENT_ICONS = {", "};")
+    filter_fn = _section(
+        html,
+        "function shouldShowSystemLogEvent(severity, eventType) {",
+        "function formatSystemLogMessage(eventType, message) {",
+    )
+
+    required_events = [
+        "topup_started",
+        "topup_trigger",
+        "topup_tiers_adequate",
+        "topup_inventory",
+        "tier_size_drift",
+        "tier_size_drift_topup_started",
+        "tier_size_drift_topup_deferred",
+    ]
+
+    for event_type in required_events:
+        assert f"{event_type}:" in icon_map
+
+    assert "evt.startsWith('topup_')" in filter_fn
+    assert "evt.startsWith('drip_')" in filter_fn
+    assert "evt.startsWith('tier_size_drift')" in filter_fn

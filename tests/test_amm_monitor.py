@@ -8,7 +8,7 @@ import types
 import threading
 import unittest
 from decimal import Decimal
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 # --------------------------------------------------------------------------
 # Minimal stubs so amm_monitor can be imported without the full app env.
@@ -304,6 +304,63 @@ class TestAMMMonitorBufferGuard(unittest.TestCase):
         with self._patch_cfg(enable_buffer=True, buffer_bps="30"):
             self.assertTrue(m.check_amm_buffer(Decimal("0.001"), "buy"))
             self.assertTrue(m.check_amm_buffer(Decimal("0.001"), "sell"))
+
+
+class TestAMMMonitorUserFacingLogs(unittest.TestCase):
+    def setUp(self):
+        self._prior_config = sys.modules.get("config")
+        sys.modules["config"] = fake_config_mod
+        fake_config_mod.cfg.ENABLE_AMM_BUFFER = True
+        fake_config_mod.cfg.AMM_BUFFER_BPS = Decimal("30")
+        fake_config_mod.cfg.AMM_DRIFT_REQUOTE_BPS = Decimal("40")
+
+    def tearDown(self):
+        if self._prior_config is None:
+            sys.modules.pop("config", None)
+        else:
+            sys.modules["config"] = self._prior_config
+
+    def test_buffer_guard_log_formats_percent_for_users(self):
+        m = AMMMonitor()
+        with m._lock:
+            m._state = {
+                "available": True,
+                "amm_price": Decimal("0.001"),
+                "xch_reserve": Decimal("10"),
+                "token_reserve": Decimal("10000"),
+                "fetched_at": time.time(),
+            }
+
+        with patch("amm_monitor.log_event") as log_event:
+            self.assertFalse(m.check_amm_buffer(Decimal("0.001"), "buy"))
+
+        message = log_event.call_args.args[2]
+        self.assertIn("0.00%", message)
+        self.assertIn("buffer=0.30%", message)
+        self.assertNotIn("bps", message.lower())
+
+    def test_drift_detected_log_formats_percent_for_users(self):
+        m = AMMMonitor()
+        m.notify_quoted_price(Decimal("1.00"), Decimal("1.00"))
+        m._fetch_pair = MagicMock(return_value={
+            "available": True,
+            "amm_price": Decimal("1.02"),
+            "xch_reserve": Decimal("10"),
+            "token_reserve": Decimal("9.803921"),
+            "fetched_at": time.time(),
+        })
+
+        with patch("amm_monitor.log_event") as log_event:
+            m._do_poll()
+
+        drift_calls = [
+            call for call in log_event.call_args_list
+            if len(call.args) >= 3 and call.args[1] == "amm_drift_detected"
+        ]
+        self.assertEqual(len(drift_calls), 1)
+        message = drift_calls[0].args[2]
+        self.assertIn("2.0%", message)
+        self.assertNotIn("bps", message.lower())
 
 
 class TestAMMMonitorGetStats(unittest.TestCase):

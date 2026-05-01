@@ -231,7 +231,7 @@ class FillTracker:
 
             if self._mass_disappearance_count >= 3:
                 # 3 strikes — accept as genuine, reset counter
-                log_event("warning", "mass_disappearance_accepted",
+                log_event("info", "mass_disappearance_accepted",
                           f"Mass disappearance confirmed after 3 checks: "
                           f"{disappeared}/{previous} offers gone")
                 self._mass_disappearance_count = 0
@@ -239,7 +239,7 @@ class FillTracker:
                 return True
             elif guard_age_secs > guard_timeout_secs:
                 # Timeout — accept despite not reaching 3 consecutive strikes
-                log_event("warning", "mass_disappearance_accepted",
+                log_event("info", "mass_disappearance_accepted",
                           f"Mass disappearance accepted after {guard_age_secs:.0f}s timeout: "
                           f"{disappeared}/{previous} offers gone "
                           f"(guard count was {self._mass_disappearance_count}/3)")
@@ -248,7 +248,7 @@ class FillTracker:
                 return True
             else:
                 # Guard triggered — skip this loop, DON'T update baseline
-                log_event("warning", "mass_disappearance_guard",
+                log_event("info", "mass_disappearance_guard",
                           f"Guard triggered ({self._mass_disappearance_count}/3, "
                           f"age {guard_age_secs:.0f}s): "
                           f"{disappeared}/{previous} offers disappeared")
@@ -621,7 +621,7 @@ class FillTracker:
                 except Exception:
                     pass
                 if was_cancelled:
-                    log_event("warning", "fill_beat_cancel_dexie",
+                    log_event("info", "fill_beat_cancel_dexie",
                               f"{side.upper()} offer {trade_id[:16]}... was marked "
                               f"bot-cancelled but Dexie reports COMPLETED — "
                               f"recording fill before Spacescan.",

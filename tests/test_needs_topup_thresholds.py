@@ -237,6 +237,22 @@ class NeedsTopupThresholdTests(unittest.TestCase):
             "drip readiness should not bypass the emergency topup cooldown",
         )
 
+    def test_drip_fires_when_spare_buffer_is_below_full_target(self):
+        """SPARE_BUFFER_LOW should lead to proactive refill work.
+
+        The hard emergency threshold for inner is 4/10, but the readiness
+        report marks the buffer LOW as soon as it drops below the full spare
+        target. The drip path should therefore fire at 9/10 rather than wait
+        until the buffer is much thinner.
+        """
+        busy_coin_tier = "extreme" if self.REVERSED else "inner"
+        mgr = self._manager(xch_overrides={busy_coin_tier: 9})
+        mgr._last_topup_time = time.time()  # emergency is on cooldown
+        mgr._last_drip_time = 0             # proactive refill is allowed
+
+        self.assertTrue(mgr.needs_topup())
+        self.assertTrue(mgr._topup_is_drip)
+
 
 # ────────────────────────────────────────────────────────────────────────────
 # Non-reversed ladder (BUY_LADDER_REVERSED=False)
@@ -418,6 +434,66 @@ class TestReversed(NeedsTopupThresholdTests):
                  "mid": Decimal("1.75"),
                  "outer": Decimal("0.875"),
                  "extreme": Decimal("0.35"),
+             }), \
+             patch.object(mgr, "get_trading_pace", return_value="normal"), \
+             patch.object(mgr, "_smart_topup_wallet", side_effect=fake_smart_topup), \
+             patch.object(mgr, "update_coin_counts"), \
+             patch.object(mgr, "log_inventory"), \
+             patch.object(self.cm, "_get_free_coins_rpc", return_value={
+                 "confirmed_records": [{"coin": {"amount": 1, "name": "dummy"}}]
+             }), \
+             patch.object(self.cm, "get_tier_distribution", return_value=active_counts), \
+             patch.object(self.cm, "get_weighted_tier_prep_counts", return_value=prepared_counts):
+            mgr._topup_worker(active_buy=12, active_sell=12)
+
+        self.assertEqual(calls[:1], ["XCH-extreme"])
+
+    def test_drip_worker_refills_partial_spare_buffer_gap(self):
+        """A drip topup should split even when only one spare is missing."""
+        mgr = self._manager()
+        mgr._topup_is_drip = True
+
+        xch_inv = {
+            "reserve": [{"coin": {"amount": 100_000_000_000_000, "name": "reserve"}}],
+            "inner": [{}] * 100,
+            "mid": [{}] * 100,
+            "outer": [{}] * 100,
+            "extreme": [{}] * 9,
+            "small": [],
+        }
+        cat_inv = {
+            "reserve": [],
+            "inner": [{}] * 100,
+            "mid": [{}] * 100,
+            "outer": [{}] * 100,
+            "extreme": [{}] * 100,
+            "small": [],
+        }
+        active_counts = {"inner": 2, "mid": 3, "outer": 5, "extreme": 10}
+        prepared_counts = {"inner": 4, "mid": 6, "outer": 10, "extreme": 20}
+        calls = []
+
+        def fake_smart_topup(name, *_args, **_kwargs):
+            calls.append(name)
+            return True
+
+        with patch.object(mgr, "_absorb_misfits_to_reserve", return_value=False), \
+             patch.object(mgr, "_classify_coins_by_designation", side_effect=[xch_inv, cat_inv]), \
+             patch.object(mgr, "_get_tier_sizes_mojos", return_value={
+                 "inner": 3_500_000_000_000,
+                 "mid": 1_750_000_000_000,
+                 "outer": 875_000_000_000,
+                 "extreme": 350_000_000_000,
+             }), \
+             patch.object(mgr, "_configured_tier_sizes_xch", return_value={
+                 "inner": Decimal("3.5"),
+                 "mid": Decimal("1.75"),
+                 "outer": Decimal("0.875"),
+                 "extreme": Decimal("0.35"),
+             }), \
+             patch.object(mgr, "_topup_offer_deficits_by_tier", return_value={
+                 "xch": {"inner": 0, "mid": 0, "outer": 0, "extreme": 0},
+                 "cat": {"inner": 0, "mid": 0, "outer": 0, "extreme": 0},
              }), \
              patch.object(mgr, "get_trading_pace", return_value="normal"), \
              patch.object(mgr, "_smart_topup_wallet", side_effect=fake_smart_topup), \

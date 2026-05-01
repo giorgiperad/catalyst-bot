@@ -308,6 +308,8 @@ class FillTrackerVerificationTests(unittest.TestCase):
         self.assertEqual(spacescan_calls, [])
         self.assertTrue(any(evt == "fill_beat_cancel_dexie"
                             for _, evt, _, _ in self.logged))
+        self.assertTrue(any(level == "info" and evt == "fill_beat_cancel_dexie"
+                            for level, evt, _, _ in self.logged))
 
 
 if __name__ == "__main__":

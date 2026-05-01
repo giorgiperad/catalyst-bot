@@ -383,8 +383,13 @@ class Sniper:
             strict_preferred_tier=True,
         )
         if not res or not res.get("success"):
-            log_event("warning", "sniper_failed",
-                      f"⚡ Sniper {side} creation failed: {res}")
+            err = (res or {}).get("error") if isinstance(res, dict) else ""
+            if err == "no_preferred_tier_coin":
+                log_event("info", "sniper_failed",
+                          f"⚡ Sniper {side} skipped: no sniper coin available yet")
+            else:
+                log_event("warning", "sniper_failed",
+                          f"⚡ Sniper {side} creation failed: {res}")
             return None
 
         trade_record = res.get("trade_record") or {}

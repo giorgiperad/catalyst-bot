@@ -251,9 +251,9 @@ class OfferManager:
             _last_warn = self._slot_warned_at.get(key, 0.0)
             if (_now - _last_warn) >= self._slot_warn_cooldown:
                 self._slot_warned_at[key] = _now
-                log_event("warning", "slot_suspended",
-                          f"Slot {side} #{slot} suspended after {count} consecutive "
-                          f"coin failures — will retry when coins are available")
+                log_event("info", "slot_suspended",
+                          f"Slot {side} #{slot} is waiting for a matching tier coin "
+                          f"after {count} selection misses — will retry when coins are available")
         # F63: auto-clear after 20 cycles (~10 minutes at typical loop speed).
         # This prevents permanent ladder degradation if unsuspend_slots
         # never fires or coins are replenished via topup without triggering
@@ -1245,7 +1245,7 @@ class OfferManager:
                               f"Using coin_ids mode: {selected_coin_id[:16]}... "
                               f"for {spend_amount} mojos")
                 elif strict_preferred_tier and preferred_tier:
-                    log_event("warning", "coin_ids_no_preferred_tier",
+                    log_event("info", "coin_ids_no_preferred_tier",
                               f"No {preferred_tier} coin available for {spend_amount} mojos")
                     return {
                         "success": False,

@@ -9,15 +9,13 @@ _get_live_local_offer_edges, _get_spacescan_market_context, etc.).
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
 from decimal import Decimal
 from urllib.parse import quote
 
 from flask import Blueprint, jsonify, request
 
 import api_server
-from config import cfg
-from database import log_event, get_stats
+from database import get_stats
 
 
 bp = Blueprint("dashboard", __name__)
@@ -109,6 +107,10 @@ def api_dashboard():
             except Exception:
                 pass
 
+        active_asset_id = api_server._active_cat.get("asset_id") or getattr(cfg, "CAT_ASSET_ID", "")
+        active_ticker_id = api_server._active_cat.get("ticker_id") or getattr(cfg, "CAT_TICKER_ID", "")
+        active_decimals = int(api_server._active_cat.get("decimals") or getattr(cfg, "CAT_DECIMALS", 3) or 3)
+
         # --- Market Health ---
         market_health = {"status": "green", "message": "Waiting for first cycle", "conditions": [], "metrics": {}}
         if bot and bot.risk_manager:
@@ -151,10 +153,52 @@ def api_dashboard():
                         metrics["overall_spread_bps"] = str(summary.get("overall_spread_bps", "0"))
             except Exception:
                 pass
+            try:
+                live_edges = {}
+                cached_edges = getattr(bot, "_last_live_offer_edges", {}) or {}
+                if cached_edges:
+                    live_edges.update(cached_edges)
 
-        active_asset_id = api_server._active_cat.get("asset_id") or getattr(cfg, "CAT_ASSET_ID", "")
-        active_ticker_id = api_server._active_cat.get("ticker_id") or getattr(cfg, "CAT_TICKER_ID", "")
-        active_decimals = int(api_server._active_cat.get("decimals") or getattr(cfg, "CAT_DECIMALS", 3) or 3)
+                def _edge_decimal(source: dict, key: str) -> Decimal:
+                    try:
+                        return Decimal(str(source.get(key, 0) or 0))
+                    except Exception:
+                        return Decimal("0")
+
+                best_bid = _edge_decimal(live_edges, "our_best_bid")
+                best_ask = _edge_decimal(live_edges, "our_best_ask")
+                if active_asset_id and (best_bid <= 0 or best_ask <= 0):
+                    local_edges = api_server._get_live_local_offer_edges(active_asset_id) or {}
+                    live_edges.update(local_edges)
+                    best_bid = _edge_decimal(live_edges, "our_best_bid")
+                    best_ask = _edge_decimal(live_edges, "our_best_ask")
+
+                if best_bid > 0:
+                    metrics["our_best_bid"] = str(best_bid)
+                if best_ask > 0:
+                    metrics["our_best_ask"] = str(best_ask)
+                if live_edges.get("our_open_buys") is not None:
+                    metrics["our_open_buys"] = int(live_edges.get("our_open_buys") or 0)
+                if live_edges.get("our_open_sells") is not None:
+                    metrics["our_open_sells"] = int(live_edges.get("our_open_sells") or 0)
+
+                live_state = getattr(bot, "_bot_state", {}) or {}
+                try:
+                    mid = Decimal(str(
+                        live_state.get("mid_price")
+                        or getattr(bot, "_current_mid_price", None)
+                        or api_server._get_live_mid_price_str()
+                        or 0
+                    ))
+                except Exception:
+                    mid = Decimal("0")
+                if mid <= 0 and best_bid > 0 and best_ask > best_bid:
+                    mid = (best_bid + best_ask) / Decimal("2")
+                if best_bid > 0 and best_ask > best_bid and mid > 0:
+                    metrics["your_spread_bps"] = str((best_ask - best_bid) / mid * Decimal("10000"))
+            except Exception:
+                pass
+
         executable_mid = Decimal("0")
         try:
             if bot and getattr(bot, "price_engine", None):
@@ -384,7 +428,6 @@ def api_dashboard():
 @bp.route("/api/stats")
 def api_stats():
     """Get trading statistics."""
-    bot = api_server.bot
     cfg = api_server.cfg
     try:
         stats = get_stats(cfg.CAT_ASSET_ID, since=api_server._get_run_history_cutoff())

@@ -4443,7 +4443,7 @@ class CoinManager:
             # Uses its own _TOPUP_DRIP_INTERVAL cooldown (90s) independent of
             # the emergency gate. Only runs if emergency check found nothing.
             if _drip_ready:
-                drip_pct = max(0.05, min(0.95, getattr(cfg, "TIER_DRIP_PCT", 75) / 100.0))
+                drip_pct = max(0.05, min(1.0, getattr(cfg, "TIER_DRIP_PCT", 100) / 100.0))
                 for tier_name in ("inner", "mid", "outer", "extreme"):
                     _xch_slots = int(xch_dist.get(tier_name, 0) or 0)
                     _cat_slots = int(cat_dist.get(tier_name, 0) or 0)
@@ -4648,8 +4648,8 @@ class CoinManager:
             # else: preserve the value set by needs_topup() (or by a prior
             # explicit caller). Reset-to-False here would silently downgrade
             # drip invocations to emergency-threshold behaviour, defeating
-            # the proactive buffer (drip predicate fires at 75% but the
-            # emergency action threshold is 15-40%, so the worker no-ops).
+            # the proactive buffer (drip predicate targets the visible spare
+            # buffer while emergency thresholds are lower), so the worker no-ops.
         # Emergency runs stamp _last_topup_time to enforce the full cooldown.
         # Drip runs already stamped _last_drip_time in needs_topup() — leave
         # _last_topup_time unchanged so the emergency gate is unaffected.
@@ -4967,7 +4967,7 @@ class CoinManager:
                     pace_scale_for_priority = 1.0
                 drip_pct_for_priority = max(
                     0.05,
-                    min(0.95, float(getattr(cfg, "TIER_DRIP_PCT", 75)) / 100.0),
+                    min(1.0, float(getattr(cfg, "TIER_DRIP_PCT", 100)) / 100.0),
                 )
 
                 def _priority_tier_pct(tier_name: str, wallet_side: str) -> float:
@@ -5126,13 +5126,13 @@ class CoinManager:
                     _topup_pace_scale = 1.0
 
                 # Drip invocations want the worker to act at the drip predicate
-                # threshold (TIER_DRIP_PCT, default 75%) so the proactive buffer
+                # threshold (TIER_DRIP_PCT, default 100%) so the proactive buffer
                 # is actually maintained. Without this, the drip trigger fires
                 # every cycle but the worker no-ops because TIER_TRIGGER_PCT_*
                 # is much lower (e.g. sniper trigger=75%, worker=40% → buffer
                 # never restored until the harder reactive threshold is hit).
                 _is_drip_invocation = bool(getattr(self, "_topup_is_drip", False))
-                _drip_pct_norm = max(0.05, min(0.95, float(getattr(cfg, "TIER_DRIP_PCT", 75)) / 100.0))
+                _drip_pct_norm = max(0.05, min(1.0, float(getattr(cfg, "TIER_DRIP_PCT", 100)) / 100.0))
 
                 def _topup_tier_pct(tier_name: str, wallet_side: str) -> float:
                     """Return the action-threshold pct for this tier/side. For
@@ -5505,16 +5505,16 @@ class CoinManager:
                               f"this cycle ({xch_total:.4f} XCH in wallet) — will re-evaluate next cycle")
                     return
                 elif xch_total > cfg.XCH_RESERVE + Decimal("1"):
-                    # All tiers above action threshold — normal steady-state
+                    # All tiers above the current invocation threshold.
                     if _is_drip:
                         self._last_drip_time = time.time()
                         log_event("info", "drip_adequate",
-                                  f"Drip: all tiers above action threshold ({xch_total:.4f} XCH) "
+                                  f"Drip: all tiers at or above refill threshold ({xch_total:.4f} XCH) "
                                   f"— next drip in {_TOPUP_DRIP_INTERVAL}s")
                     else:
                         self._last_topup_time = time.time()
                         log_event("info", "topup_tiers_adequate",
-                                  f"All tiers above action threshold ({xch_total:.4f} XCH in wallet) "
+                                  f"All tiers above emergency threshold ({xch_total:.4f} XCH in wallet) "
                                   f"— coins deployed in active offers (normal state)")
                     return
                 else:
@@ -7042,16 +7042,29 @@ class CoinManager:
         # this drift against actual reserve size on each runtime-check
         # pass, so the damage is bounded. We log a warning so an operator
         # staring at the bot during a flake can spot the situation.
+        outputs_owned = owned_count >= num_to_create and num_to_create > 0
+        if outputs_owned:
+            message = (
+                f"One-step split outputs are owned but not selectable after {wait_max}s "
+                f"(tx={'confirmed' if tx_state['confirmed'] else 'pending'}, "
+                f"{owned_count}/{num_to_create} owned, "
+                f"{sel_count}/{num_to_create} selectable). Runtime health will "
+                "reconcile the top-up budget if the wallet settles later."
+            )
+        else:
+            message = (
+                f"One-step split not confirmed after {wait_max}s "
+                f"(tx={'confirmed' if tx_state['confirmed'] else 'pending'}, "
+                f"{owned_count}/{num_to_create} owned, "
+                f"{sel_count}/{num_to_create} selectable). If the TX "
+                f"eventually lands the topup-budget counter may drift; "
+                f"bot_health.check_topup_budget_drift will reconcile on the "
+                f"next runtime-check pass."
+            )
         log_event(
-            "warning",
+            "info" if outputs_owned else "warning",
             f"{tag}_osstep_timeout",
-            f"One-step split not confirmed after {wait_max}s "
-            f"(tx={'confirmed' if tx_state['confirmed'] else 'pending'}, "
-            f"{owned_count}/{num_to_create} owned, "
-            f"{sel_count}/{num_to_create} selectable). If the TX "
-            f"eventually lands the topup-budget counter may drift; "
-            f"bot_health.check_topup_budget_drift will reconcile on the "
-            f"next runtime-check pass.",
+            message,
             data={"tag": tag, "wait_max": wait_max,
                   "tx_confirmed": tx_state["confirmed"],
                   "owned": owned_count, "needed": num_to_create,

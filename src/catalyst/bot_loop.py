@@ -223,6 +223,7 @@ class BotLoop:
         # volatility calculation can use real Dexie v3 historical_trades
         # instead of relying solely on price_engine snapshots.
         self.risk_manager._dexie_manager = self.dexie_manager
+        self.risk_manager._bot_ref = self
         self.sniper = Sniper(
             offer_manager=self.offer_manager,
             risk_manager=self.risk_manager,
@@ -1014,15 +1015,13 @@ class BotLoop:
             "sell_deficit": int(sell_deficit),
         })
         self._set_state(status="recovering")
-        # Demote to INFO if the book has never been at target this session —
-        # this is the initial throttled deploy, not a real recovery scenario.
-        # The user knows the bot is building; warning here is just noise that
-        # clears within ~1 cycle as soon as the ladder fills.
+        # Recovery mode is a controlled rebuild state. The alert still makes
+        # the state visible; the log line should read as progress, not failure.
         _is_initial_deploy = not bool(state.get("book_ever_at_target"))
         log_event(
-            "info" if _is_initial_deploy else "warning",
+            "info",
             "recovery_mode_enter",
-            f"{'Initial deploy in progress' if _is_initial_deploy else 'Entering recovery mode'} — "
+            f"{'Initial deploy in progress' if _is_initial_deploy else 'Recovery mode active'} - "
             f"{reason}. Current deficit: {buy_deficit} buy, {sell_deficit} sell.",
         )
         self._emit_alert(
@@ -1419,8 +1418,9 @@ class BotLoop:
                 next_buffer = current_buffer - step
                 if next_buffer >= min_buffer:
                     return (
-                        f"floor_tighten ({current_buffer}bps → {next_buffer}bps; "
-                        f"target ≥ {min_buffer}bps from Tibet)"
+                        f"floor_tighten ({_bps_to_pct(current_buffer)} → "
+                        f"{_bps_to_pct(next_buffer)}; target ≥ "
+                        f"{_bps_to_pct(min_buffer)} from Tibet)"
                     )
                 # Within safety margin of the AMM-arb floor — stop tightening
                 # so we don't keep re-evaluating every cycle.
@@ -1607,6 +1607,17 @@ class BotLoop:
             "our_best_bid": str(best_bid),
             "our_best_ask": str(best_ask),
         }
+
+    def _record_live_offer_edges(self, offer_edges: Dict[str, str]) -> None:
+        """Cache live bid/ask edges for dashboard market-health calculations."""
+        edges = dict(offer_edges or {})
+        edges.setdefault("our_best_bid", "0")
+        edges.setdefault("our_best_ask", "0")
+        self._last_live_offer_edges = edges
+        self._set_state(
+            our_best_bid=edges.get("our_best_bid", "0"),
+            our_best_ask=edges.get("our_best_ask", "0"),
+        )
 
     def _apply_immediate_sweep_protection(self, buy_fills, sell_fills):
         """Pause same-side creation immediately when one cycle sees a fill burst."""
@@ -2121,8 +2132,8 @@ class BotLoop:
 
                     log_event("info", "probe_retry",
                               f"Probe attempt {attempt}: {'+'.join(taken_sides) or 'none visible'} "
-                              f"taken (arb gap {arb_gap_bps_float:.0f} BPS) — safe edge "
-                              f"not found, widening buffer to {adjusted_buffer} BPS")
+                              f"taken (arb gap {_bps_to_pct(arb_gap_bps_float)}) — safe edge "
+                              f"not found, widening buffer to {_bps_to_pct(adjusted_buffer)}")
                     log_event("info", "probe_retry_status",
                               f"Probe retry {attempt} - widening spread to find safe edge")
                     self._clear_alert("probe_status")
@@ -2717,7 +2728,7 @@ class BotLoop:
                 _active_buy = sum(1 for o in _open if o.get("side") == "buy")
                 _active_sell = sum(1 for o in _open if o.get("side") == "sell")
                 if self.coin_manager.start_topup(
-                    _active_buy, _active_sell, is_drip=False
+                    _active_buy, _active_sell, is_drip=True
                 ):
                     self._last_tier_drift_topup_time = _now
                     topup_note = "Live topup has started to reshape the coin pools."
@@ -3796,7 +3807,7 @@ class BotLoop:
             max_age = max(ages) if ages else 0
             age_phrase = f"{min_age}s" if min_age == max_age else f"{min_age}-{max_age}s"
             log_event(
-                "warning",
+                "info",
                 "pending_cancel_settle_retry_queued",
                 f"{len(entries)} {side} cancel(s) stayed wallet-active for "
                 f"{age_phrase} after DB cancel; queued cancel retries and "
@@ -4081,12 +4092,32 @@ class BotLoop:
                       f"Defensive cancel: firing on {len(tids)} {tier_label} {side_label} offers "
                       f"({len(buys)} buy + {len(sells)} sell, reason={reason})")
             try:
-                self.offer_manager.cancel_offers(
-                    tids, reason=reason, skip_confirmation=True)
+                results = self.offer_manager.cancel_offers(
+                    tids,
+                    reason=reason,
+                    force_storm=True,
+                    skip_confirmation=True,
+                )
             except Exception as e:
                 log_event("warning", "defensive_cancel_call_failed",
                           f"cancel_offers raised: {e}")
                 return 0
+            if isinstance(results, dict):
+                successes = sum(
+                    1
+                    for result in results.values()
+                    if isinstance(result, dict) and result.get("success")
+                )
+                failures = len(results) - successes
+                if failures > 0:
+                    log_event(
+                        "warning",
+                        "defensive_cancel_failed",
+                        f"Defensive cancel submitted {successes}/{len(tids)} "
+                        f"{tier_label} {side_label} offers (reason={reason}); "
+                        f"{failures} failed or remain queued for retry.",
+                    )
+                return successes
             return len(tids)
         except Exception as e:
             log_event("warning", "defensive_cancel_failed",
@@ -5022,10 +5053,11 @@ class BotLoop:
                               f"Startup orderbook refresh failed (non-critical): {e}")
 
                 try:
+                    offer_edges = self._get_live_offer_edges(open_buys, open_sells)
+                    self._record_live_offer_edges(offer_edges)
                     health_data = self._augment_health_with_spacescan(
                         self.risk_manager.get_market_health(loop_count=self._loop_count)
                     )
-                    offer_edges = self._get_live_offer_edges(open_buys, open_sells)
                     cached_intel = {}
                     try:
                         cached_intel = self.market_intel.get_cached_data() if self.market_intel else {}
@@ -6346,7 +6378,7 @@ class BotLoop:
                             if not self._force_requote.get(_target_side):
                                 log_event(
                                     "info", "amm_drift_requote_triggered",
-                                    f"AMM drift {amm_drift_bps:.1f}bps "
+                                    f"AMM drift {_bps_to_pct(amm_drift_bps)} "
                                     f"({_direction_note}) — forcing "
                                     f"{_target_side} requote",
                                     data={"drift_bps": str(
@@ -6677,7 +6709,7 @@ class BotLoop:
                     linger_secs = int(getattr(cfg, "SNIPER_LINGER_SECS", 600) or 0)
                     log_event("info", "probe_confirmed",
                               f"Both probes survived — price confirmed at Tibet "
-                              f"{probe['tibet_price']:.8f} (buffer {confirmed_buffer}bps). "
+                              f"{probe['tibet_price']:.8f} (buffer {_bps_to_pct(confirmed_buffer)}). "
                               f"Keeping probes live for {linger_secs}s while building "
                               f"main offers behind them.")
                     log_event("info", "probe_confirmed_status",
@@ -6719,9 +6751,10 @@ class BotLoop:
                         log_event(
                             "info",
                             "probe_floor_found",
-                            f"Empirical floor located: probe at {taken_buffer}bps "
-                            f"got taken; last safe buffer was {safe_buffer}bps. "
-                            f"Floor sits between {taken_buffer} and {safe_buffer} bps "
+                            f"Empirical floor located: probe at {_bps_to_pct(taken_buffer)} "
+                            f"got taken; last safe buffer was {_bps_to_pct(safe_buffer)}. "
+                            f"Floor sits between {_bps_to_pct(taken_buffer)} and "
+                            f"{_bps_to_pct(safe_buffer)} "
                             f"from Tibet — tightening stopped.",
                         )
                 if probe["attempt"] >= probe["max_attempts"]:
@@ -6761,7 +6794,7 @@ class BotLoop:
 
                 log_event("info", "probe_retry",
                           f"Probe attempt {attempt}: {'+'.join(taken_sides)} taken, "
-                          f"widening buffer to {adjusted_buffer} BPS")
+                          f"widening buffer to {_bps_to_pct(adjusted_buffer)}")
                 log_event("info", "probe_retry_status",
                           f"Probe retry {attempt} — widening spread")
                 self._clear_alert("probe_status")
@@ -7782,10 +7815,11 @@ class BotLoop:
 
         # Push dashboard command centre update (market health + performance)
         try:
+            offer_edges = self._get_live_offer_edges(open_buys, open_sells)
+            self._record_live_offer_edges(offer_edges)
             health_data = self._augment_health_with_spacescan(
                 self.risk_manager.get_market_health(loop_count=self._loop_count)
             )
-            offer_edges = self._get_live_offer_edges(open_buys, open_sells)
             # Include competitor spread + fill rate for Smart Advisor
             _competitor_bps = 0
             _fills_hr = 0

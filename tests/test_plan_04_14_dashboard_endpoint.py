@@ -116,6 +116,69 @@ class TestDashboard(_FlaskBase):
         body = resp.get_json()
         self.assertIsInstance(body["current_cat"], dict)
 
+    def test_market_health_uses_live_offer_edges_for_inner_spread(self):
+        risk_manager = MagicMock()
+        risk_manager.get_inventory_state.return_value = {}
+        risk_manager.get_circuit_breaker_blocked_side.return_value = ""
+        risk_manager.get_market_health.return_value = {
+            "status": "green",
+            "message": "ok",
+            "conditions": [],
+            "metrics": {
+                "your_spread_bps": "1770.5",
+                "buy_spread_bps": "798.4",
+                "sell_spread_bps": "972.1",
+            },
+        }
+        bot = MagicMock()
+        bot.risk_manager = risk_manager
+        bot._loop_count = 5
+        bot._start_time = 0
+        bot._bot_state = {"mid_price": "0.0001318526026886049206032406980"}
+        bot._probe_state = {}
+        bot.market_intel = None
+        bot.coin_manager = None
+        bot.sniper = None
+        bot.boost_manager = None
+        bot.price_engine.get_last_price.return_value = "0.0001318526026886049206032406980"
+
+        fake_stats = {
+            "realised_pnl_xch": "0", "total_fills": 0, "buy_fills": 0,
+            "sell_fills": 0, "round_trips": 0, "win_rate": 0,
+            "fill_rate_per_hour": 0, "avg_spread_capture": "0",
+            "pending_verification_count": 0, "volume_xch": "0",
+        }
+        fake_summary = {"xch_free_count": 0, "cat_free_count": 0, "xch_total": 0, "cat_total": 0}
+        live_edges = {
+            "our_best_bid": api_server.Decimal("0.0001297758078408030669426051158"),
+            "our_best_ask": api_server.Decimal("0.0001349368190860945260879005506"),
+            "our_open_buys": 23,
+            "our_open_sells": 23,
+            "source": "wallet_sync",
+        }
+
+        with patch("database.get_stats", return_value=fake_stats), \
+             patch("database.get_coin_summary", return_value=fake_summary), \
+             patch("database.get_open_offers", return_value=[]), \
+             patch("database.get_connection", return_value=_make_mock_db_conn()), \
+             patch.object(api_server, "_get_spacescan_market_context",
+                          return_value=_empty_spacescan()), \
+             patch.object(api_server, "_get_live_local_offer_edges", return_value=live_edges), \
+             patch.object(api_server, "_active_cat", {"asset_id": "aa" * 32, "wallet_id": 2, "decimals": 3}), \
+             patch.object(api_server, "bot", bot):
+            resp = self.client.get("/api/dashboard", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.status_code, 200)
+        metrics = resp.get_json()["market_health"]["metrics"]
+        self.assertEqual(metrics["our_best_bid"], str(live_edges["our_best_bid"]))
+        self.assertEqual(metrics["our_best_ask"], str(live_edges["our_best_ask"]))
+        expected_bps = (
+            (live_edges["our_best_ask"] - live_edges["our_best_bid"])
+            / api_server.Decimal(bot._bot_state["mid_price"])
+            * api_server.Decimal("10000")
+        )
+        self.assertAlmostEqual(float(metrics["your_spread_bps"]), float(expected_bps), places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

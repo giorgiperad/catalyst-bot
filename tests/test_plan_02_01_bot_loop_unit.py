@@ -247,6 +247,61 @@ class TestBpsToPct(_PatchedCfg):
         self.assertIsInstance(result, str)
 
 
+class TestBotLoopWiring(_PatchedCfg):
+    """BotLoop wiring used by dashboard market health."""
+
+    def test_risk_manager_gets_live_bot_reference(self):
+        loop = _make_loop()
+
+        self.assertIs(loop.risk_manager._bot_ref, loop)
+
+    def test_record_live_offer_edges_updates_cache_and_gui_state(self):
+        loop = _make_loop()
+        edges = {"our_best_bid": "1.00", "our_best_ask": "1.05"}
+
+        loop._record_live_offer_edges(edges)
+
+        self.assertEqual(loop._last_live_offer_edges, edges)
+        self.assertEqual(loop._bot_state["our_best_bid"], "1.00")
+        self.assertEqual(loop._bot_state["our_best_ask"], "1.05")
+
+
+class TestTierSizeDriftTopup(_PatchedCfg):
+    def test_tier_size_drift_uses_proactive_topup_threshold(self):
+        loop = _make_loop()
+        calls = []
+
+        class DriftCoinManager:
+            def check_tier_size_drift(self):
+                return [{"side": "cat", "tier": "inner", "ratio": 0.98, "coin_count": 2}]
+
+            def start_topup(self, active_buy, active_sell, is_drip=None):
+                calls.append((active_buy, active_sell, is_drip))
+                return True
+
+        fake_coin_manager = types.ModuleType("coin_manager")
+        fake_coin_manager.reclassify_tier_spare_coins = lambda: None
+        fake_database = types.ModuleType("database")
+        fake_database.get_open_offers = lambda cat_asset_id=None: [
+            {"side": "buy"},
+            {"side": "sell"},
+            {"side": "sell"},
+        ]
+
+        loop.coin_manager = DriftCoinManager()
+        loop._last_tier_drift_topup_time = 0
+        loop._emit_alert = lambda *a, **kw: None
+        loop._clear_alert = lambda *a, **kw: None
+
+        with patch.dict(sys.modules, {
+            "coin_manager": fake_coin_manager,
+            "database": fake_database,
+        }), patch.object(bot_loop, "log_event"):
+            loop._check_tier_size_drift()
+
+        self.assertEqual(calls, [(1, 2, True)])
+
+
 class TestGetLiveOfferEdges(_PatchedCfg):
     """BotLoop._get_live_offer_edges — static method, extracts best bid/ask."""
 

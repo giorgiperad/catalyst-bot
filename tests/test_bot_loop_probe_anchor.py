@@ -1565,6 +1565,53 @@ class ProbeAnchorTests(unittest.TestCase):
         ))
         self.assertEqual(loop._last_tibet_shock["sides"], ("sell",))
 
+    def test_defensive_cancel_tiers_bypasses_storm_guard_and_counts_successes(self):
+        loop = bot_loop.BotLoop()
+        cancel_calls = []
+        open_sells = [
+            {"trade_id": f"sell-{idx}", "tier": "inner"}
+            for idx in range(21)
+        ]
+
+        class _Canceller:
+            def cancel_offers(self, trade_ids, reason="manual",
+                              force_storm=False, skip_confirmation=False):
+                cancel_calls.append({
+                    "trade_ids": list(trade_ids),
+                    "reason": reason,
+                    "force_storm": force_storm,
+                    "skip_confirmation": skip_confirmation,
+                })
+                return {
+                    trade_id: {
+                        "success": trade_id != "sell-20",
+                        "error": "wallet_busy" if trade_id == "sell-20" else "",
+                    }
+                    for trade_id in trade_ids
+                }
+
+        def _get_open_offers(side=None, cat_asset_id=None):
+            del cat_asset_id
+            return open_sells if side == "sell" else []
+
+        loop.offer_manager = _Canceller()
+
+        with patch("database.get_open_offers", side_effect=_get_open_offers), \
+                patch("config.cfg", fake_config.cfg):
+            cancelled = loop._defensive_cancel_tiers(
+                tiers=("inner", "mid", "outer"),
+                sides=("sell",),
+                reason="mempool_price_move_11.01pct_up",
+            )
+
+        self.assertEqual(cancelled, 20)
+        self.assertEqual(len(cancel_calls), 1)
+        self.assertTrue(cancel_calls[0]["force_storm"])
+        self.assertTrue(cancel_calls[0]["skip_confirmation"])
+        self.assertEqual(cancel_calls[0]["trade_ids"], [
+            f"sell-{idx}" for idx in range(21)
+        ])
+
     def test_probe_rearm_defers_while_pending_cancel_settles(self):
         loop = bot_loop.BotLoop()
         loop._pending_cancel_wallet_ids_by_side = {

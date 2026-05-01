@@ -9768,7 +9768,7 @@
                                     <div id="boostTotalArbs" style="font-size: var(--text-base); font-weight: 700; font-family: var(--font-mono); color: var(--text-primary);">0</div>
                                 </div>
                                 <div>
-                                    <div style="color: var(--text-tertiary); font-size: var(--text-xs); margin-bottom: 2px;">Cost <span class="cc-help">?<span class="cc-tooltip">Total estimated cost of probes this session (each arbed probe loses approximately offset_bps × probe_size).</span></span></div>
+                                    <div style="color: var(--text-tertiary); font-size: var(--text-xs); margin-bottom: 2px;">Cost <span class="cc-help">?<span class="cc-tooltip">Total estimated cost of probes this session (each arbed probe loses approximately probe offset percentage times probe size).</span></span></div>
                                     <div id="boostTotalCost" style="font-size: var(--text-base); font-weight: 700; font-family: var(--font-mono); color: var(--text-secondary);">0 XCH</div>
                                 </div>
                             </div>
@@ -10480,9 +10480,9 @@
                                 <div class="v4-settings-hint">0 = auto from inner edge; positive value = explicit TibetSwap move trigger</div>
                             </div>
                             <div class="form-group" style="margin-bottom: 0;">
-                                <label style="font-size: 0.85em;">Arb Alert Threshold (bps) <span class="cc-help">?<span class="cc-tooltip">Dexie/Tibet gap, in basis points, that marks an arbitrage alert. Smart Settings calibrates this from liquidity, volatility, and the live venue gap.</span></span></label>
-                                <input type="number" id="configArbThreshold" value="200" min="1" max="5000" step="1">
-                                <div class="v4-settings-hint">100 bps = 1%; used by alerting and sniper re-arm calibration</div>
+                                <label style="font-size: 0.85em;">Arb Alert Threshold (%) <span class="cc-help">?<span class="cc-tooltip">Dexie/Tibet gap, as a percentage, that marks an arbitrage alert. Smart Settings calibrates this from liquidity, volatility, and the live venue gap.</span></span></label>
+                                <input type="number" id="configArbThreshold" value="2.0" min="0.01" max="50" step="0.1">
+                                <div class="v4-settings-hint">Used by alerting and sniper re-arm calibration</div>
                             </div>
                         </div>
                         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
@@ -12917,7 +12917,7 @@
                             const dlp = parseFloat(g('DYNAMIC_LIMIT_PCT') || 0); document.getElementById('configDynamicLimitPct').value = dlp > 0 ? dlp : 50;
                             const msc = parseFloat(g('MAX_STEP_CHANGE_FRACTION') || 0); document.getElementById('configMaxStepChange').value = msc > 0 ? (msc * 100).toFixed(0) : 0;
                             const tsp = parseFloat(g('TIBET_SHOCK_CANCEL_TRIGGER_PCT') || 0); document.getElementById('configTibetShockCancelPct').value = tsp > 0 ? tsp.toFixed(2) : 0;
-                            const arb = parseInt(g('ARB_ALERT_THRESHOLD_BPS') || 0); document.getElementById('configArbThreshold').value = arb > 0 ? arb : 200;
+                            const arb = parseInt(g('ARB_ALERT_THRESHOLD_BPS') || 0); document.getElementById('configArbThreshold').value = arb > 0 ? _bps2pct(arb) : '2.0';
 
                             const de = g('DYNAMIC_SPREAD_ENABLED'); if (de !== null) document.getElementById('configDynamicSpreadEnabled').checked = de === true || de === 'true' || de === '1' || de === 'True';
                             const bs = parseFloat(g('BASE_SPREAD_BPS') || 0); if (bs > 0) document.getElementById('configBaseSpreadBps').value = (bs / 100).toFixed(1);
@@ -14129,8 +14129,8 @@
         }
         function _fmtDiagBps(raw) {
             const n = Number(raw || 0);
-            if (!Number.isFinite(n)) return '0.0 bps';
-            return n.toFixed(1) + ' bps';
+            if (!Number.isFinite(n)) return '0.00%';
+            return bps2pct(n);
         }
         function updateOfferDiagnostics(data = {}) {
             const rq = data.requote_diagnostics || {};
@@ -14748,6 +14748,8 @@
             if (decimals === undefined) decimals = n < 1 ? 2 : 1;
             return n.toFixed(decimals) + '%';
         }
+        const _bps2pct = v => (Number(v) / 100).toFixed(1);
+        const _pct2bps = v => Math.round((parseFloat(v) || 0) * 100);
 
         // =================================================================
         // LIVE CONTROLS — Toggles, Sliders, Debounce, Apply
@@ -18474,7 +18476,7 @@
                 if (data.dynamic_limit_pct > 0) document.getElementById('configDynamicLimitPct').value = data.dynamic_limit_pct;
                 if (data.max_step_change_pct >= 0) document.getElementById('configMaxStepChange').value = data.max_step_change_pct;
                 if (data.tibet_shock_cancel_trigger_pct !== undefined) document.getElementById('configTibetShockCancelPct').value = Number(data.tibet_shock_cancel_trigger_pct || 0).toFixed(2);
-                const _arbEl = document.getElementById('configArbThreshold'); if (_arbEl && data.arb_alert_threshold_bps != null) _arbEl.value = data.arb_alert_threshold_bps;
+                const _arbEl = document.getElementById('configArbThreshold'); if (_arbEl && data.arb_alert_threshold_bps != null) _arbEl.value = _bps2pct(data.arb_alert_threshold_bps);
 
                 // Safety & Limits — Price Rails
                 if (data.min_mid > 0 && data.max_mid > 0) {
@@ -18493,7 +18495,7 @@
                 if (data.pair_incentivized === true) {
                     // Pair qualifies — show field with correct value
                     if (dbxRow) dbxRow.style.display = '';
-                    document.getElementById('configDbxMaxSpreadBps').value = data.dbx_max_spread_bps;
+                    document.getElementById('configDbxMaxSpreadBps').value = _bps2pct(data.dbx_max_spread_bps);
                 } else if (data.pair_incentivized === false) {
                     // Pair definitely not incentivized — hide and blank the field
                     if (dbxRow) dbxRow.style.display = 'none';
@@ -18501,7 +18503,7 @@
                 } else {
                     // Unknown — show with default so user can set it manually if needed
                     if (dbxRow) dbxRow.style.display = '';
-                    document.getElementById('configDbxMaxSpreadBps').value = data.dbx_max_spread_bps;
+                    document.getElementById('configDbxMaxSpreadBps').value = _bps2pct(data.dbx_max_spread_bps);
                 }
 
                 // Bot Operations
@@ -18879,9 +18881,11 @@
                     // Spread row
                     const spreadBps = data.base_spread_bps || 0;
                     const requoteBps = data.requote_bps || 0;
+                    const spreadPct = bps2pct(data.base_spread_bps || 0);
+                    const requotePct = bps2pct(data.requote_bps || 0);
                     const spreadRow = spreadBps > 0 ? `<div>
                         <span style="color:var(--slate-400);font-size:0.8em;text-transform:uppercase;letter-spacing:0.05em;">Spread</span>
-                        <div style="margin-top:3px;">Base <strong>${spreadBps.toFixed(1)}%</strong> · Requote at <strong>${requoteBps.toFixed(1)}%</strong> · Auto-requote ${data.auto_requote ? '<span style="color:var(--success-200);">on</span>' : '<span style="color:var(--sell-color);">off</span>'}${data.dynamic_spread_enabled ? ' · Dynamic spreads <span style="color:var(--success-200);">on</span>' : ''}</div>
+                        <div style="margin-top:3px;">Base <strong>${spreadPct}</strong> · Requote at <strong>${requotePct}</strong> · Auto-requote ${data.auto_requote ? '<span style="color:var(--success-200);">on</span>' : '<span style="color:var(--sell-color);">off</span>'}${data.dynamic_spread_enabled ? ' · Dynamic spreads <span style="color:var(--success-200);">on</span>' : ''}</div>
                     </div>` : '';
 
                     // A3: build "What changed" diff row
@@ -24515,6 +24519,12 @@
                     metrics[key] = extra[key];
                 }
             });
+            const liveBid = parseFloat(metrics.our_best_bid || 0);
+            const liveAsk = parseFloat(metrics.our_best_ask || 0);
+            const liveMid = parseFloat(extra.mid_price || metrics.mid_price || (bot_state && bot_state.mid_price) || 0);
+            if (liveBid > 0 && liveAsk > liveBid && liveMid > 0) {
+                metrics.your_spread_bps = ((liveAsk - liveBid) / liveMid) * 10000;
+            }
             if (extra.competitor_spread_bps !== undefined && extra.competitor_spread_bps !== null && extra.competitor_spread_bps !== '') {
                 metrics.market_spread_bps = extra.competitor_spread_bps;
             }
@@ -24951,6 +24961,16 @@
             splash_flush_result: '📡', splash_repost_done: '🌐',
             circuit_breaker: '🛑', position_limit: '🛑',
             coin_split_manual: '🪙', coin_topup: '🪙',
+            topup_trigger: '\u{1FA99}', topup_started: '\u{1FA99}',
+            topup_inventory: '\u{1FA99}', topup_tiers_adequate: '✅',
+            topup_single_action_done: '✅', topup_split_blocked: '⚠️',
+            topup_missing_offers_prioritized: '\u{1FA99}',
+            topup_floor_spares_prioritized: '\u{1FA99}',
+            drip_trigger: '\u{1FA99}', drip_adequate: '✅',
+            drip_no_coins: '⏳',
+            tier_size_drift: '\u{1FA99}',
+            tier_size_drift_topup_started: '\u{1FA99}',
+            tier_size_drift_topup_deferred: '⏳',
             coin_prep_done: '🪙', startup_coin_recheck: '🪙',
             wallet_unhealthy: '⚠️', wallet_recovery: '💚',
             connectivity_recovery: '💚', startup_wallet_sync: '🔗',
@@ -24983,12 +25003,20 @@
             const sev = String(severity || 'info');
             const evt = String(eventType || '');
             if (sev === 'debug') return false;
-            if (sev === 'info' && !SYSTEM_LOG_EVENT_ICONS[evt]) return false;
+            if (sev === 'info'
+                && !SYSTEM_LOG_EVENT_ICONS[evt]
+                && !evt.startsWith('topup_')
+                && !evt.startsWith('drip_')
+                && !evt.startsWith('tier_size_drift')) return false;
             return true;
         }
 
         function formatSystemLogMessage(eventType, message) {
-            const icon = SYSTEM_LOG_EVENT_ICONS[String(eventType || '')] || '';
+            const evt = String(eventType || '');
+            const icon = SYSTEM_LOG_EVENT_ICONS[evt]
+                || (evt.startsWith('topup_') ? '\u{1FA99}' : '')
+                || (evt.startsWith('drip_') ? '\u{1FA99}' : '')
+                || (evt.startsWith('tier_size_drift') ? '\u{1FA99}' : '');
             return (icon ? icon + ' ' : '') + String(message || '');
         }
 
@@ -25275,6 +25303,7 @@
                         our_best_ask: data.our_best_ask,
                         best_bid: data.best_bid,
                         best_ask: data.best_ask,
+                        mid_price: data.mid_price,
                     });
                     updateMarketHealth(mergedMarketHealth);
                     mergeLiveMarketHealthMetrics((mergedMarketHealth && mergedMarketHealth.metrics) || {}, { render: false });
@@ -25680,8 +25709,6 @@
                 return { icon: '\u{1FA99}', msg: 'Coin top-up started', cls: 'la-info' };
             if (eventType === 'coin_topup')
                 return { icon: '🪙', msg: 'Topping up coins...', cls: 'la-info' };
-            if (eventType === 'topup_trigger' || eventType === 'topup_started')
-                return { icon: '🪙', msg: 'Coin top-up started', cls: 'la-info' };
             if (eventType === 'topup_wait_sync')
                 return { icon: '⏳', msg: 'Coin top-up waiting for wallet sync', cls: 'la-warning' };
             if (eventType === 'topup_wallet_unsynced')
@@ -25770,7 +25797,7 @@
 
             // Recovery mode: user-visible state change — ladder rebuild in progress.
             if (eventType === 'recovery_mode_enter')
-                return { icon: '🛠️', msg: 'Recovery mode — rebuilding ladder', cls: 'la-warning' };
+                return { icon: '🛠️', msg: 'Recovery mode — rebuilding ladder', cls: 'la-info' };
             if (eventType === 'recovery_mode_exit')
                 return { icon: '💚', msg: 'Recovery complete — back to normal', cls: 'la-success' };
 
@@ -25846,7 +25873,7 @@
                 return { icon: '⏳', msg: 'Tibet swap spotted early — waiting for current cancels to settle', cls: 'la-info' };
             }
             if (eventType === 'amm_drift_detected') {
-                const drift = (m.match(/drifted\s+([0-9.]+bps)/i) || [,''])[1];
+                const drift = (m.match(/drifted\s+([0-9.]+%)/i) || m.match(/drifted\s+([0-9.]+bps)/i) || [,''])[1];
                 return { icon: '📈', msg: 'AMM drift detected' + (drift ? ': ' + drift : ''), cls: 'la-info' };
             }
             if (eventType === 'amm_drift_requote_triggered') {
@@ -25861,7 +25888,7 @@
                 };
             }
             if (eventType === 'pending_cancel_settle_retry_queued') {
-                return { icon: '🔁', msg: 'Cancel settlement retry queued', cls: 'la-warning' };
+                return { icon: '🔁', msg: 'Cancel settlement retry queued', cls: 'la-info' };
             }
             if (eventType === 'cancel_retries') {
                 return { icon: '✅', msg: m || 'Cancel retry pass completed', cls: 'la-info' };
@@ -30976,7 +31003,7 @@
                 // TibetSwap (with null checks)
                 // enable_tibetswap: REMOVED - TibetSwap always enabled
                 // price_strategy: NOT sent from GUI — managed via .env only to prevent accidental overwrite
-                arb_threshold_bps: parseInt(document.getElementById('configArbThreshold')?.value || '200'),
+                arb_threshold_bps: _pct2bps(document.getElementById('configArbThreshold')?.value || '2.0'),
 
                 // V2: Dynamic Spreads
                 dynamic_spread_enabled: document.getElementById('configDynamicSpreadEnabled').checked,

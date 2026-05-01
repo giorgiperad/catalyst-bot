@@ -26,6 +26,17 @@ from typing import Optional, Dict
 from database import log_event
 
 
+def _bps_to_pct(val) -> str:
+    """Convert basis-point values to friendly percentages for user logs."""
+    try:
+        pct = Decimal(str(val)) / Decimal("100")
+        if abs(pct) < Decimal("1"):
+            return f"{pct:.2f}%"
+        return f"{pct:.1f}%"
+    except Exception:
+        return str(val)
+
+
 class AMMMonitor:
     """Background AMM reserve monitor with drift detection and cache invalidation.
 
@@ -251,8 +262,8 @@ class AMMMonitor:
             if within_buffer:
                 distance_bps = abs(offer_price - amm_price) / amm_price * Decimal("10000")
                 log_event("debug", "amm_buffer_guard",
-                          f"AMM buffer: {side} offer {offer_price:.8f} is {distance_bps:.1f}bps "
-                          f"from AMM {amm_price:.8f} (buffer={buffer_bps}bps) — SKIPPED",
+                          f"AMM buffer: {side} offer {offer_price:.8f} is {_bps_to_pct(distance_bps)} "
+                          f"from AMM {amm_price:.8f} (buffer={_bps_to_pct(buffer_bps)}) — SKIPPED",
                           data={"side": side, "offer_price": str(offer_price),
                                 "amm_price": str(amm_price),
                                 "distance_bps": str(distance_bps.quantize(Decimal("0.1")))})
@@ -361,7 +372,7 @@ class AMMMonitor:
             self._last_drift_bucket = current_bucket
             if should_log:
                 log_event("info", "amm_drift_detected",
-                          f"AMM price drifted {drift_bps:.1f}bps from last quoted mid "
+                          f"AMM price drifted {_bps_to_pct(drift_bps)} from last quoted mid "
                           f"— invalidating Tibet cache for fresh requote",
                           data={"drift_bps": str(drift_bps.quantize(Decimal("0.1"))),
                                 "threshold_bps": str(drift_threshold),

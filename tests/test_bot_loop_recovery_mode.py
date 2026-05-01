@@ -340,6 +340,18 @@ class RecoveryModeTests(unittest.TestCase):
         self.assertEqual(loop._bot_state["status"], "recovering")
         self.assertTrue(any(evt == "recovery_mode_enter" for _, evt, _, _ in self.logged))
 
+    def test_recovery_mode_enter_is_info_after_book_was_live(self):
+        loop = bot_loop.BotLoop()
+        loop._running = True
+        loop._recovery_state["book_ever_at_target"] = True
+
+        loop._enter_recovery_mode("book drift", 2, 3)
+
+        self.assertTrue(
+            any(severity == "info" and evt == "recovery_mode_enter"
+                for severity, evt, _, _ in self.logged)
+        )
+
     def test_recovery_mode_does_not_enter_on_stale_sync_without_deficit(self):
         loop = bot_loop.BotLoop()
         loop._running = True

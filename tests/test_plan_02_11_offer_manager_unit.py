@@ -54,7 +54,7 @@ class _OM(unittest.TestCase):
         self._cfg_patcher = patch.object(_om_mod, "cfg", _FAKE_CFG)
         self._cfg_patcher.start()
         self._log_patcher = patch.object(_om_mod, "log_event")
-        self._log_patcher.start()
+        self.log_event = self._log_patcher.start()
         self._manager = OfferManager()
 
     def tearDown(self):
@@ -214,6 +214,10 @@ class TestSlotSuspension(_OM):
         for _ in range(threshold):
             self._manager.record_slot_coin_failure("buy", 0)
         self.assertTrue(self._manager.is_slot_suspended("buy", 0))
+        self.assertTrue(any(
+            call.args[0] == "info" and call.args[1] == "slot_suspended"
+            for call in self.log_event.call_args_list
+        ))
 
     def test_below_threshold_not_suspended(self):
         threshold = self._manager._slot_suspend_threshold

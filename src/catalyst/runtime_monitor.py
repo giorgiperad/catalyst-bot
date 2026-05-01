@@ -815,6 +815,28 @@ class RuntimeMonitor:
                 or under_target_total >= 3
             )
         )
+        if under_target_total <= 0:
+            book_under_target_close_message = "Live book counts are back on target"
+        elif coin_recovery_active:
+            book_under_target_close_message = (
+                "Book shortfall moved into controlled recovery: "
+                f"buy {buy_visible}/{buy_target}, sell {sell_visible}/{sell_target}"
+            )
+        elif offer_churn_active:
+            book_under_target_close_message = (
+                "Book shortfall is still settling after offer churn: "
+                f"buy {buy_visible}/{buy_target}, sell {sell_visible}/{sell_target}"
+            )
+        elif gap_closer_active:
+            book_under_target_close_message = (
+                "Book shortfall is controlled by gap closer activity: "
+                f"buy {buy_visible}/{buy_target}, sell {sell_visible}/{sell_target}"
+            )
+        else:
+            book_under_target_close_message = (
+                "Book under-target alert cleared: "
+                f"buy {buy_visible}/{buy_target}, sell {sell_visible}/{sell_target}"
+            )
         self._update_streak("book_under_target", book_under_target)
         if self._apply_condition(
             "book_under_target",
@@ -826,7 +848,7 @@ class RuntimeMonitor:
                 f"buy {buy_visible}/{buy_target}, sell {sell_visible}/{sell_target}"
             ),
             close_event="bot_health_book_under_target_ok",
-            close_message="Live book counts are back on target",
+            close_message=book_under_target_close_message,
         ):
             active_conditions.append(self._condition_entry(
                 "book_under_target",

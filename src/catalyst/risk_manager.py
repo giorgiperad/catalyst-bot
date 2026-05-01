@@ -56,6 +56,7 @@ class RiskManager:
     def __init__(self, price_engine=None, market_intel=None):
         self._price_engine = price_engine
         self._market_intel = market_intel
+        self._bot_ref = None
         self._boost_manager = None  # Set after construction for convergence
 
         # Current net CAT position (from database)
@@ -1040,10 +1041,29 @@ class RiskManager:
                 import bot_loop as _bl
                 _bot = getattr(_bl, "bot", None)
             if _bot:
-                _best_bid = Decimal(str(_bot._bot_state.get("our_best_bid", "0") or "0"))
-                _best_ask = Decimal(str(_bot._bot_state.get("our_best_ask", "0") or "0"))
-                _mid = Decimal(str(_bot._bot_state.get("mid_price", "0") or "0"))
-                if _best_bid > 0 and _best_ask > 0 and _mid > 0:
+                def _edge_decimal(source, key):
+                    try:
+                        return Decimal(str((source or {}).get(key, "0") or "0"))
+                    except Exception:
+                        return Decimal("0")
+
+                _edges = getattr(_bot, "_last_live_offer_edges", {}) or {}
+                _state = getattr(_bot, "_bot_state", {}) or {}
+                _best_bid = _edge_decimal(_edges, "our_best_bid")
+                _best_ask = _edge_decimal(_edges, "our_best_ask")
+                if _best_bid <= 0:
+                    _best_bid = _edge_decimal(_state, "our_best_bid")
+                if _best_ask <= 0:
+                    _best_ask = _edge_decimal(_state, "our_best_ask")
+                try:
+                    _mid = Decimal(str(
+                        _state.get("mid_price", None)
+                        or getattr(_bot, "_current_mid_price", None)
+                        or "0"
+                    ))
+                except Exception:
+                    _mid = Decimal("0")
+                if _best_bid > 0 and _best_ask > _best_bid and _mid > 0:
                     _actual_gap_bps = (_best_ask - _best_bid) / _mid * Decimal("10000")
                     metrics["your_spread_bps"] = str(_actual_gap_bps)
         except Exception:

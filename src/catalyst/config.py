@@ -656,6 +656,10 @@ class Config:
         # (busy=1.4x, normal=1.0x, slow=0.7x). If False, pace is ignored and
         # the per-tier base percentages are used exactly as configured.
         self.TIER_TRIGGER_PACE_SCALE = _bool("TIER_TRIGGER_PACE_SCALE", True)
+        # Proactive refill target used by the drip topup path. 100 means any
+        # visible SPARE_BUFFER_LOW tier is eligible for gradual replenishment;
+        # the harder TIER_TRIGGER_PCT_* values still govern emergency topups.
+        self.TIER_DRIP_PCT = _int("TIER_DRIP_PCT", 100)
         # Trading pace thresholds (fills per hour)
         self.FILLS_PER_HOUR_BUSY = _int("FILLS_PER_HOUR_BUSY", 10)   # >10 fills/hr = busy
         self.FILLS_PER_HOUR_SLOW = _int("FILLS_PER_HOUR_SLOW", 2)    # <2 fills/hr = slow
@@ -885,7 +889,7 @@ class Config:
         "TIER_TRIGGER_PCT_INNER", "TIER_TRIGGER_PCT_MID",
         "TIER_TRIGGER_PCT_OUTER", "TIER_TRIGGER_PCT_EXTREME",
         "TIER_TRIGGER_PCT_SNIPER", "TIER_TRIGGER_PCT_FEES",
-        "TIER_TRIGGER_PACE_SCALE",
+        "TIER_TRIGGER_PACE_SCALE", "TIER_DRIP_PCT",
         "FILLS_PER_HOUR_BUSY", "FILLS_PER_HOUR_SLOW",
         "RECONCILE_EVERY_N_LOOPS",
         # Sniper

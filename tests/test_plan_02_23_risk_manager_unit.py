@@ -427,5 +427,52 @@ class TestApplyInventorySkew(unittest.TestCase):
         self.assertGreaterEqual(adjusted, min_edge)
 
 
+@unittest.skipIf(_SKIP is not None, f"risk_manager unavailable: {_SKIP}")
+class TestMarketHealthInnerSpread(unittest.TestCase):
+    """get_market_health -- actual live inner spread for the dashboard."""
+
+    def setUp(self):
+        self._p = patch.object(_rm_mod, "cfg", _fake_cfg)
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+
+    def test_uses_live_bot_bid_ask_gap_when_available(self):
+        rm = _make_rm()
+        rm._bot_ref = type("Bot", (), {
+            "_last_live_offer_edges": {
+                "our_best_bid": "0.99",
+                "our_best_ask": "1.02",
+            },
+            "_bot_state": {"mid_price": "1.00"},
+        })()
+
+        health = rm.get_market_health()
+
+        self.assertAlmostEqual(
+            Decimal(health["metrics"]["your_spread_bps"]),
+            Decimal("300"),
+        )
+
+    def test_crossed_live_bot_edges_fall_back_to_configured_spread(self):
+        rm = _make_rm()
+        rm._bot_ref = type("Bot", (), {
+            "_last_live_offer_edges": {
+                "our_best_bid": "1.02",
+                "our_best_ask": "1.01",
+            },
+            "_bot_state": {"mid_price": "1.00"},
+        })()
+
+        health = rm.get_market_health()
+
+        # buy + sell adjusted spreads from the fake config: 700 bps each.
+        self.assertEqual(
+            Decimal(health["metrics"]["your_spread_bps"]),
+            Decimal("1400.00"),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

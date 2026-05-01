@@ -401,6 +401,51 @@ class RuntimeMonitorTests(unittest.TestCase):
             for call in log_event_mock.call_args_list
         ))
 
+    def test_book_under_target_recovery_close_message_does_not_claim_full_target(self):
+        bot = _FakeBot(
+            wallet_buys=24,
+            wallet_sells=19,
+            coin_status={
+                "xch_locked_coins": 24,
+                "cat_locked_coins": 19,
+                "prep_running": False,
+                "topup_running": False,
+                "inventory": {},
+            },
+            market_snapshot={
+                "buy_count": 50,
+                "sell_count": 50,
+                "our_buy_count": 24,
+                "our_sell_count": 19,
+                "our_best_bid": "0.00011990",
+                "our_best_ask": "0.00012110",
+            },
+        )
+        monitor = RuntimeMonitor(bot)
+        monitor.reset_session()
+        monitor._last_post_activity_at = time.time() - 600
+
+        with patch("runtime_monitor.get_events_since", return_value=[]), \
+             patch("runtime_monitor.get_open_offers", return_value=_open_offer_rows(24, 24)), \
+             patch("runtime_monitor.log_event") as log_event_mock, \
+             patch.object(monitor, "_resolve_superlog_path", return_value=""), \
+             patch("runtime_monitor.cfg.ENABLE_BUY", True), \
+             patch("runtime_monitor.cfg.ENABLE_SELL", True), \
+             patch("runtime_monitor.cfg.MAX_ACTIVE_BUY_OFFERS", 24), \
+             patch("runtime_monitor.cfg.MAX_ACTIVE_SELL_OFFERS", 24):
+            monitor._run_once()
+            monitor._run_once()
+            bot.coin_manager._status["topup_running"] = True
+            monitor._run_once()
+
+        close_calls = [
+            call for call in log_event_mock.call_args_list
+            if call.args[1] == "bot_health_book_under_target_ok"
+        ]
+        self.assertTrue(close_calls)
+        self.assertIn("controlled recovery", close_calls[-1].args[2])
+        self.assertNotIn("back on target", close_calls[-1].args[2])
+
     def test_suppresses_db_wallet_divergence_during_offer_churn(self):
         bot = _FakeBot(wallet_buys=25, wallet_sells=24)
         bot._current_cycle_step = "step9_requote"
