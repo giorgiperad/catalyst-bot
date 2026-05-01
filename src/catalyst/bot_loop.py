@@ -288,6 +288,7 @@ class BotLoop:
         # this session so we don't fire the orchestrator repeatedly for the
         # same persistent alert if it somehow reappears mid-flow.
         self._watchdog_auto_healed: set = set()
+        self._last_tier_drift_topup_time: float = 0.0
 
         # ---- Ladder anchor state ----
         # Replacement offers must price against the same grid the original
@@ -2415,8 +2416,7 @@ class BotLoop:
                       f"buys={len(offers_buy)}, sells={len(offers_sell)})")
 
     def _check_tier_size_drift(self) -> None:
-        """Periodic check: do prepared coin sizes still match the live tier
-        targets?
+        """Periodic check: do prepared coin sizes still fit live tier targets?
 
         Prep coins are sized for the price at prep time. After enough price
         drift the F70 selector has nothing it can use for some tier and the
@@ -2471,21 +2471,73 @@ class BotLoop:
         summary = ", ".join(parts)
 
         log_event(
-            "warning", "tier_size_drift",
-            f"Prepared coin sizes have drifted from live tier targets: "
-            f"{summary}. Re-run Smart Settings to re-prep at the current price."
+            "info", "tier_size_drift",
+            f"Prepared coin sizes need live reshaping: {summary}. "
+            f"The bot will use live topup/rebuild before asking for Coin Prep."
         )
+
+        topup_note = "Live topup will retry on the next eligible cycle."
+        try:
+            _now = time.time()
+            _cooldown = max(
+                120,
+                int(getattr(cfg, "TIER_DRIFT_TOPUP_COOLDOWN_SECS", 600) or 600),
+            )
+            _last_topup = float(
+                getattr(self, "_last_tier_drift_topup_time", 0.0) or 0.0
+            )
+            if _now - _last_topup >= _cooldown:
+                from database import get_open_offers
+
+                _open = get_open_offers(cat_asset_id=cfg.CAT_ASSET_ID)
+                _active_buy = sum(1 for o in _open if o.get("side") == "buy")
+                _active_sell = sum(1 for o in _open if o.get("side") == "sell")
+                if self.coin_manager.start_topup(
+                    _active_buy, _active_sell, is_drip=False
+                ):
+                    self._last_tier_drift_topup_time = _now
+                    topup_note = "Live topup has started to reshape the coin pools."
+                    log_event(
+                        "info",
+                        "tier_size_drift_topup_started",
+                        f"Started live topup for tier-size drift: {summary}",
+                        data={
+                            "active_buy_count": _active_buy,
+                            "active_sell_count": _active_sell,
+                            "findings": findings[:8],
+                        },
+                    )
+                else:
+                    log_event(
+                        "info",
+                        "tier_size_drift_topup_deferred",
+                        "Tier-size drift found, but live topup is already busy "
+                        "or unavailable this cycle",
+                        data={"findings": findings[:8]},
+                    )
+            else:
+                _remaining = int(_cooldown - (_now - _last_topup))
+                topup_note = f"Live topup recently ran; retry window opens in {_remaining}s."
+                log_event(
+                    "debug",
+                    "tier_size_drift_topup_cooldown",
+                    topup_note,
+                    data={"findings": findings[:8]},
+                )
+        except Exception as _topup_err:
+            log_event(
+                "debug",
+                "tier_size_drift_topup_failed",
+                f"Tier-size drift topup trigger failed (non-fatal): {_topup_err}",
+            )
 
         self._emit_alert(
             alert_id,
-            "warning",
-            "Coin sizes drifting from live price",
-            f"Prepared tier coins no longer match the live ladder sizes "
-            f"({summary}). The bot can keep trading but some slots may skip "
-            f"as drift grows. Re-run Smart Settings to re-prep coins at the "
-            f"current price.",
-            action="open_settings",
-            action_label="Open Smart Settings",
+            "info",
+            "Coin pools reshaping",
+            f"Some spare tier coins are outside the current live ladder sizes "
+            f"({summary}). {topup_note} Coin Prep is only needed if this "
+            f"stays unresolved after topup has had time to finish.",
         )
 
     def _reset_runtime_state(self) -> None:
@@ -7152,10 +7204,10 @@ class BotLoop:
             # If buy-side requote took 20s, defer sell to next cycle.
             _requote_elapsed = time.time() - _requote_start_time
             if _requote_elapsed > _REQUOTE_TIME_BUDGET_SECS:
-                log_event("warning", "requote_time_budget",
-                          f"Requote time budget exceeded ({_requote_elapsed:.1f}s > "
-                          f"{_REQUOTE_TIME_BUDGET_SECS}s) — deferring {side} to "
-                          f"next cycle")
+                log_event("info", "requote_time_budget",
+                          f"Requote time budget reached ({_requote_elapsed:.1f}s > "
+                          f"{_REQUOTE_TIME_BUDGET_SECS}s) - deferring {side} to "
+                          f"next cycle while wallet/Dexie settle")
                 # Keep the force flag so it fires next cycle
                 break
 
@@ -7426,6 +7478,17 @@ class BotLoop:
                         self._last_quoted_plain_mid[side] = mid_price  # F67
                         self._ladder_grid_mid[side] = requote_mid
                         self._ladder_anchor_plain_mid[side] = mid_price
+                    elif tier_filter_drained:
+                        log_event("info", "requote_scope_empty",
+                                  f"{side} requote had no matching tier slots left "
+                                  f"to replace (target {target_count_trunc}, "
+                                  f"original {original_target}); the active "
+                                  f"cancel/rebuild path is already handling it.",
+                                  data={"side": side,
+                                        "replaced": replaced_count,
+                                        "target": target_count_trunc,
+                                        "original_target": original_target,
+                                        "tier_filter_drained": tier_filter_drained})
                     else:
                         # Zero progress. Do NOT advance baselines — that
                         # used to hide stale exposed offers from drift

@@ -514,6 +514,27 @@ class RuntimeMonitor:
         except Exception:
             pass
 
+        offer_churn_reasons = []
+        cycle_step = str(getattr(self._bot, "_current_cycle_step", "") or "").lower()
+        if any(token in cycle_step for token in ("requote", "create", "post", "cancel")):
+            offer_churn_reasons.append(cycle_step)
+        try:
+            pending_by_side = getattr(self._bot, "_pending_cancel_wallet_ids_by_side", {}) or {}
+            pending_cancel_count = sum(len(v or []) for v in pending_by_side.values())
+        except Exception:
+            pending_cancel_count = 0
+        if pending_cancel_count > 0:
+            offer_churn_reasons.append(f"pending_cancel:{pending_cancel_count}")
+        if db_cancel_pending > 0:
+            offer_churn_reasons.append(f"db_cancel_pending:{db_cancel_pending}")
+        try:
+            last_bulk_create = float(getattr(self._bot, "_last_bulk_create_time", 0.0) or 0.0)
+        except Exception:
+            last_bulk_create = 0.0
+        if last_bulk_create > 0 and (time.time() - last_bulk_create) < 180:
+            offer_churn_reasons.append("recent_bulk_create")
+        offer_churn_active = bool(offer_churn_reasons)
+
         performance = {
             "latest_ms": {k: round(v, 1) for k, v in self._slow_last_ms.items()},
             "active_methods": [],
@@ -550,6 +571,8 @@ class RuntimeMonitor:
                 "dexie_queue_size": int(self._bot.dexie_manager.get_stats().get("queue_size", 0) or 0),
                 "db_buy_tiers": dict(db_tier_counts["buy"]),
                 "db_sell_tiers": dict(db_tier_counts["sell"]),
+                "offer_churn_active": offer_churn_active,
+                "offer_churn_reasons": offer_churn_reasons[:6],
             },
             "coins": {
                 "xch_spendable": int(free_counts.get("xch_spendable", 0) or 0),
@@ -656,7 +679,14 @@ class RuntimeMonitor:
         wallet_excess_sell = max(0, int(market["wallet_sell"]) - int(market["db_sell"]))
         gap_total = wallet_excess_buy + wallet_excess_sell
         gap_closer_active = bool(market.get("gap_closer_active"))
-        divergence_active = (not startup_grace) and wallet_fresh and gap_total >= 2 and not gap_closer_active
+        offer_churn_active = bool(market.get("offer_churn_active"))
+        divergence_active = (
+            (not startup_grace)
+            and wallet_fresh
+            and gap_total >= 2
+            and not gap_closer_active
+            and not offer_churn_active
+        )
         self._update_streak("db_wallet_divergence", divergence_active)
         # Require 4 consecutive samples (≥60s on the 15-20s health cadence)
         # before warning. Sage's get_offers RPC routinely lags 30-90s after
@@ -672,7 +702,7 @@ class RuntimeMonitor:
                 f"vs DB {market['db_buy']}/{market['db_sell']}"
             ),
             close_event="bot_health_db_wallet_ok",
-            close_message="DB and wallet offer counts are aligned again",
+            close_message="DB and wallet offer count gap is no longer actionable",
         ):
             active_conditions.append(self._condition_entry(
                 "db_wallet_divergence",

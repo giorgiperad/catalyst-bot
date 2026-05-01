@@ -166,11 +166,20 @@ def install_all_hooks():
     try:
         import offer_manager as om
         cls = om.OfferManager
-        for method in ["create_offer_with_retry", "create_ladder", "cancel_offers",
-                        "cancel_all", "cleanup_expired", "detect_expiring_offers",
-                        "retry_failed_cancels", "sync_from_wallet", "should_requote",
-                        "requote_side"]:
-            _wrap_method(cls, method, "OFFER", slow_ms=SLOW_NETWORK_MS)
+        offer_thresholds = {
+            "create_offer_with_retry": SLOW_WALLET_MS,
+            "create_ladder": 15000,
+            "cancel_offers": 20000,
+            "cancel_all": 20000,
+            "cleanup_expired": SLOW_NETWORK_MS,
+            "detect_expiring_offers": SLOW_NETWORK_MS,
+            "retry_failed_cancels": 20000,
+            "sync_from_wallet": SLOW_WALLET_MS,
+            "should_requote": SLOW_NETWORK_MS,
+            "requote_side": 20000,
+        }
+        for method, threshold in offer_thresholds.items():
+            _wrap_method(cls, method, "OFFER", slow_ms=threshold)
             hooked += 1
         slog("HOOKS", "  offer_manager: hooked", level="debug")
     except Exception as e:
@@ -324,11 +333,17 @@ def install_all_hooks():
         # catches a genuinely wedged loop.
         _wrap_method(BotLoop, "_run_one_cycle", "LOOP", slow_ms=18000)
         count += 1
-        for method in ["_startup_sync", "_handle_requoting",
-                        "_create_offers_if_needed", "_handle_coins",
-                        "_handle_housekeeping", "_repost_active_offers_to_dexie",
-                        "graceful_config_change"]:
-            _wrap_method(BotLoop, method, "LOOP", slow_ms=SLOW_NETWORK_MS)
+        bot_loop_thresholds = {
+            "_startup_sync": SLOW_NETWORK_MS,
+            "_handle_requoting": 20000,
+            "_create_offers_if_needed": 10000,
+            "_handle_coins": SLOW_NETWORK_MS,
+            "_handle_housekeeping": SLOW_NETWORK_MS,
+            "_repost_active_offers_to_dexie": SLOW_NETWORK_MS,
+            "graceful_config_change": SLOW_NETWORK_MS,
+        }
+        for method, threshold in bot_loop_thresholds.items():
+            _wrap_method(BotLoop, method, "LOOP", slow_ms=threshold)
             count += 1
         hooked += count
         slog("HOOKS", "  bot_loop: hooked", level="debug")

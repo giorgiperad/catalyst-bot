@@ -688,7 +688,7 @@ def init_database():
                     "UPDATE fills SET round_trip_id = NULL, pnl_xch = NULL WHERE round_trip_id = ?",
                     (rt_id,))
             conn.commit()
-            log_event("warning", "db_migration",
+            log_event("info", "db_migration",
                       "Cleared %d bad round-trip matches (size mismatch)" % len(rt_ids))
     except Exception as fix_e:
         log_event("warning", "db_migration",

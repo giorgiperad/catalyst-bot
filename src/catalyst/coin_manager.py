@@ -417,9 +417,29 @@ def _infer_designation_by_size(amt: int, tier_sizes_mojos: Dict[str, int]) -> Tu
     return _cc_infer(amt, tier_sizes_mojos)
 
 
+def _effective_tier_size_drift_bounds(
+    low_ratio: Optional[float],
+    high_ratio: Optional[float],
+) -> Tuple[float, float]:
+    """Return the same coin-fit bounds used by tier offer selection."""
+    try:
+        from coin_classifier import DEFAULT_FLOOR_TOLERANCE
+        default_low = float(DEFAULT_FLOOR_TOLERANCE)
+    except Exception:
+        default_low = 0.98
+    try:
+        default_high = float(getattr(cfg, "COIN_MAX_SIZE_RATIO", 1.5) or 1.5)
+    except Exception:
+        default_high = 1.5
+    return (
+        default_low if low_ratio is None else float(low_ratio),
+        default_high if high_ratio is None else float(high_ratio),
+    )
+
+
 def check_tier_size_drift_standalone(
-    low_ratio: float = 0.95,
-    high_ratio: float = 1.20,
+    low_ratio: Optional[float] = None,
+    high_ratio: Optional[float] = None,
     min_sample: int = 2,
 ) -> List[Dict]:
     """Module-level mirror of CoinManager.check_tier_size_drift.
@@ -428,9 +448,15 @@ def check_tier_size_drift_standalone(
     for its end-of-prep verification (the worker doesn't have a live
     CoinManager) and by api_server's pre-start gate. Returns the same
     list-of-finding-dicts shape: empty when all tier coins match.
+
+    By default this uses the same usable coin bounds as live offer
+    selection: the coin-classifier floor tolerance and COIN_MAX_SIZE_RATIO.
+    That avoids telling the operator to re-prep while the bot still has
+    perfectly usable oversize coins that live topup can reshape normally.
     """
     from database import get_coins_by_designation
 
+    low_ratio, high_ratio = _effective_tier_size_drift_bounds(low_ratio, high_ratio)
     findings: List[Dict] = []
     if not cfg.TIER_ENABLED:
         return findings
@@ -3502,19 +3528,18 @@ class CoinManager:
 
     def check_tier_size_drift(
         self,
-        low_ratio: float = 0.95,
-        high_ratio: float = 1.20,
+        low_ratio: Optional[float] = None,
+        high_ratio: Optional[float] = None,
         min_sample: int = 2,
     ) -> List[Dict]:
-        """Detect when prepared tier-coin sizes have drifted from the live
-        target sizes.
+        """Detect when prepared tier-coin sizes drift outside usable bounds.
 
         Smart Settings sizes coins for the price at prep time. If the live
         mid drifts, the same offer ladder needs differently-sized coins.
-        Once the median prepped coin sits outside ``[low_ratio, high_ratio]``
-        of the live tier size, the offer creator starts skipping slots
-        (coin under floor) or oversizing offers (coin over ceiling), and
-        a re-prep is the right answer.
+        Once the median prepped coin sits outside the selector-compatible
+        band, live topup should reshape reserve and misfit coins into the
+        new pool sizes. A full Coin Prep is only needed if the wallet cannot
+        self-heal from existing reserves.
 
         Returns a list of finding dicts — one per (side, tier) that has
         drifted — with the median amount, live target size, ratio, and
@@ -3527,6 +3552,7 @@ class CoinManager:
         except Exception:
             return []
 
+        low_ratio, high_ratio = _effective_tier_size_drift_bounds(low_ratio, high_ratio)
         findings: List[Dict] = []
         for wallet_type, is_cat in (("xch", False), ("cat", True)):
             try:
@@ -4482,7 +4508,7 @@ class CoinManager:
                     self._last_low_coin_warning = time.time()
                 return False
 
-            log_event("warning", "coin_health_trigger",
+            log_event("info", "coin_health_trigger",
                       f"[COIN HEALTH] XCH: {free_xch} free (need {target_free_xch}), "
                       f"CAT: {free_cat} free (need {target_free_cat})")
             return True

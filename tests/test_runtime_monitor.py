@@ -102,6 +102,9 @@ class _FakeBot:
         self._last_loop_duration = 12.5
         self._current_mid_price = "0.00012050"
         self._start_time = time.time() - 300
+        self._current_cycle_step = "idle"
+        self._pending_cancel_wallet_ids_by_side = {"buy": set(), "sell": set()}
+        self._last_bulk_create_time = 0.0
         self.offer_manager = _FakeOfferManager(fresh=fresh)
         self.market_intel = _FakeMarketIntel(snapshot=market_snapshot)
         self.coin_manager = _FakeCoinManager(status=coin_status, free_counts=free_counts)
@@ -209,6 +212,47 @@ class RuntimeMonitorTests(unittest.TestCase):
         active_codes = {item["code"] for item in state["active_conditions"]}
         self.assertNotIn("dexie_visibility_gap", active_codes)
         self.assertFalse(any(call.args[1] == "bot_health_dexie_gap" for call in log_event_mock.call_args_list))
+
+    def test_flags_db_wallet_divergence_when_wallet_excess_persists(self):
+        bot = _FakeBot(wallet_buys=25, wallet_sells=24)
+        monitor = RuntimeMonitor(bot)
+        monitor.reset_session()
+
+        with patch("runtime_monitor.get_events_since", return_value=[]), \
+             patch("runtime_monitor.get_open_offers", return_value=_open_offer_rows(19, 24)), \
+             patch("runtime_monitor.log_event") as log_event_mock, \
+             patch.object(monitor, "_resolve_superlog_path", return_value=""):
+            for _ in range(4):
+                monitor._run_once()
+
+        state = monitor.get_state()
+        active_codes = {item["code"] for item in state["active_conditions"]}
+        self.assertIn("db_wallet_divergence", active_codes)
+        self.assertTrue(any(
+            call.args[1] == "bot_health_db_wallet_gap"
+            for call in log_event_mock.call_args_list
+        ))
+
+    def test_suppresses_db_wallet_divergence_during_offer_churn(self):
+        bot = _FakeBot(wallet_buys=25, wallet_sells=24)
+        bot._current_cycle_step = "step9_requote"
+        monitor = RuntimeMonitor(bot)
+        monitor.reset_session()
+
+        with patch("runtime_monitor.get_events_since", return_value=[]), \
+             patch("runtime_monitor.get_open_offers", return_value=_open_offer_rows(19, 24)), \
+             patch("runtime_monitor.log_event") as log_event_mock, \
+             patch.object(monitor, "_resolve_superlog_path", return_value=""):
+            for _ in range(4):
+                monitor._run_once()
+
+        state = monitor.get_state()
+        active_codes = {item["code"] for item in state["active_conditions"]}
+        self.assertNotIn("db_wallet_divergence", active_codes)
+        self.assertFalse(any(
+            call.args[1] == "bot_health_db_wallet_gap"
+            for call in log_event_mock.call_args_list
+        ))
 
     def test_flags_topup_lag_when_coin_headroom_does_not_improve(self):
         bot = _FakeBot(
