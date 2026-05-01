@@ -55,3 +55,31 @@ def test_coin_prep_cancel_all_fails_if_offers_remain_open(tmp_path):
         patch("coin_prep_worker.time.sleep"),
     ):
         assert worker.cancel_all_offers() is False
+
+
+def test_coin_prep_cancel_all_aborts_when_batch_cancel_is_only_pending(tmp_path):
+    worker = _worker()
+    worker.get_all_open_offers_rpc = MagicMock(
+        side_effect=[
+            [{"id": "trade-a"}],
+            [],
+        ]
+    )
+
+    with (
+        patch(
+            "user_paths.worker_cancelled_ids_file",
+            return_value=str(tmp_path / "worker_cancelled_ids.json"),
+        ),
+        patch(
+            "coin_prep_worker.cancel_offers_batch",
+            return_value={
+                "trade-a": {
+                    "success": True,
+                    "method": "submitted_pending_confirm",
+                },
+            },
+        ),
+        patch("coin_prep_worker.time.sleep"),
+    ):
+        assert worker.cancel_all_offers() is False

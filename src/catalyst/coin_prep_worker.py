@@ -1912,16 +1912,33 @@ class CoinPrepWorker:
             results = cancel_offers_batch(trade_ids, secure=True)
 
             # Count successes and failures from the batch result
+            pending_methods = {
+                "submitted_pending_confirm",
+                "already_in_mempool",
+                "mempool_conflict_inflight",
+                "already_gone_ambiguous",
+            }
             cancelled = 0
             failed_ids = []
+            pending_ids = []
             for tid in trade_ids:
                 res = results.get(tid, {})
                 if res and res.get("success"):
-                    cancelled += 1
+                    method = str(res.get("method") or "")
+                    if method in pending_methods:
+                        pending_ids.append(tid)
+                    else:
+                        cancelled += 1
                 else:
                     failed_ids.append(tid)
 
             self.log(f"\nBulk cancel result: {cancelled} succeeded, {len(failed_ids)} failed")
+            if pending_ids:
+                self.log(
+                    f"{len(pending_ids)} cancels are still awaiting on-chain "
+                    "confirmation; aborting coin prep before reshaping coins"
+                )
+                return False
 
             # RETRY failed cancels individually (transient errors)
             permanently_failed = set()

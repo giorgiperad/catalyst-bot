@@ -76,6 +76,46 @@ class WalletSageCancelBatchTests(unittest.TestCase):
         self.assertTrue(results["0xabc123"]["success"])
         self.assertEqual(results["0xabc123"]["method"], "confirmed_by_unlock")
 
+    def test_cancel_batch_does_not_confirm_when_offer_disappears_but_tx_pending(self):
+        ticks = itertools.count(start=0, step=31)
+
+        with patch.object(wallet_sage, "cancel_offer", return_value={"success": True}), \
+             patch.object(wallet_sage, "get_spendable_coin_count", return_value=100), \
+             patch.object(wallet_sage, "get_pending_transactions",
+                          return_value=[{"transaction_id": "pending"}]), \
+             patch.object(wallet_sage, "get_all_offers", return_value=[]), \
+             patch.object(wallet_sage, "get_owned_coins_detailed", return_value={}), \
+             patch("builtins.print"), \
+             patch.object(wallet_sage.time, "sleep", return_value=None), \
+             patch.object(wallet_sage.time, "time", side_effect=lambda: next(ticks)):
+            results = wallet_sage.cancel_offers_batch(["0xabc123"], secure=False)
+
+        self.assertTrue(results["0xabc123"]["success"])
+        self.assertEqual(
+            results["0xabc123"]["method"],
+            "submitted_pending_confirm",
+        )
+
+    def test_cancel_batch_does_not_confirm_when_offer_lock_still_visible(self):
+        ticks = itertools.count(start=0, step=31)
+
+        with patch.object(wallet_sage, "cancel_offer", return_value={"success": True}), \
+             patch.object(wallet_sage, "get_spendable_coin_count", return_value=100), \
+             patch.object(wallet_sage, "get_pending_transactions", return_value=[]), \
+             patch.object(wallet_sage, "get_all_offers", return_value=[]), \
+             patch.object(wallet_sage, "get_owned_coins_detailed",
+                          return_value={"0xcoin": {"offer_id": "0xabc123"}}), \
+             patch("builtins.print"), \
+             patch.object(wallet_sage.time, "sleep", return_value=None), \
+             patch.object(wallet_sage.time, "time", side_effect=lambda: next(ticks)):
+            results = wallet_sage.cancel_offers_batch(["0xabc123"], secure=False)
+
+        self.assertTrue(results["0xabc123"]["success"])
+        self.assertEqual(
+            results["0xabc123"]["method"],
+            "submitted_pending_confirm",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

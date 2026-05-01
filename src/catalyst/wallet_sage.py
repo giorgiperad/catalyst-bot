@@ -3294,6 +3294,31 @@ def cancel_offers_batch(trade_ids: list, secure: bool = True, max_workers: int =
                 return None
         return total
 
+    target_trade_ids = set(trade_ids)
+
+    def _pending_count():
+        """Return pending transaction count, or None if Sage cannot answer."""
+        try:
+            pending = get_pending_transactions()
+            if isinstance(pending, list):
+                return len(pending)
+        except Exception:
+            pass
+        return None
+
+    def _locked_trade_ids():
+        """Return trade ids still locking wallet coins, or None on RPC failure."""
+        locked = set()
+        for _wid in _wallet_ids:
+            try:
+                owned = get_owned_coins_detailed(_wid)
+            except Exception:
+                return None
+            if owned is None:
+                return None
+            locked.update(_get_still_locked_trade_ids(target_trade_ids, owned))
+        return locked
+
     # ── 1. Pre-cancel snapshot ──
     pre_coins = _total_spendable()
     if pre_coins is not None:
@@ -3403,10 +3428,9 @@ def cancel_offers_batch(trade_ids: list, secure: bool = True, max_workers: int =
             try:
                 open_offers = get_all_offers(include_completed=False, end=500)
                 if open_offers and isinstance(open_offers, list):
-                    target_set = set(trade_ids)
                     for o in open_offers:
                         tid = o.get("trade_id", "") or o.get("offer_id", "")
-                        if tid in target_set:
+                        if tid in target_trade_ids:
                             raw_status = o.get("status")
                             # Count fillable offers (includes PENDING_CANCEL
                             # — the cancel TX is in the mempool but the
@@ -3423,6 +3447,12 @@ def cancel_offers_batch(trade_ids: list, secure: bool = True, max_workers: int =
             except Exception:
                 open_remaining = -1  # unknown
 
+            pending_count = _pending_count()
+            still_locked = _locked_trade_ids()
+            coins_returned = pre_coins is not None and delta >= num_offers
+            locks_clear = still_locked is not None and not still_locked
+            pending_clear = pending_count == 0
+
             print(f"   🔄 [{elapsed}s] spendable={current_coins} "
                   f"(delta=+{delta}), open_remaining={open_remaining}")
 
@@ -3430,7 +3460,7 @@ def cancel_offers_batch(trade_ids: list, secure: bool = True, max_workers: int =
             # off-book and cancels confirmed on-chain — PENDING_CANCEL
             # rows are NOT counted as success because a fill can still
             # beat an in-mempool cancel).
-            if open_remaining == 0:
+            if open_remaining == 0 and (coins_returned or (locks_clear and pending_clear)):
                 print(f"   ✅ [Sage] All offers cancelled — coins returned "
                       f"(spendable={current_coins}, delta=+{delta})")
                 confirmed = True
@@ -3441,8 +3471,12 @@ def cancel_offers_batch(trade_ids: list, secure: bool = True, max_workers: int =
                     results[tid] = entry
                 break
 
+            if open_remaining == 0:
+                print("   [Sage] Offers are off-book, waiting for cancel "
+                      "settlement before releasing coins to coin prep")
+
             # Secondary: coin count jumped significantly even if status is lagging
-            if pre_coins is not None and delta >= num_offers and open_remaining <= 0:
+            if coins_returned and open_remaining <= 0:
                 print(f"   ✅ [Sage] Coin count confirms cancels "
                       f"(+{delta} coins, expected ~{num_offers})")
                 confirmed = True
