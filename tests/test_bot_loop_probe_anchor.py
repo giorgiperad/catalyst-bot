@@ -930,6 +930,83 @@ class ProbeAnchorTests(unittest.TestCase):
         self.assertEqual(loop._pending_cancel_settle_seen["stuck-sell"]["retries"], 1)
         self.assertNotIn("gone-sell", loop._pending_cancel_settle_seen)
 
+    def test_wallet_active_pending_cancel_watchdog_aggregates_retry_log(self):
+        loop = bot_loop.BotLoop()
+        loop.offer_manager._pending_cancel_retries = {}
+        loop._pending_cancel_settle_retry_secs = 300.0
+        loop._pending_cancel_settle_seen = {
+            "stuck-sell-1": {"side": "sell", "first_seen": 1000.0, "last_retry": 0.0, "retries": 0},
+            "stuck-sell-2": {"side": "sell", "first_seen": 1000.0, "last_retry": 0.0, "retries": 0},
+            "stuck-sell-3": {"side": "sell", "first_seen": 1000.0, "last_retry": 0.0, "retries": 0},
+        }
+        events = []
+
+        def _log_event(severity, event_type, message, data=None):
+            events.append((severity, event_type, message, data or {}))
+
+        with patch.object(bot_loop.time, "time", return_value=1401.0), \
+                patch.object(bot_loop, "log_event", side_effect=_log_event):
+            loop._track_pending_cancel_settle_watchdog({
+                "buy": set(),
+                "sell": {"stuck-sell-1", "stuck-sell-2", "stuck-sell-3"},
+            })
+
+        retry_events = [
+            event for event in events
+            if event[1] == "pending_cancel_settle_retry_queued"
+        ]
+        self.assertEqual(len(retry_events), 1)
+        self.assertEqual(retry_events[0][3]["side"], "sell")
+        self.assertEqual(retry_events[0][3]["queued_count"], 3)
+        self.assertIn("3 sell cancel", retry_events[0][2])
+        self.assertEqual(len(loop.offer_manager._pending_cancel_retries), 3)
+
+    def test_pending_cancel_deferral_notice_suppresses_unchanged_repeats(self):
+        loop = bot_loop.BotLoop()
+        events = []
+
+        def _log_event(severity, event_type, message, data=None):
+            events.append((severity, event_type, message, data or {}))
+
+        with patch.object(bot_loop, "log_event", side_effect=_log_event), \
+                patch.object(bot_loop.time, "time", return_value=1000.0):
+            first = loop._log_pending_cancel_notice(
+                "warning",
+                "emergency_requote_deferred_pending_cancel_settle",
+                "Emergency sell requote deferred - 20 pending cancels must settle",
+                side="sell",
+                pending_count=20,
+            )
+            repeat = loop._log_pending_cancel_notice(
+                "warning",
+                "emergency_requote_deferred_pending_cancel_settle",
+                "Emergency sell requote deferred - 20 pending cancels must settle",
+                side="sell",
+                pending_count=20,
+            )
+
+        with patch.object(bot_loop, "log_event", side_effect=_log_event), \
+                patch.object(bot_loop.time, "time", return_value=1010.0):
+            changed = loop._log_pending_cancel_notice(
+                "warning",
+                "emergency_requote_deferred_pending_cancel_settle",
+                "Emergency sell requote deferred - 19 pending cancels must settle",
+                side="sell",
+                pending_count=19,
+            )
+
+        self.assertTrue(first)
+        self.assertFalse(repeat)
+        self.assertTrue(changed)
+        self.assertEqual(
+            [
+                event[3].get("pending_count")
+                for event in events
+                if event[1] == "emergency_requote_deferred_pending_cancel_settle"
+            ],
+            [20, 19],
+        )
+
     def test_wallet_active_pending_cancel_watchdog_uses_db_cancel_age_for_new_ids(self):
         loop = bot_loop.BotLoop()
         loop.offer_manager._pending_cancel_retries = {}
@@ -1107,6 +1184,34 @@ class ProbeAnchorTests(unittest.TestCase):
         self.assertEqual(loop._watcher_data["last_xch_reserve"], 1100)
         self.assertEqual(loop._watcher_data["last_token_reserve"], 4500)
         self.assertEqual(loop._watcher_data["last_confirmed_price_xch"], "0.00018716")
+
+    def test_mempool_price_move_stores_raw_reserves_in_watcher_units(self):
+        loop = bot_loop.BotLoop()
+        loop._running = True
+
+        class _PriceEngine:
+            def inject_tibet_reserves(self, **kwargs):
+                del kwargs
+                return True
+
+            def invalidate_tibet_cache(self):
+                raise AssertionError("cache should not invalidate on successful injection")
+
+        loop.price_engine = _PriceEngine()
+        with patch.object(bot_loop.time, "time", return_value=1000.0):
+            loop._record_confirmed_price_move({
+                "type": "price_move",
+                "direction": "down",
+                "magnitude_pct": 7.369,
+                "new_xch_reserve": 125660489718592,
+                "new_tok_reserve": 953680549,
+                "new_price_xch": "0.00013177",
+                "pair_id": "pair-raw",
+            }, in_cycle=False)
+
+        self.assertAlmostEqual(loop._watcher_data["last_xch_reserve"], 125.660489718592)
+        self.assertAlmostEqual(loop._watcher_data["last_token_reserve"], 953680.549)
+        self.assertEqual(loop._watcher_data["change_pct"], 7.369)
 
     def test_mempool_price_move_invalidates_cache_when_injection_misses(self):
         loop = bot_loop.BotLoop()

@@ -24946,7 +24946,8 @@
             sniper_trigger: '⚡', sniper_fired: '⚡', sniper_fill: '🎯',
             requoting: '🔄', offers_created: '📋',
             emergency_requote: '🚨', emergency_requote_done: '✅',
-            cancel_retry_success: '✅', dexie_flush_result: '📡',
+            cancel_retries: '✅', cancel_retry_success: '✅',
+            dexie_flush_result: '📡',
             splash_flush_result: '📡', splash_repost_done: '🌐',
             circuit_breaker: '🛑', position_limit: '🛑',
             coin_split_manual: '🪙', coin_topup: '🪙',
@@ -24961,6 +24962,12 @@
             gap_closer_start: '📈', gap_closer_stop: '📈',
             gap_closer_step: '📈', gap_closer_arbed: '⚠️',
             boost_created: '📈', boost_cancelled: '📈',
+            tibet_swap_detected: '📈', mempool_swap_detected: '🔭',
+            mempool_imminent_wake: '⚡', mempool_price_confirmed: '📈',
+            mempool_price_move: '📈', defensive_cancel_start: '🛡️',
+            mempool_defensive_cancel_done: '🛡️',
+            mempool_defensive_cancel_deferred_pending_cancel_settle: '⏳',
+            amm_drift_detected: '📈', amm_drift_requote_triggered: '🔄',
             splash_node_started: '🌐', splash_node_stopped: '🌐',
             probe_launch_status: '🎯', probe_confirmed_status: '✅',
             probe_retry_status: '🎯', probe_timeout_status: '⚠️',
@@ -25775,6 +25782,72 @@
                 return { icon: '✅', msg: 'Wallet synced — ready to trade', cls: 'la-success' };
             if (eventType === 'startup_wallet_sync')
                 return { icon: '🔗', msg: 'Syncing with wallet...', cls: 'la-info' };
+
+            // --- TibetSwap / AMM protection ---
+            if (eventType === 'mempool_swap_detected' || eventType === 'mempool_imminent_wake') {
+                return { icon: '🔭', msg: 'Tibet swap spotted early — watching pool confirmation', cls: 'la-info' };
+            }
+            if (eventType === 'tibet_swap_detected') {
+                const pct = (m.match(/Reserves moved\s+([0-9.]+%)/i) || [,''])[1];
+                return { icon: '📈', msg: 'Tibet reserve move spotted' + (pct ? ' (' + pct + ')' : ''), cls: 'la-info' };
+            }
+            if (eventType === 'mempool_price_confirmed') {
+                const move = (m.match(/confirmed:\s*([^\(]+)/i) || [,''])[1].trim();
+                return {
+                    icon: '📈',
+                    msg: 'Tibet price shift confirmed' + (move ? ': ' + move : ''),
+                    cls: 'la-info'
+                };
+            }
+            if (eventType === 'mempool_price_move') {
+                const move = (m.match(/change:\s*([^\(]+)/i) || [,''])[1].trim();
+                return {
+                    icon: '📈',
+                    msg: 'Tibet reserve move recorded' + (move ? ': ' + move : ''),
+                    cls: 'la-info'
+                };
+            }
+            if (eventType === 'defensive_cancel_start') {
+                const side = (m.match(/\b(buy|sell)\b/i) || [,''])[1];
+                return {
+                    icon: '🛡️',
+                    msg: 'Protecting stale ' + (side ? side + ' ' : '') + 'offers after Tibet move',
+                    cls: 'la-info'
+                };
+            }
+            if (eventType === 'mempool_defensive_cancel_done') {
+                const side = (m.match(/cancelled\s+\d+\s+(\w+)/i) || [,''])[1];
+                const count = (m.match(/cancelled\s+(\d+)/i) || [,''])[1];
+                return {
+                    icon: '🛡️',
+                    msg: 'Protected book: cancelled ' + (count || 'stale') + ' ' + (side || '') + ' offers after Tibet move',
+                    cls: 'la-info'
+                };
+            }
+            if (eventType === 'mempool_defensive_cancel_deferred_pending_cancel_settle') {
+                return { icon: '⏳', msg: 'Tibet move noticed — waiting for current cancels to settle', cls: 'la-info' };
+            }
+            if (eventType === 'amm_drift_detected') {
+                const drift = (m.match(/drifted\s+([0-9.]+bps)/i) || [,''])[1];
+                return { icon: '📈', msg: 'AMM drift detected' + (drift ? ': ' + drift : ''), cls: 'la-info' };
+            }
+            if (eventType === 'amm_drift_requote_triggered') {
+                return { icon: '🔄', msg: 'AMM move triggered a requote', cls: 'la-info' };
+            }
+            if (eventType === 'emergency_requote_deferred_pending_cancel_settle') {
+                const side = (m.match(/Emergency\s+(\w+)\s+requote/i) || [,''])[1];
+                return {
+                    icon: '⏳',
+                    msg: 'Waiting for cancel confirmations before rebuilding ' + (side || 'that') + ' side',
+                    cls: 'la-warning'
+                };
+            }
+            if (eventType === 'pending_cancel_settle_retry_queued') {
+                return { icon: '🔁', msg: 'Cancel settlement retry queued', cls: 'la-warning' };
+            }
+            if (eventType === 'cancel_retries') {
+                return { icon: '✅', msg: m || 'Cancel retry pass completed', cls: 'la-info' };
+            }
 
             // --- Price watcher wake (suppressed — fires every 12s, too noisy) ---
             if (eventType === 'watcher_wake')

@@ -3744,6 +3744,7 @@ class OfferManager:
 
         success_count = 0
         to_remove = []
+        success_details = []
 
         for trade_id, info in list(self._pending_cancel_retries.items()):
             attempts = info.get("attempts", 0)
@@ -3819,9 +3820,11 @@ class OfferManager:
                         pass
                     to_remove.append(trade_id)
                     continue
-                log_event("info", "cancel_retry_success",
-                          f"Cancel retry succeeded for {trade_id[:16]}... "
-                          f"(attempt {info['attempts']}, method={method or 'unspecified'})")
+                success_details.append({
+                    "trade_id": trade_id,
+                    "attempt": info["attempts"],
+                    "method": method or "unspecified",
+                })
                 update_offer_status(trade_id, "cancelled")
                 success_count += 1
                 to_remove.append(trade_id)
@@ -3829,6 +3832,19 @@ class OfferManager:
                 log_event("debug", "cancel_retry_failed",
                           f"Cancel retry failed for {trade_id[:16]}... "
                           f"(attempt {info['attempts']}/{self._max_cancel_retries})")
+
+        if len(success_details) == 1:
+            detail = success_details[0]
+            log_event("info", "cancel_retry_success",
+                      f"Cancel retry succeeded for {detail['trade_id'][:16]}... "
+                      f"(attempt {detail['attempt']}, method={detail['method']})")
+        elif len(success_details) > 1:
+            log_event("debug", "cancel_retry_success_batch",
+                      f"Cancel retry succeeded for {len(success_details)} offers",
+                      data={
+                          "count": len(success_details),
+                          "trade_ids": [detail["trade_id"] for detail in success_details],
+                      })
 
         # Clean up completed/exhausted retries
         for tid in to_remove:

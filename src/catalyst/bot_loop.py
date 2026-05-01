@@ -543,6 +543,8 @@ class BotLoop:
         self._pending_cancel_settle_seen: Dict[str, Dict] = {}
         self._pending_cancel_settle_retry_secs: float = 300.0
         self._pending_cancel_settle_max_retries: int = 5
+        self._pending_cancel_notice_seen: Dict[str, Dict] = {}
+        self._pending_cancel_notice_repeat_secs: float = 300.0
 
         # ---- Degraded-mode recovery tracking ----
         # When the bot stays materially under target or Sage visibility is
@@ -3460,6 +3462,85 @@ class BotLoop:
                 counts[side_norm] = len(pending)
         return counts
 
+    def _confirmed_reserves_for_watcher(self, xch_reserve, token_reserve) -> tuple:
+        """Return confirmed reserves in the same units as _fetch_tibet_reserves."""
+        raw_hint = False
+        xch_out = None
+        token_out = None
+        try:
+            xch_dec = Decimal(str(xch_reserve))
+            raw_hint = abs(xch_dec) > Decimal("1000000")
+            xch_out = xch_dec / Decimal("1000000000000") if raw_hint else xch_dec
+        except Exception:
+            xch_out = None
+
+        try:
+            token_dec = Decimal(str(token_reserve))
+            if raw_hint:
+                decimals = int(getattr(cfg, "CAT_DECIMALS", 3) or 3)
+                token_dec = token_dec / (Decimal(10) ** Decimal(decimals))
+            token_out = token_dec
+        except Exception:
+            token_out = None
+
+        return (
+            float(xch_out) if xch_out is not None else None,
+            float(token_out) if token_out is not None else None,
+        )
+
+    def _log_pending_cancel_notice(self, severity: str, event_type: str,
+                                   message: str, *, side: str = "",
+                                   pending_count: int = 0,
+                                   data: Optional[Dict] = None,
+                                   key: Optional[str] = None,
+                                   repeat_secs: Optional[float] = None) -> bool:
+        """Log pending-cancel waits once per unchanged state.
+
+        Wallet-active pending cancels can last several cycles. Repeating the
+        same warning every loop makes the dashboard look worse than the bot's
+        actual state, so unchanged counts are suppressed for a short window.
+        """
+        side_norm = str(side or (data or {}).get("side") or "").strip().lower()
+        try:
+            count = int(pending_count or (data or {}).get("pending_count") or 0)
+        except Exception:
+            count = 0
+        notice_key = key or f"{event_type}:{side_norm or 'all'}"
+        now = time.time()
+        repeat_window = float(
+            repeat_secs
+            if repeat_secs is not None
+            else getattr(self, "_pending_cancel_notice_repeat_secs", 300.0)
+        )
+        state = (getattr(self, "_pending_cancel_notice_seen", {}) or {}).get(notice_key) or {}
+        last_at = float(state.get("last_at") or 0.0)
+        last_count = state.get("pending_count")
+        try:
+            unchanged = int(last_count) == count
+        except Exception:
+            unchanged = False
+
+        if last_at > 0 and unchanged and (now - last_at) < repeat_window:
+            state["suppressed_repeats"] = int(state.get("suppressed_repeats") or 0) + 1
+            self._pending_cancel_notice_seen[notice_key] = state
+            return False
+
+        payload = dict(data or {})
+        if side_norm:
+            payload.setdefault("side", side_norm)
+        payload.setdefault("pending_count", count)
+        suppressed = int(state.get("suppressed_repeats") or 0)
+        if suppressed:
+            payload["suppressed_repeats"] = suppressed
+        log_event(severity, event_type, message, data=payload)
+        self._pending_cancel_notice_seen[notice_key] = {
+            "last_at": now,
+            "pending_count": count,
+            "side": side_norm,
+            "suppressed_repeats": 0,
+        }
+        return True
+
     def _defer_probe_launch_for_pending_cancel(self, launch_reason: Optional[str]) -> Optional[str]:
         if not launch_reason:
             return launch_reason
@@ -3662,6 +3743,8 @@ class BotLoop:
                 seen.pop(tid, None)
 
         retry_map = getattr(getattr(self, "offer_manager", None), "_pending_cancel_retries", None)
+        exhausted_by_side: Dict[str, list] = {"buy": [], "sell": []}
+        queued_by_side: Dict[str, list] = {"buy": [], "sell": []}
         for tid, side in active.items():
             if tid not in seen:
                 seen[tid] = {
@@ -3680,15 +3763,11 @@ class BotLoop:
             retries = int(info.get("retries") or 0)
             if retries >= max_retries:
                 if not info.get("exhausted_logged"):
-                    log_event(
-                        "warning",
-                        "pending_cancel_settle_retry_exhausted",
-                        f"{side} offer {tid[:16]}... still wallet-active after "
-                        f"{int(age)}s and {retries} retry nudge(s); keeping "
-                        f"creation blocked until Sage stops reporting it active",
-                        data={"trade_id": tid, "side": side, "age_secs": int(age),
-                              "retries": retries},
-                    )
+                    exhausted_by_side.setdefault(side, []).append({
+                        "trade_id": tid,
+                        "age_secs": int(age),
+                        "retries": retries,
+                    })
                     info["exhausted_logged"] = True
                 continue
 
@@ -3703,15 +3782,55 @@ class BotLoop:
                 }
                 info["last_retry"] = now
                 info["retries"] = retries + 1
-                log_event(
-                    "warning",
-                    "pending_cancel_settle_retry_queued",
-                    f"{side} offer {tid[:16]}... has stayed wallet-active for "
-                    f"{int(age)}s after DB cancel; queued a cancel retry and "
-                    f"kept new {side} creation blocked",
-                    data={"trade_id": tid, "side": side, "age_secs": int(age),
-                          "retry_count": info["retries"]},
-                )
+                queued_by_side.setdefault(side, []).append({
+                    "trade_id": tid,
+                    "age_secs": int(age),
+                    "retry_count": info["retries"],
+                })
+
+        for side, entries in queued_by_side.items():
+            if not entries:
+                continue
+            ages = [int(entry.get("age_secs") or 0) for entry in entries]
+            min_age = min(ages) if ages else 0
+            max_age = max(ages) if ages else 0
+            age_phrase = f"{min_age}s" if min_age == max_age else f"{min_age}-{max_age}s"
+            log_event(
+                "warning",
+                "pending_cancel_settle_retry_queued",
+                f"{len(entries)} {side} cancel(s) stayed wallet-active for "
+                f"{age_phrase} after DB cancel; queued cancel retries and "
+                f"kept new {side} creation blocked",
+                data={
+                    "side": side,
+                    "queued_count": len(entries),
+                    "age_secs_min": min_age,
+                    "age_secs_max": max_age,
+                    "trade_ids": [entry["trade_id"] for entry in entries],
+                    "retry_counts": [entry["retry_count"] for entry in entries],
+                },
+            )
+
+        for side, entries in exhausted_by_side.items():
+            if not entries:
+                continue
+            ages = [int(entry.get("age_secs") or 0) for entry in entries]
+            retries = [int(entry.get("retries") or 0) for entry in entries]
+            log_event(
+                "warning",
+                "pending_cancel_settle_retry_exhausted",
+                f"{len(entries)} {side} cancel(s) still wallet-active after "
+                f"{max(retries) if retries else max_retries} retry nudge(s); "
+                "keeping creation blocked until Sage stops reporting them active",
+                data={
+                    "side": side,
+                    "exhausted_count": len(entries),
+                    "age_secs_min": min(ages) if ages else 0,
+                    "age_secs_max": max(ages) if ages else 0,
+                    "trade_ids": [entry["trade_id"] for entry in entries],
+                    "retries": retries,
+                },
+            )
 
         self._pending_cancel_settle_seen = seen
 
@@ -3982,6 +4101,10 @@ class BotLoop:
             old_xch = sig.get("old_xch_reserve")
             old_tok = sig.get("old_tok_reserve")
             now_ts = time.time()
+            watcher_xch, watcher_tok = self._confirmed_reserves_for_watcher(
+                new_xch if new_xch is not None else old_xch,
+                new_tok if new_tok is not None else old_tok,
+            )
 
             with self._watcher_lock:
                 self._watcher_data["triggered"] = True
@@ -3989,14 +4112,10 @@ class BotLoop:
                 self._watcher_data["direction"] = str(sig.get("direction", "") or "")
                 self._watcher_data["last_change_ts"] = now_ts
                 self._watcher_data["triggers"] = int(self._watcher_data.get("triggers", 0) or 0) + 1
-                if new_xch is not None:
-                    self._watcher_data["last_xch_reserve"] = int(new_xch)
-                elif old_xch is not None:
-                    self._watcher_data["last_xch_reserve"] = int(old_xch)
-                if new_tok is not None:
-                    self._watcher_data["last_token_reserve"] = int(new_tok)
-                elif old_tok is not None:
-                    self._watcher_data["last_token_reserve"] = int(old_tok)
+                if watcher_xch is not None:
+                    self._watcher_data["last_xch_reserve"] = watcher_xch
+                if watcher_tok is not None:
+                    self._watcher_data["last_token_reserve"] = watcher_tok
                 if sig.get("new_price_xch") is not None:
                     self._watcher_data["last_confirmed_price_xch"] = str(sig.get("new_price_xch"))
 
@@ -6189,7 +6308,12 @@ class BotLoop:
         # ---- Step 7c: Retry failed cancels (V1 parity) ----
         retried = self.offer_manager.retry_failed_cancels()
         if retried > 0:
-            log_event("info", "cancel_retries", f"Retried {retried} failed cancels")
+            suffix = "" if retried == 1 else "s"
+            log_event(
+                "info",
+                "cancel_retries",
+                f"Cancel retry pass completed for {retried} pending cancel{suffix}",
+            )
 
         # Update cancel retry alert
         pending_retries = len(self.offer_manager._pending_cancel_retries)
@@ -6804,12 +6928,14 @@ class BotLoop:
                     _pending_settle = self._pending_cancel_wallet_ids(eq_side)
                     if _pending_settle:
                         self._force_requote[eq_side] = True
-                        log_event(
+                        self._log_pending_cancel_notice(
                             "warning",
                             "emergency_requote_deferred_pending_cancel_settle",
                             f"Emergency {eq_side} requote deferred — "
                             f"{len(_pending_settle)} wallet-active pending cancel(s) "
                             f"must settle before replacement offers are created",
+                            side=eq_side,
+                            pending_count=len(_pending_settle),
                             data={
                                 "side": eq_side,
                                 "pending_count": len(_pending_settle),
