@@ -11,9 +11,11 @@ Key responsibilities:
       kwargs dict with CREATE_NO_WINDOW or DETACHED_PROCESS flags
     - Optional CREATE_NEW_PROCESS_GROUP for children that need their own
       signal group
+    - Optional CREATE_BREAKAWAY_FROM_JOB for external apps that must survive
+      CATalyst's kill-on-close Windows Job Object
     - Cross-platform safe: returns `{}` when `os.name != "nt"`
 
-Used by anything that launches a child process (Sage daemon, Splash
+Used by anything that launches a child process (Sage wallet, Splash
 binary, coin-prep worker, PyInstaller build subprocesses).
 """
 
@@ -24,7 +26,12 @@ import subprocess
 from typing import Dict, Any
 
 
-def hidden_subprocess_kwargs(*, detached: bool = False, new_process_group: bool = False) -> Dict[str, Any]:
+def hidden_subprocess_kwargs(
+    *,
+    detached: bool = False,
+    new_process_group: bool = False,
+    breakaway_from_job: bool = False,
+) -> Dict[str, Any]:
     """Return subprocess kwargs that suppress Windows console windows.
 
     On non-Windows platforms this returns an empty dict.
@@ -39,6 +46,8 @@ def hidden_subprocess_kwargs(*, detached: bool = False, new_process_group: bool 
         creationflags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
     if new_process_group:
         creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    if breakaway_from_job:
+        creationflags |= getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
 
     kwargs: Dict[str, Any] = {}
     if creationflags:

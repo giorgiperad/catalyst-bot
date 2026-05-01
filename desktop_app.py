@@ -122,6 +122,14 @@ WINDOW_MIN_HEIGHT = 700
 # decide whether to show a native dialog instead of printing to the terminal.
 _CONSOLE_HIDDEN = _under_pythonw
 _RESPAWN_ENV = "BOT_GUI_RESPAWNED_UNDER_PYTHONW"
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800
+JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK = 0x00001000
+
+
+def _kill_on_close_job_limit_flags() -> int:
+    """Return the Windows Job Object flags used by the desktop parent."""
+    return JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK
 
 # Window geometry persistence — lives in the user data directory so
 # the setting survives installs to read-only locations like Program Files.
@@ -496,7 +504,8 @@ def _attach_to_kill_on_close_job() -> bool:
     Windows 8+ via nested-job support. We hold the job handle for the
     lifetime of this process; when the kernel releases it on exit, the
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE flag terminates everything still
-    running in the job.
+    running in the job. The job also allows explicit child breakaway so
+    independently owned external apps can survive CATalyst shutdown.
 
     Returns True on success. False on platforms / Windows versions where
     nested jobs aren't supported — non-fatal, startup continues without
@@ -512,7 +521,6 @@ def _attach_to_kill_on_close_job() -> bool:
         return False
 
     JobObjectExtendedLimitInformation = 9
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 
     class _IO_COUNTERS(ctypes.Structure):
         _fields_ = [
@@ -564,7 +572,7 @@ def _attach_to_kill_on_close_job() -> bool:
             return False
 
         limits = _EXTENDED_LIMIT()
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        limits.BasicLimitInformation.LimitFlags = _kill_on_close_job_limit_flags()
         if not kernel32.SetInformationJobObject(
             h_job, JobObjectExtendedLimitInformation,
             ctypes.byref(limits), ctypes.sizeof(limits),
@@ -1250,10 +1258,9 @@ def main(argv=None):
         _open_existing_instance_in_browser()
         return 0
 
-    # Kill-on-close Job Object: ensures every child process (coin-prep
-    # worker, Sage if we launched it, etc.) dies when this parent dies,
-    # even on Task Manager force-kill. Closes the orphan-worker class of
-    # bug that survived the singleton lock alone.
+    # Kill-on-close Job Object: ensures default child processes (coin-prep
+    # workers, helper commands, etc.) die when this parent dies, even on
+    # Task Manager force-kill. External apps can opt into breakaway.
     _attach_to_kill_on_close_job()
 
     # Auto-recover the SQLite DB if the previous run left it corrupt.

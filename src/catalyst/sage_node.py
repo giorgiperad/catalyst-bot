@@ -1179,8 +1179,9 @@ def _detect_sage_cert_path() -> Optional[str]:
 def _launch_sage_exe(exe_path: str) -> bool:
     """Launch sage-tauri.exe as a separate process.
 
-    Uses subprocess.Popen with Windows CREATE_NEW_PROCESS_GROUP
-    so Sage runs independently of the bot's console.
+    Uses subprocess.Popen with Windows CREATE_NEW_PROCESS_GROUP and
+    CREATE_BREAKAWAY_FROM_JOB so Sage runs independently of CATalyst's
+    console and kill-on-close process job.
 
     Args:
         exe_path: Full path to sage-tauri.exe
@@ -1196,10 +1197,31 @@ def _launch_sage_exe(exe_path: str) -> bool:
 
     try:
         if _sys.platform == "win32":
-            proc = subprocess.Popen(
-                [exe_path],
-                **hidden_subprocess_kwargs(detached=True, new_process_group=True),
-            )
+            try:
+                proc = subprocess.Popen(
+                    [exe_path],
+                    **hidden_subprocess_kwargs(
+                        detached=True,
+                        new_process_group=True,
+                        breakaway_from_job=True,
+                    ),
+                )
+            except OSError as breakaway_error:
+                print(
+                    "[Sage] Breakaway launch failed; retrying without job breakaway: "
+                    f"{breakaway_error}",
+                    flush=True,
+                )
+                log_event(
+                    "warning",
+                    "sage_startup_breakaway_failed",
+                    "Sage launch could not break away from the app process job; "
+                    "retrying without breakaway",
+                )
+                proc = subprocess.Popen(
+                    [exe_path],
+                    **hidden_subprocess_kwargs(detached=True, new_process_group=True),
+                )
         else:
             proc = subprocess.Popen([exe_path])
 
