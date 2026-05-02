@@ -45,4 +45,7 @@ def test_live_market_health_fallback_recomputes_inner_spread_from_edges():
     assert "mid_price: data.mid_price," in html
     assert "const liveBid = parseFloat(metrics.our_best_bid || 0);" in html
     assert "const liveAsk = parseFloat(metrics.our_best_ask || 0);" in html
+    assert "let liveMid = parseFloat" in html
+    assert "if (!(liveMid > 0) && liveBid > 0 && liveAsk > liveBid)" in html
+    assert "liveMid = (liveBid + liveAsk) / 2;" in html
     assert "metrics.your_spread_bps = ((liveAsk - liveBid) / liveMid) * 10000;" in html

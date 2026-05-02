@@ -1063,6 +1063,8 @@ class RiskManager:
                     ))
                 except Exception:
                     _mid = Decimal("0")
+                if _mid <= 0 and _best_bid > 0 and _best_ask > _best_bid:
+                    _mid = (_best_bid + _best_ask) / Decimal("2")
                 if _best_bid > 0 and _best_ask > _best_bid and _mid > 0:
                     _actual_gap_bps = (_best_ask - _best_bid) / _mid * Decimal("10000")
                     metrics["your_spread_bps"] = str(_actual_gap_bps)

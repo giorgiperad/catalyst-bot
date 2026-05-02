@@ -24587,7 +24587,10 @@
             });
             const liveBid = parseFloat(metrics.our_best_bid || 0);
             const liveAsk = parseFloat(metrics.our_best_ask || 0);
-            const liveMid = parseFloat(extra.mid_price || metrics.mid_price || (bot_state && bot_state.mid_price) || 0);
+            let liveMid = parseFloat(extra.mid_price || metrics.mid_price || (bot_state && bot_state.mid_price) || 0);
+            if (!(liveMid > 0) && liveBid > 0 && liveAsk > liveBid) {
+                liveMid = (liveBid + liveAsk) / 2;
+            }
             if (liveBid > 0 && liveAsk > liveBid && liveMid > 0) {
                 metrics.your_spread_bps = ((liveAsk - liveBid) / liveMid) * 10000;
             }

@@ -455,6 +455,24 @@ class TestMarketHealthInnerSpread(unittest.TestCase):
             Decimal("300"),
         )
 
+    def test_uses_live_bot_bid_ask_midpoint_when_mid_price_missing(self):
+        rm = _make_rm()
+        rm._bot_ref = type("Bot", (), {
+            "_last_live_offer_edges": {
+                "our_best_bid": "0.99",
+                "our_best_ask": "1.02",
+            },
+            "_bot_state": {"mid_price": "0"},
+        })()
+
+        health = rm.get_market_health()
+
+        expected_bps = (Decimal("1.02") - Decimal("0.99")) / Decimal("1.005") * Decimal("10000")
+        self.assertAlmostEqual(
+            Decimal(health["metrics"]["your_spread_bps"]),
+            expected_bps,
+        )
+
     def test_crossed_live_bot_edges_fall_back_to_configured_spread(self):
         rm = _make_rm()
         rm._bot_ref = type("Bot", (), {
