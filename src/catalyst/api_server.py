@@ -227,7 +227,7 @@ def _is_rate_limited(endpoint: str) -> bool:
 
 _dbx_pair_cache = {}
 _LOCAL_API_TOKEN_HEADER = "X-Bot-Local-Token"
-_LOCAL_API_QUERY_PARAM = "_local_token"
+_LOCAL_API_COOKIE = "catalyst_local_session"
 _LOCAL_API_TOKEN = os.environ.get("BOT_LOCAL_WRITE_TOKEN") or secrets.token_urlsafe(32)
 os.environ["BOT_LOCAL_WRITE_TOKEN"] = _LOCAL_API_TOKEN
 
@@ -611,10 +611,27 @@ def _is_loopback_addr(addr: str) -> bool:
 def _has_valid_local_token() -> bool:
     supplied = (
         request.headers.get(_LOCAL_API_TOKEN_HEADER, "")
-        or request.args.get(_LOCAL_API_QUERY_PARAM, "")
+        or request.cookies.get(_LOCAL_API_COOKIE, "")
     )
     supplied = str(supplied or "")
     return bool(supplied) and secrets.compare_digest(supplied, _LOCAL_API_TOKEN)
+
+
+def _request_origin_matches_app() -> bool:
+    """Allow browser write requests only from the app's own origin."""
+    raw_origin = request.headers.get("Origin", "")
+    if not raw_origin:
+        return True
+    try:
+        parsed = urlparse(str(raw_origin).strip())
+    except Exception:
+        return False
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return False
+    return (
+        _is_loopback_addr(parsed.hostname)
+        and parsed.netloc.lower() == (request.host or "").lower()
+    )
 
 
 def _get_sage_signing_block_reason():
@@ -641,23 +658,22 @@ def _get_sage_signing_block_reason():
 
 
 def _serve_bootstrapped_html(filename: str):
-    """Serve HTML with the local runtime token injected for same-machine use."""
+    """Serve HTML and bind the local runtime token to an HttpOnly cookie."""
     gui_dir = _APP_ROOT
     path = os.path.join(gui_dir, filename)
     with open(path, "r", encoding="utf-8") as f:
         html_doc = f.read()
 
-    bootstrap = (
-        "<script>"
-        f"window.__BOT_LOCAL_TOKEN={json.dumps(_LOCAL_API_TOKEN)};"
-        f"window.__BOT_LOCAL_TOKEN_HEADER={json.dumps(_LOCAL_API_TOKEN_HEADER)};"
-        "</script>"
+    response = Response(html_doc, mimetype="text/html")
+    response.set_cookie(
+        _LOCAL_API_COOKIE,
+        _LOCAL_API_TOKEN,
+        httponly=True,
+        samesite="Strict",
+        secure=False,
+        path="/",
     )
-    if "</head>" in html_doc:
-        html_doc = html_doc.replace("</head>", bootstrap + "\n</head>", 1)
-    else:
-        html_doc = bootstrap + html_doc
-    return Response(html_doc, mimetype="text/html")
+    return response
 
 
 class _QuietRequestFilter(logging.Filter):
@@ -1087,6 +1103,9 @@ def add_no_cache_headers(response):
             "font-src 'self' https://fonts.gstatic.com; "
             "img-src 'self' data: https://icons.dexie.space https://*.spacescan.io https://cdn.spacescan.io https://assets.spacescan.io; "
             "connect-src 'self'; "
+            "base-uri 'none'; "
+            "object-src 'none'; "
+            "form-action 'self'; "
             "frame-ancestors 'none'"
         )
     return response
@@ -1109,6 +1128,10 @@ def enforce_local_runtime_guard():
 
     if path == "/api/events" and not _has_valid_local_token():
         return Response("Unauthorized", status=401, mimetype="text/plain")
+
+    if request.method in {"POST", "PUT", "PATCH", "DELETE", "OPTIONS"} and path.startswith("/api/"):
+        if not _request_origin_matches_app():
+            return jsonify({"error": "origin_not_allowed"}), 403
 
     if request.method in {"POST", "PUT", "PATCH", "DELETE"} and path.startswith("/api/"):
         requires_token = path not in _TOKEN_EXEMPT_WRITE_ROUTES
@@ -2673,7 +2696,7 @@ from blueprints.offers import _build_fill_history_for_gui  # noqa: E402
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  Chia CAT Market Maker V2 — 'The Smart One'")
+    print("  CATalyst V2 - The Smart One")
     print("=" * 60)
 
     # --- Check for stale instance already running on port 5000 ---
@@ -2806,4 +2829,3 @@ if __name__ == "__main__":
         debug=False,
         threaded=True
     )
-

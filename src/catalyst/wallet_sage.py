@@ -71,7 +71,7 @@ def _generate_self_signed_cert(cert_path, key_path):
         key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         subject = issuer = x509.Name([
             x509.NameAttribute(NameOID.COMMON_NAME, "sage-bot-client"),
-            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "CAT Market Maker Bot"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "CATalyst Bot"),
         ])
         cert = (
             x509.CertificateBuilder()
@@ -4229,4 +4229,3 @@ def cat_to_mojos(amount: Decimal, decimals: int) -> int:
 def xch_to_mojos(amount: Decimal) -> int:
     """Convert XCH amount to mojos (1 XCH = 1e12 mojos)."""
     return int((amount * Decimal("1000000000000")).to_integral_value(ROUND_DOWN))
-

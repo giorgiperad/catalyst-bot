@@ -618,7 +618,7 @@ def start_flask_server():
     Start the Flask API server in the current thread.
     This runs in a daemon thread so it dies when the main process exits.
     """
-    # Import api_server â€” this triggers all the module imports and init
+    # Import api_server - this triggers all the module imports and init
     import api_server
 
     # Initialise database
@@ -971,12 +971,12 @@ def run_desktop_mode(dev_mode: bool = False):
     _cleanup()
     print("  Shutdown complete. Goodbye!", flush=True)
     time.sleep(0.5)  # Brief pause so user can see the shutdown messages
-    os._exit(0)  # Force exit â€” daemon threads (Flask, tray) won't block
+    os._exit(0)  # Force exit - daemon threads (Flask, tray) won't block
 
 
 def run_flask_mode():
     """Fallback: run as plain Flask server (like v3)."""
-    print(f"\n  {APP_NAME} v{APP_VERSION} â€” Flask Mode")
+    print(f"\n  {APP_NAME} v{APP_VERSION} - Flask Mode")
     print(f"  {'=' * 40}")
     print(f"  Open http://{FLASK_HOST}:{FLASK_PORT}/ in your browser")
     print("  Press Ctrl+C to stop\n")
@@ -1007,7 +1007,7 @@ _state = {
 def _detect_gui_backend():
     """Detect best PyWebView GUI backend for the current platform."""
     if sys.platform == "win32":
-        return "edgechromium"  # Edge WebView2 â€” best on Windows
+        return "edgechromium"  # Edge WebView2 - best on Windows
     elif sys.platform == "darwin":
         return None  # Default WebKit on macOS
     else:
@@ -1369,4 +1369,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
-

@@ -21,11 +21,16 @@ class TestApiLocalGuard(unittest.TestCase):
         self.loopback = {"REMOTE_ADDR": "127.0.0.1"}
         api_server._rate_limit_log.clear()
 
-    def test_root_injects_local_token(self):
+    def test_root_sets_http_only_local_session_cookie_without_injecting_token(self):
         resp = self.client.get("/", environ_base=self.loopback)
         body = resp.get_data(as_text=True)
         self.assertEqual(resp.status_code, 200)
-        self.assertIn("window.__BOT_LOCAL_TOKEN", body)
+        self.assertNotIn("window.__BOT_LOCAL_TOKEN", body)
+        self.assertNotIn("BOT_LOCAL_WRITE_TOKEN", body)
+        cookie_header = resp.headers.get("Set-Cookie", "")
+        self.assertIn("catalyst_local_session=", cookie_header)
+        self.assertIn("HttpOnly", cookie_header)
+        self.assertIn("SameSite=Strict", cookie_header)
 
     def test_debug_routes_are_disabled(self):
         resp = self.client.get("/api/debug/pricing", environ_base=self.loopback)
@@ -38,6 +43,21 @@ class TestApiLocalGuard(unittest.TestCase):
     def test_events_require_local_token(self):
         resp = self.client.get("/api/events", environ_base=self.loopback)
         self.assertEqual(resp.status_code, 401)
+
+    def test_cookie_auth_reaches_write_handler(self):
+        self.client.get("/", environ_base=self.loopback)
+        resp = self.client.post("/api/bot/stop", environ_base=self.loopback)
+        self.assertNotEqual(resp.status_code, 401)
+
+    def test_cross_origin_write_is_rejected_even_with_cookie(self):
+        self.client.get("/", environ_base=self.loopback)
+        resp = self.client.post(
+            "/api/bot/stop",
+            headers={"Origin": "http://127.0.0.1:9999"},
+            environ_base=self.loopback,
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.get_json()["error"], "origin_not_allowed")
 
     def test_console_route_returns_404_when_console_removed(self):
         resp = self.client.get("/console", environ_base=self.loopback)

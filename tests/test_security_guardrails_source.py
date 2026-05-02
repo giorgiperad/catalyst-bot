@@ -60,6 +60,15 @@ class SecurityGuardrailSourceTests(unittest.TestCase):
         self.assertIn("window.__CATALYST_DEBUG_LOGS", source)
         self.assertNotRegex(source, r"\bconsole\.(log|warn|error|debug)\(")
 
+    def test_local_write_token_is_not_exposed_to_frontend_javascript(self):
+        api_source = (ROOT / "api_server.py").read_text(encoding="utf-8")
+        gui_source = (REPO_ROOT / "bot_gui.html").read_text(encoding="utf-8")
+        self.assertNotIn("window.__BOT_LOCAL_TOKEN", api_source)
+        self.assertNotIn("window.__BOT_LOCAL_TOKEN", gui_source)
+        self.assertNotIn("_local_token", gui_source)
+        self.assertIn("httponly=True", api_source)
+        self.assertIn('samesite="Strict"', api_source)
+
 
 if __name__ == "__main__":
     unittest.main()

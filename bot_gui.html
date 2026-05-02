@@ -14304,8 +14304,6 @@
         // =================================================================
         // Use relative URL so it works from both 127.0.0.1 (PyWebView) and localhost (browser)
         const API_URL = '/api';
-        const LOCAL_API_TOKEN = window.__BOT_LOCAL_TOKEN || '';
-        const LOCAL_API_TOKEN_HEADER = window.__BOT_LOCAL_TOKEN_HEADER || 'X-Bot-Local-Token';
 
         function escapeHtml(value) {
             const div = document.createElement('div');
@@ -14356,9 +14354,6 @@
                     input instanceof URL ? input.href : String(input),
                     window.location.origin
                 );
-                if (LOCAL_API_TOKEN && url.origin === window.location.origin && url.pathname === '/api/events') {
-                    url.searchParams.set('_local_token', LOCAL_API_TOKEN);
-                }
                 if (typeof input === 'string' && !/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(input)) {
                     return url.pathname + url.search + url.hash;
                 }
@@ -14376,11 +14371,8 @@
                         input instanceof URL ? input.href : String(input),
                         window.location.origin
                     );
-                    if (LOCAL_API_TOKEN && url.origin === window.location.origin && url.pathname.startsWith('/api/')) {
+                    if (url.origin === window.location.origin && url.pathname.startsWith('/api/')) {
                         const options = init ? { ...init } : {};
-                        const headers = new Headers(options.headers || undefined);
-                        headers.set(LOCAL_API_TOKEN_HEADER, LOCAL_API_TOKEN);
-                        options.headers = headers;
                         if (typeof input === 'string' || input instanceof URL) {
                             input = buildLocalApiUrl(input);
                         }
@@ -34923,4 +34915,3 @@ document.addEventListener('DOMContentLoaded', () => {
 </script>
 </body>
 </html>
-
