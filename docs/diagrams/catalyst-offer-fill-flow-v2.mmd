@@ -5,10 +5,18 @@ config:
   themeVariables:
     fontFamily: "Inter, system-ui, -apple-system, sans-serif"
     fontSize: 14px
-    primaryColor: "#0f172a"
-    primaryTextColor: "#e2e8f0"
-    primaryBorderColor: "#475569"
-    lineColor: "#94a3b8"
+    background: "#ffffff"
+    mainBkg: "#f8fafc"
+    primaryColor: "#f8fafc"
+    primaryTextColor: "#0f172a"
+    primaryBorderColor: "#cbd5e1"
+    lineColor: "#64748b"
+    secondaryColor: "#ffffff"
+    tertiaryColor: "#f1f5f9"
+    clusterBkg: "#f8fafc"
+    clusterBorder: "#e2e8f0"
+    titleColor: "#334155"
+    edgeLabelBackground: "#ffffff"
 ---
 flowchart TB
 
@@ -136,15 +144,15 @@ flowchart TB
   %% =========================================================
   %%  STYLING
   %% =========================================================
-  classDef trigger  fill:#3b0764,stroke:#a855f7,color:#f3e8ff,stroke-width:2px
-  classDef intel    fill:#14532d,stroke:#4ade80,color:#dcfce7,stroke-width:2px
-  classDef creator  fill:#78350f,stroke:#fbbf24,color:#fef3c7,stroke-width:2px
-  classDef wallet   fill:#1e3a8a,stroke:#60a5fa,color:#dbeafe,stroke-width:3px
-  classDef external fill:#1e3a8a,stroke:#60a5fa,color:#dbeafe,stroke-width:2px
-  classDef subproc  fill:#7f1d1d,stroke:#f87171,color:#fee2e2,stroke-width:2px,stroke-dasharray:5 5
-  classDef state    fill:#334155,stroke:#94a3b8,color:#e2e8f0,stroke-width:2px
-  classDef core     fill:#7c2d12,stroke:#fb923c,color:#fff7ed,stroke-width:3px
-  classDef decision fill:#365314,stroke:#a3e635,color:#ecfccb,stroke-width:2px
+  classDef trigger  fill:#f5f3ff,stroke:#7c3aed,color:#3b0764,stroke-width:2px
+  classDef intel    fill:#ecfdf5,stroke:#059669,color:#064e3b,stroke-width:2px
+  classDef creator  fill:#fff7ed,stroke:#ea580c,color:#7c2d12,stroke-width:2px
+  classDef wallet   fill:#eff6ff,stroke:#2563eb,color:#172554,stroke-width:3px
+  classDef external fill:#eff6ff,stroke:#2563eb,color:#172554,stroke-width:2px
+  classDef subproc  fill:#fef2f2,stroke:#dc2626,color:#7f1d1d,stroke-width:2px,stroke-dasharray:5 5
+  classDef state    fill:#f8fafc,stroke:#64748b,color:#0f172a,stroke-width:2px
+  classDef core     fill:#ffedd5,stroke:#f97316,color:#7c2d12,stroke-width:3px
+  classDef decision fill:#f7fee7,stroke:#65a30d,color:#365314,stroke-width:2px
 
   class TICK,MEMP,SHOCK trigger
   class RM,CM intel
