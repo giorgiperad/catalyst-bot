@@ -60,6 +60,46 @@ def test_min_spread_clamp_copy_is_diagnostic_not_directive():
     assert "normalizeMarketConditionText" in html
     assert "raise MIN_SPREAD_BPS" not in html
 
+def test_max_spread_clamp_recommendation_opens_running_settings():
+    html = GUI.read_text(encoding="utf-8", errors="replace")
+
+    assert 'id="settings-section-smart-pricing"' in html
+    assert "reviewMaxSpread" in html
+    assert "Review Max Spread" in html
+    assert "actionType: 'reviewMaxSpread'" in html
+    assert "Settings > Setup > Smart Pricing" in html
+    assert "settingsSwitchSubview('setup')" in html
+    assert "configMaxSpreadBps" in html
+    assert "future requotes and new offers" in html
+
+
+def test_live_controls_points_max_spread_users_to_setup():
+    html = GUI.read_text(encoding="utf-8", errors="replace")
+
+    assert "Max Spread caps live in Setup > Smart Pricing" in html
+
+
+def test_spread_tighten_recommendations_pause_at_max_spread_clamp():
+    html = GUI.read_text(encoding="utf-8", errors="replace")
+
+    assert "const maxSpreadClampActive" in html
+    assert "if (!_gapCloserActive && !maxSpreadClampActive" in html
+    assert "fillsHr === 0 && !maxSpreadClampActive" in html
+
+
+def test_inventory_drift_advisor_uses_backend_position_percent():
+    html = GUI.read_text(encoding="utf-8", errors="replace")
+
+    assert "const positionLoadPct" in html
+    assert "positionLoadPct > 70" in html
+    assert "Math.abs(netPos) > maxPos * 0.7" not in html
+
+
+def test_advisor_fill_rate_reads_dashboard_field_name():
+    html = GUI.read_text(encoding="utf-8", errors="replace")
+
+    assert "perf.fill_rate_per_hour ?? perf.fills_per_hour" in html
+
 
 def test_running_settings_restart_warning_is_setup_only():
     html = GUI.read_text(encoding="utf-8", errors="replace")

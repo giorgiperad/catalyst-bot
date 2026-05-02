@@ -474,5 +474,30 @@ class TestMarketHealthInnerSpread(unittest.TestCase):
         )
 
 
+    def test_max_spread_clamp_is_advisory_not_unhealthy(self):
+        rm = _make_rm()
+        max_spread = _fake_cfg.MAX_SPREAD_BPS / Decimal("10000")
+        rm.get_adjusted_spread = lambda _side: max_spread
+        rm._market_intel = type("MarketIntel", (), {
+            "get_market_summary": lambda self: {
+                "orderbook_refreshes": 1,
+                "orderbook_age_secs": 1,
+                "num_competitor_buys": 1,
+                "num_competitor_sells": 1,
+                "competitor_spread_bps": "600",
+                "overall_spread_bps": "500",
+            }
+        })()
+
+        health = rm.get_market_health(loop_count=3)
+
+        condition_text = " ".join(c["text"] for c in health["conditions"])
+        self.assertEqual(health["status"], "green")
+        self.assertEqual(health["message"], "Market healthy — bot operating normally")
+        self.assertNotIn("MAX_SPREAD_BPS", condition_text)
+        self.assertEqual(Decimal(health["metrics"]["buy_spread_bps"]), _fake_cfg.MAX_SPREAD_BPS)
+        self.assertEqual(Decimal(health["metrics"]["sell_spread_bps"]), _fake_cfg.MAX_SPREAD_BPS)
+
+
 if __name__ == "__main__":
     unittest.main()

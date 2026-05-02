@@ -10172,6 +10172,7 @@
                     <div class="v4-settings-subview" id="settingsLiveView">
                         <div style="font-size: 12px; color: var(--text-secondary); margin-bottom: 12px; padding: 10px 14px; background: rgba(96,165,250,0.05); border: 1px solid rgba(96,165,250,0.18); border-radius: 8px;">
                             <strong style="color: var(--info-300);">Live Controls</strong> — these settings hot-reload on the next loop cycle. Safe to change while the bot is running.
+                            <span style="display:block; margin-top:4px;">Max Spread caps live in Setup > Smart Pricing.</span>
                         </div>
                         <!-- Live Controls markup moves here from the dashboard during initial page load.
                              Element id remains #liveControls so existing JS handlers keep working. -->
@@ -10747,7 +10748,7 @@
                     </div>
 
                     <!-- ══ SECTION: Smart Pricing ══ -->
-                    <div class="v4-settings-section v4-settings-amber">
+                    <div class="v4-settings-section v4-settings-amber" id="settings-section-smart-pricing">
                         <div class="v4-settings-section-title" style="color: var(--warning-300);">Smart Pricing <span class="cc-help">?<span class="cc-tooltip">Dynamic spread calculation and inventory-aware skewing. When enabled, spreads auto-adjust based on volatility, pool depth, fill rate, and your position.</span></span></div>
 
                         <!-- Dynamic Spreads -->
@@ -15624,6 +15625,8 @@
                     return 'Fix price rail in Settings';
                 case 'reviewTopupPool':
                     return 'CAT top-up pool empty';
+                case 'reviewMaxSpread':
+                    return 'Max Spread clamp active';
                 case 'reserveFloor':
                     return 'Reserve floor active — bot paused';
                 default:
@@ -15748,8 +15751,9 @@
                 mhMetrics.market_spread_bps ?? mh.competitor_spread_bps ?? 0
             ) || 0;
             const competitorPct = competitorBps / 100;
-            const fillsHr = parseFloat(perf.fills_per_hour || 0);
+            const fillsHr = parseFloat(perf.fill_rate_per_hour ?? perf.fills_per_hour ?? 0) || 0;
             const netPos = parseFloat(perf.net_position || 0);
+            const positionLoadPct = parseFloat(mhMetrics.position_pct ?? 0) || 0;
             const maxPos = parseFloat(s.inventory && s.inventory.max_position_xch || 5);
             const targetOpenBuys = parseInt(trading.max_active_buy ?? 0, 10) || 0;
             const targetOpenSells = parseInt(trading.max_active_sell ?? 0, 10) || 0;
@@ -15901,6 +15905,26 @@
             });
 
             // ── Price rail check — highest priority, blocks everything ──
+            const dynamicSpreadsEnabled = !!spreads.dynamic_enabled
+                || String(spreads.mode || '').toLowerCase() === 'dynamic';
+            const buyDynamicBps = parseFloat(mhMetrics.buy_spread_bps ?? 0) || 0;
+            const sellDynamicBps = parseFloat(mhMetrics.sell_spread_bps ?? 0) || 0;
+            const maxSpreadClampActive = isRunning
+                && dynamicSpreadsEnabled
+                && maxBps > 0
+                && (buyDynamicBps >= maxBps - 0.5 || sellDynamicBps >= maxBps - 0.5);
+            if (maxSpreadClampActive) {
+                pushSuggestion({
+                    type: 'warning',
+                    icon: '!',
+                    title: 'Max Spread clamp active',
+                    msg: 'High volatility has widened dynamic spreads to your Max Spread cap. This is protective, so you can dismiss it. To trade tighter, go to Settings > Setup > Smart Pricing > Max Spread. Saving while running affects future requotes and new offers.',
+                    action: 'Review Max Spread',
+                    actionType: 'reviewMaxSpread',
+                    actionValue: 'max_spread'
+                });
+            }
+
             const hardMax = parseFloat(safety.hard_max_price) || 0;
             const hardMin = parseFloat(safety.hard_min_price) || 0;
             const currentMid = parseFloat(bot_state?.pricing?.mid) || 0;
@@ -16082,7 +16106,7 @@
                 // reflects competitor/pool widening. Anchoring on the adjusted
                 // spread produced targets wider than BASE and the "Tighten"
                 // button silently widened the user's config.
-                if (!_gapCloserActive && baseBps > 400 && !_spreadCooldownActive) {
+                if (!_gapCloserActive && !maxSpreadClampActive && baseBps > 400 && !_spreadCooldownActive) {
                     // Arb-gap reliability gate: the arb gap is computed
                     // against Dexie's price, which falls back to a stale
                     // 24h average for thin/illiquid pairs. Without legit
@@ -16191,7 +16215,7 @@
                     }
                 }
 
-                if (Math.abs(netPos) > maxPos * 0.7) {
+                if (positionLoadPct > 70) {
                     const direction = netPos > 0 ? 'long CAT' : 'short CAT';
                     if (!inventoryMgmtEnabled) {
                         pushSuggestion({
@@ -16218,7 +16242,7 @@
                 // and saying "competitors are tighter at 0.0%" is internally
                 // contradictory. Gate the entire branch on competitorBps > 0.
                 const spreadGapBps = baseBps - competitorBps;
-                if (fillsHr === 0 && competitorCount > 0 && competitorBps > 0 && arbGapBps < 60 && !bothSidesAtEdge && !_spreadCooldownActive) {
+                if (fillsHr === 0 && !maxSpreadClampActive && competitorCount > 0 && competitorBps > 0 && arbGapBps < 60 && !bothSidesAtEdge && !_spreadCooldownActive) {
                     // The Spacescan "token still maturing" tip relies on
                     // holder/activity levels that may be stale (rate-limited
                     // 24h cache). If the cache is past the 12h freshness
@@ -16542,6 +16566,28 @@
                     setTimeout(() => {
                         const topupEl = document.getElementById('settings-section-topup');
                         if (topupEl) topupEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    }, 300);
+                    return;
+                }
+                case 'reviewMaxSpread': {
+                    if (typeof v4SwitchView === 'function') v4SwitchView('settings');
+                    else if (typeof switchView === 'function') switchView('settings');
+                    else {
+                        const settingsTab = document.querySelector('[data-view="settings"]');
+                        if (settingsTab) settingsTab.click();
+                    }
+                    if (typeof settingsSwitchSubview === 'function') settingsSwitchSubview('setup');
+                    setTimeout(() => {
+                        const smartPricingEl = document.getElementById('settings-section-smart-pricing');
+                        if (smartPricingEl) smartPricingEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                        const maxSpreadInput = document.getElementById('configMaxSpreadBps');
+                        if (maxSpreadInput) {
+                            maxSpreadInput.focus({ preventScroll: true });
+                            if (typeof maxSpreadInput.select === 'function') maxSpreadInput.select();
+                            const previousShadow = maxSpreadInput.style.boxShadow;
+                            maxSpreadInput.style.boxShadow = '0 0 0 2px rgba(251, 191, 36, 0.65)';
+                            setTimeout(() => { maxSpreadInput.style.boxShadow = previousShadow; }, 2200);
+                        }
                     }, 300);
                     return;
                 }
@@ -26163,6 +26209,7 @@
             'openLiveControls',
             'activateGapCloser',
             'reviewTopupPool',
+            'reviewMaxSpread',
             'reserveFloor'
         ]);
         const ACTIONABLE_ALERT_IDS = new Set([

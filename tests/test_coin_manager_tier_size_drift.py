@@ -5,8 +5,8 @@ import database
 from config import cfg
 
 
-def _coin(amount_mojos):
-    return {"amount_mojos": int(amount_mojos)}
+def _coin(amount_mojos, status="free"):
+    return {"amount_mojos": int(amount_mojos), "status": status}
 
 
 def _patch_drift_inputs(monkeypatch, amounts_by_key):
@@ -41,6 +41,31 @@ def test_standalone_drift_flags_under_floor_coins(monkeypatch):
     assert findings[0]["side"] == "xch"
     assert findings[0]["tier"] == "inner"
     assert findings[0]["ratio"] == 0.97
+
+def test_standalone_drift_ignores_locked_offer_coins(monkeypatch):
+    monkeypatch.setattr(cfg, "TIER_ENABLED", True, raising=False)
+    monkeypatch.setattr(cfg, "COIN_MAX_SIZE_RATIO", 1.5, raising=False)
+
+    def fake_tier_sizes(is_cat=False):
+        return {"inner": 1000, "mid": 500, "outer": 250, "extreme": 125}
+
+    def fake_coins(wallet_type, designation, tier):
+        assert designation == "tier_spare"
+        if (wallet_type, tier) == ("cat", "outer"):
+            return [
+                _coin(250, status="free"),
+                _coin(250, status="free"),
+                _coin(220, status="locked"),
+                _coin(220, status="locked"),
+            ]
+        return []
+
+    monkeypatch.setattr(coin_manager, "get_tier_sizes_mojos_from_cfg", fake_tier_sizes)
+    monkeypatch.setattr(database, "get_coins_by_designation", fake_coins)
+
+    findings = coin_manager.check_tier_size_drift_standalone()
+
+    assert findings == []
 
 
 def test_standalone_drift_flags_above_configured_max_ratio(monkeypatch):

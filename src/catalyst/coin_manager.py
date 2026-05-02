@@ -481,6 +481,7 @@ def check_tier_size_drift_standalone(
                 int(c.get("amount_mojos") or 0)
                 for c in coins
                 if int(c.get("amount_mojos") or 0) > 0
+                and str(c.get("status") or "free").lower() == "free"
             )
             if len(amounts) < max(1, int(min_sample)):
                 continue
@@ -3704,6 +3705,7 @@ class CoinManager:
                     int(c.get("amount_mojos") or 0)
                     for c in coins
                     if int(c.get("amount_mojos") or 0) > 0
+                    and str(c.get("status") or "free").lower() == "free"
                 )
                 if len(amounts) < max(1, int(min_sample)):
                     continue
