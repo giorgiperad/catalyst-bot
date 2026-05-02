@@ -10,6 +10,7 @@ Covers functions not previously tested:
 import sys
 import types
 import unittest
+from datetime import datetime, timezone
 from decimal import Decimal
 from unittest.mock import patch
 
@@ -274,6 +275,33 @@ class TestPositionSanityDepositDetection(_PatchedCfg):
 
         self.assertIsNotNone(match)
         self.assertEqual(match["amount_mojos"], 193_886_291)
+
+    def test_delta_matching_old_cat_deposit_before_baseline_is_ignored(self):
+        class _Conn:
+            def execute(self, *_args, **_kwargs):
+                return self
+
+            def fetchall(self):
+                return [{
+                    "coin_id": "0xolddeposit",
+                    "amount_mojos": 193_886_291,
+                    "designation": "unknown",
+                    "first_seen": "2026-05-02 14:40:07",
+                }]
+
+        fake_db = types.ModuleType("database")
+        fake_db.get_connection = lambda: _Conn()
+        fake_db.get_setting = lambda *_args, **_kwargs: ""
+        baseline_at = datetime(2026, 5, 2, 14, 45, 0, tzinfo=timezone.utc).timestamp()
+
+        with patch.dict(sys.modules, {"database": fake_db}):
+            match = bot_loop._find_cat_deposit_for_position_delta(
+                Decimal("193886.291"),
+                Decimal("1000"),
+                baseline_at,
+            )
+
+        self.assertIsNone(match)
 
 
 class TestBotLoopWiring(_PatchedCfg):

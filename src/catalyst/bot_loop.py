@@ -129,6 +129,11 @@ def _find_cat_deposit_for_position_delta(delta_cat, scale, baseline_at=0):
     except Exception:
         return None
 
+    try:
+        baseline_ts = float(baseline_at or 0)
+    except Exception:
+        baseline_ts = 0
+
     for row in rows or []:
         try:
             coin_id = row["coin_id"]
@@ -139,6 +144,24 @@ def _find_cat_deposit_for_position_delta(delta_cat, scale, baseline_at=0):
             continue
         if not coin_id or amount <= 0:
             continue
+        if baseline_ts > 0 and first_seen:
+            try:
+                if isinstance(first_seen, (int, float)):
+                    first_seen_ts = float(first_seen)
+                else:
+                    first_seen_raw = str(first_seen).strip()
+                    if first_seen_raw.endswith("Z"):
+                        first_seen_raw = first_seen_raw[:-1] + "+00:00"
+                    first_seen_dt = datetime.fromisoformat(
+                        first_seen_raw.replace(" ", "T", 1)
+                    )
+                    if first_seen_dt.tzinfo is None:
+                        first_seen_dt = first_seen_dt.replace(tzinfo=timezone.utc)
+                    first_seen_ts = first_seen_dt.timestamp()
+                if first_seen_ts < baseline_ts:
+                    continue
+            except Exception:
+                pass
         return {
             "coin_id": coin_id,
             "amount_mojos": amount,
