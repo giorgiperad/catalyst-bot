@@ -253,6 +253,33 @@ class NeedsTopupThresholdTests(unittest.TestCase):
         self.assertTrue(mgr.needs_topup())
         self.assertTrue(mgr._topup_is_drip)
 
+    def test_sniper_drip_waits_when_cat_pool_has_no_source(self):
+        """Do not start noisy drip topups for optional CAT sniper gaps with no pool."""
+        self._ns.SNIPER_ENABLED = True
+        self._ns.SNIPER_PREP_COUNT = 25
+        self._ns.SNIPER_SIZE_XCH = "0.001"
+        self._ns.TIER_DRIP_PCT = 100
+
+        mgr = self._manager(cat_overrides={"sniper": 24})
+        mgr._last_topup_time = time.time()  # emergency is on cooldown
+        mgr._last_drip_time = 0             # proactive refill is allowed
+        mgr._cat_inventory = {
+            "reserve": [],
+            "inner": [],
+            "mid": [],
+            "outer": [],
+            "extreme": [],
+            "sniper": [{}] * 24,
+            "small": [],
+        }
+
+        with patch.object(self.cm, "log_event") as log_event:
+            self.assertFalse(mgr.needs_topup())
+
+        event_types = [call.args[1] for call in log_event.call_args_list]
+        self.assertIn("drip_source_unavailable", event_types)
+        self.assertNotIn("drip_trigger", event_types)
+
 
 # ────────────────────────────────────────────────────────────────────────────
 # Non-reversed ladder (BUY_LADDER_REVERSED=False)

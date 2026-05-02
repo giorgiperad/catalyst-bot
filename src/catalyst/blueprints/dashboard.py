@@ -21,6 +21,90 @@ from database import get_stats
 bp = Blueprint("dashboard", __name__)
 
 
+def _get_cfg_int(cfg, name: str, fallback: str | None = None) -> int:
+    value = getattr(cfg, name, None)
+    if value is None and fallback:
+        value = getattr(cfg, fallback, 0)
+    try:
+        return max(0, int(value or 0))
+    except Exception:
+        return 0
+
+
+def _build_coin_recommendations(cfg, coins: dict, is_running: bool) -> list[dict]:
+    """Build user-facing coin recommendations for the dashboard.
+
+    These are runtime nudges, not startup prep instructions. Full Coin Prep
+    cancels/rebuilds offers, so live recommendations should prefer adding or
+    allocating top-up fuel unless the bot explicitly has to stop and rebuild.
+    """
+    if not is_running or not getattr(cfg, "TIER_ENABLED", False):
+        return []
+    if not getattr(cfg, "ENABLE_SELL", True):
+        return []
+
+    tier_counts = (coins or {}).get("tier_counts") or {}
+    if not tier_counts.get("enabled", False):
+        return []
+
+    cat_counts = tier_counts.get("cat") or {}
+    cat_reserve_count = int(cat_counts.get("reserve", 0) or 0)
+    cat_dust_count = int(cat_counts.get("dust", 0) or 0)
+    if cat_reserve_count > 0 or cat_dust_count >= 2:
+        return []
+
+    targets = {
+        "inner": _get_cfg_int(cfg, "SELL_INNER_TIER_SPARE_COUNT", "INNER_TIER_SPARE_COUNT"),
+        "mid": _get_cfg_int(cfg, "SELL_MID_TIER_SPARE_COUNT", "MID_TIER_SPARE_COUNT"),
+        "outer": _get_cfg_int(cfg, "SELL_OUTER_TIER_SPARE_COUNT", "OUTER_TIER_SPARE_COUNT"),
+        "extreme": _get_cfg_int(cfg, "SELL_EXTREME_TIER_SPARE_COUNT", "EXTREME_TIER_SPARE_COUNT"),
+    }
+    try:
+        sniper_enabled = (
+            bool(getattr(cfg, "SNIPER_ENABLED", False))
+            and int(getattr(cfg, "SNIPER_PREP_COUNT", 0) or 0) > 0
+            and Decimal(str(getattr(cfg, "SNIPER_SIZE_XCH", "0") or "0")) > 0
+        )
+    except Exception:
+        sniper_enabled = False
+    if sniper_enabled:
+        targets["sniper"] = _get_cfg_int(cfg, "SNIPER_PREP_COUNT")
+
+    short = []
+    labels = {
+        "inner": "inner",
+        "mid": "mid",
+        "outer": "outer",
+        "extreme": "extreme",
+        "sniper": "sniper",
+    }
+    for tier, target in targets.items():
+        if target <= 0:
+            continue
+        have = int(cat_counts.get(tier, 0) or 0)
+        if have < target:
+            short.append(f"{labels.get(tier, tier)} {have}/{target}")
+
+    if not short:
+        return []
+
+    return [{
+        "id": "cat_topup_pool_empty",
+        "severity": "warning",
+        "title": "CAT top-up pool empty",
+        "message": (
+            "CAT spare coins are below target ("
+            + ", ".join(short[:4])
+            + "). The bot has no CAT top-up pool to split from. "
+            "Add CAT funds or allocate an incoming CAT coin to the top-up pool "
+            "so sell-side spares can be rebuilt while the bot keeps running."
+        ),
+        "action": "reviewTopupPool",
+        "action_label": "Review top-up pool",
+        "action_value": "cat",
+    }]
+
+
 @bp.route("/api/dashboard")
 def api_dashboard():
     """Aggregated endpoint for the Command Centre panel.
@@ -316,6 +400,15 @@ def api_dashboard():
                 tier_counts = get_live_tier_group_counts()
                 tier_counts["enabled"] = True
                 coins["tier_counts"] = tier_counts
+            try:
+                is_running = bool(bot and bot.is_running())
+            except Exception:
+                is_running = False
+            coins["recommendations"] = _build_coin_recommendations(
+                cfg,
+                coins,
+                is_running=is_running,
+            )
         except Exception:
             pass
 

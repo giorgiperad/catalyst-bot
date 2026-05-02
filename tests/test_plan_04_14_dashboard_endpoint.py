@@ -8,6 +8,7 @@ Tests GET /api/dashboard:
 
 import os
 import sys
+import types
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -15,9 +16,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
     import api_server
+    from blueprints import dashboard as dashboard_bp
     _SKIP = None
 except (ModuleNotFoundError, ImportError) as exc:
     api_server = None
+    dashboard_bp = None
     _SKIP = str(exc)
 
 
@@ -178,6 +181,60 @@ class TestDashboard(_FlaskBase):
             * api_server.Decimal("10000")
         )
         self.assertAlmostEqual(float(metrics["your_spread_bps"]), float(expected_bps), places=6)
+
+    def test_cat_topup_pool_empty_recommendation_does_not_suggest_coin_prep(self):
+        cfg = types.SimpleNamespace(
+            TIER_ENABLED=True,
+            ENABLE_SELL=True,
+            SNIPER_ENABLED=True,
+            SNIPER_PREP_COUNT=25,
+            SNIPER_SIZE_XCH="0.001",
+            SELL_INNER_TIER_SPARE_COUNT=8,
+            SELL_MID_TIER_SPARE_COUNT=4,
+            SELL_OUTER_TIER_SPARE_COUNT=5,
+            SELL_EXTREME_TIER_SPARE_COUNT=2,
+        )
+        coins = {
+            "tier_counts": {
+                "enabled": True,
+                "cat": {
+                    "inner": 8,
+                    "mid": 4,
+                    "outer": 5,
+                    "extreme": 2,
+                    "sniper": 24,
+                    "reserve": 0,
+                    "dust": 0,
+                },
+                "xch": {},
+            }
+        }
+
+        recs = dashboard_bp._build_coin_recommendations(cfg, coins, is_running=True)
+
+        self.assertTrue(recs)
+        rec = recs[0]
+        self.assertEqual(rec["id"], "cat_topup_pool_empty")
+        self.assertEqual(rec["action"], "reviewTopupPool")
+        self.assertIn("CAT top-up pool", rec["title"])
+        self.assertIn("allocate an incoming CAT coin", rec["message"])
+        self.assertNotIn("Coin Prep", rec["message"])
+
+    def test_shape_fix_coin_prep_halt_copy_is_explicitly_nuclear(self):
+        with open(os.path.join(os.path.dirname(os.path.dirname(__file__)), "bot_gui.html"),
+                  encoding="utf-8") as handle:
+            html = handle.read()
+
+        self.assertIn(
+            "Stop the bot, review Smart Settings, then run Coin Prep",
+            html,
+        )
+        self.assertNotIn(
+            "Could not produce tier-correct coins (run coin prep)",
+            html,
+        )
+        self.assertIn("'reviewTopupPool'", html)
+        self.assertIn("CAT top-up pool empty", html)
 
 
 if __name__ == "__main__":

@@ -207,7 +207,8 @@ def api_coin_prep():
     if bot.is_running():
         return jsonify({
             "error": "Stop the bot before manual coin prep. "
-                     "The bot handles coin prep automatically while running.",
+                     "Runtime top-up can refill prepared spares while running; "
+                     "full coin prep cancels and rebuilds the wallet layout.",
             "requires_stop": True,
         }), 409
 

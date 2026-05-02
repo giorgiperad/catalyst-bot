@@ -10389,7 +10389,7 @@
                          separate from the user's hard reserve (set in step 1
                          above) and represents the working budget Smart
                          Settings derives for topup headroom. -->
-                    <div class="v4-settings-section v4-settings-green" style="background: rgba(16,185,129,0.05);">
+                    <div class="v4-settings-section v4-settings-green" id="settings-section-topup" style="background: rgba(16,185,129,0.05);">
                         <div class="v4-settings-section-title" style="display: flex; align-items: center; gap: 6px; color: var(--status-success);">
                             Topup Pool
                             <span class="cc-help">?<span class="cc-tooltip" style="text-align: left; min-width: 280px;">
@@ -15622,6 +15622,8 @@
                     return 'Open Live Controls';
                 case 'openSettings':
                     return 'Fix price rail in Settings';
+                case 'reviewTopupPool':
+                    return 'CAT top-up pool empty';
                 case 'reserveFloor':
                     return 'Reserve floor active — bot paused';
                 default:
@@ -15655,7 +15657,7 @@
                 .map((item, index) => ({
                     id: makeAdvisorActionId(item.actionType, item.actionValue, index),
                     severity: getAdvisorActionSeverity(item.type),
-                    title: getAdvisorActionTitle(item.actionType),
+                    title: item.title || getAdvisorActionTitle(item.actionType),
                     message: item.msg,
                     action: item.actionType,
                     action_value: item.actionValue || '',
@@ -15881,6 +15883,22 @@
                 const a = _activeAlerts && _activeAlerts[String(id)];
                 return !!(a && !a.dismissed);
             };
+
+            const coinRecommendations = Array.isArray(coins.recommendations)
+                ? coins.recommendations
+                : [];
+            coinRecommendations.forEach((rec) => {
+                if (!rec || !rec.message) return;
+                pushSuggestion({
+                    type: rec.severity || 'warning',
+                    icon: '+',
+                    title: rec.title || 'Coin recommendation',
+                    msg: rec.message,
+                    action: rec.action_label || null,
+                    actionType: rec.action || null,
+                    actionValue: rec.action_value || ''
+                });
+            });
 
             // ── Price rail check — highest priority, blocks everything ──
             const hardMax = parseFloat(safety.hard_max_price) || 0;
@@ -16512,6 +16530,19 @@
                             if (safetyEl) safetyEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
                         }, 300);
                     }
+                    return;
+                }
+                case 'reviewTopupPool': {
+                    if (typeof v4SwitchView === 'function') v4SwitchView('settings');
+                    else if (typeof switchView === 'function') switchView('settings');
+                    else {
+                        const settingsTab = document.querySelector('[data-view="settings"]');
+                        if (settingsTab) settingsTab.click();
+                    }
+                    setTimeout(() => {
+                        const topupEl = document.getElementById('settings-section-topup');
+                        if (topupEl) topupEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    }, 300);
                     return;
                 }
                 case 'activateGapCloser': {
@@ -26128,6 +26159,7 @@
             'openSettings',
             'openLiveControls',
             'activateGapCloser',
+            'reviewTopupPool',
             'reserveFloor'
         ]);
         const ACTIONABLE_ALERT_IDS = new Set([
@@ -26768,7 +26800,7 @@
             timeout_waiting_for_confirmation: 'Timed out waiting for chain confirmation',
             timeout_reshape: 'Timed out waiting for coin reshape',
             position_guard_blocked: 'Position limit reached — waiting for opposite-side fills',
-            no_tier_correct_coins_possible: 'Could not produce tier-correct coins (run coin prep)',
+            no_tier_correct_coins_possible: 'Could not produce tier-correct coins. Stop the bot, review Smart Settings, then run Coin Prep.',
             cancel_rejected: 'Cancel rejected by storm protection',
             internal_error: 'Internal error — see logs',
         };

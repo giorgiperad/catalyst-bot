@@ -1,0 +1,145 @@
+---
+title: CATalyst — Coin Prep & Topup Flow
+config:
+  theme: base
+  themeVariables:
+    fontFamily: "Inter, system-ui, -apple-system, sans-serif"
+    fontSize: 14px
+    primaryColor: "#0f172a"
+    primaryTextColor: "#e2e8f0"
+    primaryBorderColor: "#475569"
+    lineColor: "#94a3b8"
+---
+flowchart TB
+
+  %% =========================================================
+  %%  DECISION — bot loop asks coin manager what's needed
+  %% =========================================================
+  BL(((Bot Loop)))
+  CM[Coin Manager<br/><i>tier classifier,<br/>topup planner</i>]
+
+  %% =========================================================
+  %%  READ — where current coin state comes from
+  %% =========================================================
+  subgraph READ["👀 &nbsp; Coin state inputs"]
+    direction LR
+    W([Sage wallet RPC<br/><i>balances + coin set</i>])
+    CS([Coinset.org<br/><i>fast cloud lookup</i>])
+  end
+
+  %% =========================================================
+  %%  COORDINATION — locks prevent racing prep + trading
+  %% =========================================================
+  subgraph LOCK["🔒 &nbsp; Coordination"]
+    RES[Reservation Manager<br/><i>leases on tier coins</i>]
+  end
+
+  %% =========================================================
+  %%  PLAN — what coin shape do we need
+  %% =========================================================
+  PLAN[/Split plan<br/>per tier × side/]
+
+  %% =========================================================
+  %%  EXECUTOR — separate subprocess
+  %% =========================================================
+  subgraph WORKER["⚙️ &nbsp; coin_prep_worker (subprocess)"]
+    direction TB
+    CP[[split executor]]
+    SF[/coin_prep_status.json/]
+  end
+
+  %% =========================================================
+  %%  WALLET WRITES — splits + topups + reconcile
+  %% =========================================================
+  subgraph WRITE["💸 &nbsp; Wallet writes"]
+    direction LR
+    SX[split_xch / split_cat]
+    TR[transfer / consolidate]
+  end
+
+  %% =========================================================
+  %%  STATE
+  %% =========================================================
+  DB[("SQLite WAL<br/><i>coins, leases,<br/>tier counts</i>")]
+
+  %% =========================================================
+  %%  CONSUMERS — who uses the prepared coins
+  %% =========================================================
+  subgraph CONS["🛠️ &nbsp; Consumers (need fee + side coins)"]
+    direction LR
+    OM[Offer Manager]
+    SN[Sniper]
+    BM[Boost Manager]
+  end
+
+  %% =========================================================
+  %%  UI — dashboard prep progress
+  %% =========================================================
+  API[Flask API + AppBridge]
+  UI([Dashboard UI])
+
+  %% ---------- Decisions: bot loop asks CM ----------
+  BL ==>|prep / topup<br/>decision| CM
+  CM -.->|spare counts<br/>tier health| BL
+
+  %% ---------- CM reads live state ----------
+  W  --> CM
+  CS --> CM
+
+  %% ---------- Locks ----------
+  CM <==> RES
+  RES <==> DB
+
+  %% ---------- CM emits a plan + dispatches ----------
+  CM ==> PLAN
+  PLAN ==>|hand off| CP
+
+  %% ---------- Worker drives wallet ----------
+  CP ==> SX
+  CP --> TR
+  SX ==> W
+  TR ==> W
+
+  %% ---------- Worker confirms via Coinset ----------
+  CS -. landed checks .-> CP
+
+  %% ---------- File-based progress handoff (key insight!) ----------
+  CP ==>|writes progress<br/>per phase| SF
+  SF -->|reads on poll| API
+
+  %% ---------- Worker also persists results ----------
+  CP ==> DB
+
+  %% ---------- CM topup + reconcile (no worker needed) ----------
+  CM ==>|topup + reconcile| W
+  CM <==> DB
+
+  %% ---------- Trading consumers pull fee + side coins ----------
+  CM -->|fee + side coins| OM
+  CM -->|fee + side coins| SN
+  CM -->|fee + side coins| BM
+
+  %% ---------- API surface to UI ----------
+  DB --> API
+  API ==>|JSON + SSE<br/>prep progress| UI
+
+  %% =========================================================
+  %%  STYLING
+  %% =========================================================
+  classDef external fill:#1e3a8a,stroke:#60a5fa,color:#dbeafe,stroke-width:2px
+  classDef subproc  fill:#7f1d1d,stroke:#f87171,color:#fee2e2,stroke-width:2px,stroke-dasharray:5 5
+  classDef intel    fill:#14532d,stroke:#4ade80,color:#dcfce7,stroke-width:2px
+  classDef trade    fill:#78350f,stroke:#fbbf24,color:#fef3c7,stroke-width:2px
+  classDef core     fill:#7c2d12,stroke:#fb923c,color:#fff7ed,stroke-width:3px
+  classDef state    fill:#334155,stroke:#94a3b8,color:#e2e8f0,stroke-width:2px
+  classDef ui       fill:#581c87,stroke:#c084fc,color:#f3e8ff,stroke-width:2px
+  classDef plan     fill:#365314,stroke:#a3e635,color:#ecfccb,stroke-width:2px
+
+  class W,CS,SX,TR external
+  class CP,SF subproc
+  class RES intel
+  class CM,OM,SN,BM trade
+  class BL core
+  class DB state
+  class API,UI ui
+  class PLAN plan

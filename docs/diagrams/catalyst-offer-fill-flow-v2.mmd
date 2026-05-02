@@ -1,0 +1,157 @@
+---
+title: CATalyst — Offer & Fill Lifecycle
+config:
+  theme: base
+  themeVariables:
+    fontFamily: "Inter, system-ui, -apple-system, sans-serif"
+    fontSize: 14px
+    primaryColor: "#0f172a"
+    primaryTextColor: "#e2e8f0"
+    primaryBorderColor: "#475569"
+    lineColor: "#94a3b8"
+---
+flowchart TB
+
+  %% =========================================================
+  %%  TRIGGERS — what wakes the bot loop
+  %% =========================================================
+  subgraph TRIG["⚡ &nbsp; Triggers"]
+    direction LR
+    TICK([LOOP_SECONDS<br/>cadence])
+    MEMP([Mempool Watcher<br/><i>imminent swap / fill</i>])
+    SHOCK([AMM Monitor<br/><i>tibet shock</i>])
+  end
+
+  %% =========================================================
+  %%  DECISION — bot loop + intelligence advice
+  %% =========================================================
+  BL(((Bot Loop)))
+  RM[Risk Manager<br/><i>spread + skew + gates</i>]
+  CM[Coin Manager<br/><i>fee + side coins</i>]
+
+  %% =========================================================
+  %%  CREATION — ladder + sniper + boost share build path
+  %% =========================================================
+  subgraph CREATE["🛠️ &nbsp; Offer creation"]
+    direction LR
+    OM[Offer Manager<br/><i>ladder</i>]
+    SN[Sniper<br/><i>arb gap</i>]
+    BM[Boost Manager<br/><i>incentive boost</i>]
+  end
+
+  W([Sage wallet RPC<br/>builds + signs offer])
+
+  %% =========================================================
+  %%  DISTRIBUTION — Dexie + Splash in parallel
+  %% =========================================================
+  subgraph DIST["📡 &nbsp; Distribution"]
+    direction TB
+    DM[Dexie Manager<br/><i>queue + post</i>]
+    SM[Splash Manager<br/><i>queue + broadcast</i>]
+    DX([Dexie API])
+    SP{{splash.exe<br/>P2P node}}
+  end
+
+  %% =========================================================
+  %%  INBOUND PEER OFFERS — Splash webhook
+  %% =========================================================
+  WH[/"POST<br/>/api/splash/incoming"/]
+  SI[(splash_incoming_offers<br/>table)]
+
+  %% =========================================================
+  %%  VERIFICATION — fill detection + 3-strike + park/retry
+  %% =========================================================
+  subgraph VER["🔍 &nbsp; Fill verification"]
+    direction TB
+    FT[Fill Tracker]
+    P3{"3-strike<br/>guard"}
+    PARK[/Spacescan park<br/>+ retry queue/]
+    SC([Spacescan])
+  end
+
+  %% =========================================================
+  %%  STATE
+  %% =========================================================
+  DB[("SQLite WAL<br/>offers / fills / pnl")]
+
+  %% ---------- Triggers fan in ----------
+  TICK  --> BL
+  MEMP  -. signal .-> BL
+  SHOCK -. signal .-> BL
+
+  %% ---------- Bot loop consults intelligence ----------
+  BL <-->|spread + skew| RM
+  BL <-->|coins + fees| CM
+  DB -->|inventory| RM
+
+  %% ---------- Bot loop fans out to creators ----------
+  BL --> OM
+  BL --> SN
+  BL --> BM
+
+  %% ---------- All creators share the wallet build path ----------
+  OM ==>|build offer| W
+  SN ==>|build offer| W
+  BM ==>|build offer| W
+  W  ==>|signed bech32| OM
+  W  ==>|signed bech32| SN
+  W  ==>|signed bech32| BM
+
+  %% ---------- Offer state persists ----------
+  OM ==> DB
+  SN --> DB
+  BM --> DB
+
+  %% ---------- Distribute to Dexie + Splash ----------
+  OM -->|bech32| DM
+  SN -->|bech32| DM
+  BM -->|bech32| DM
+  BL -->|bech32| SM
+
+  DM ==>|POST| DX
+  SM ==>|submit| SP
+  SP ==>|broadcast<br/>+ peer relay| DX
+
+  %% ---------- Inbound from Splash peers ----------
+  SP -->|incoming| WH
+  WH ==> SI
+  SI -.->|sniper candidates| BL
+
+  %% ---------- Verification fallback chain: Sage → Dexie → Spacescan ----------
+  W   ==>|wallet view of<br/>open offers| FT
+  DX  -->|terminal status| FT
+  FT  --> P3
+  P3  -->|passes| SC
+  SC  --> FT
+  P3  -.->|transient blip| FT
+
+  %% ---------- Park / retry loop for unverified fills ----------
+  FT  -. unverified .-> PARK
+  PARK -. retry .-> SC
+
+  %% ---------- Verified fills land in DB and wake the loop ----------
+  FT  ==>|fills + PnL| DB
+  FT  -.->|fill event| BL
+
+  %% =========================================================
+  %%  STYLING
+  %% =========================================================
+  classDef trigger  fill:#3b0764,stroke:#a855f7,color:#f3e8ff,stroke-width:2px
+  classDef intel    fill:#14532d,stroke:#4ade80,color:#dcfce7,stroke-width:2px
+  classDef creator  fill:#78350f,stroke:#fbbf24,color:#fef3c7,stroke-width:2px
+  classDef wallet   fill:#1e3a8a,stroke:#60a5fa,color:#dbeafe,stroke-width:3px
+  classDef external fill:#1e3a8a,stroke:#60a5fa,color:#dbeafe,stroke-width:2px
+  classDef subproc  fill:#7f1d1d,stroke:#f87171,color:#fee2e2,stroke-width:2px,stroke-dasharray:5 5
+  classDef state    fill:#334155,stroke:#94a3b8,color:#e2e8f0,stroke-width:2px
+  classDef core     fill:#7c2d12,stroke:#fb923c,color:#fff7ed,stroke-width:3px
+  classDef decision fill:#365314,stroke:#a3e635,color:#ecfccb,stroke-width:2px
+
+  class TICK,MEMP,SHOCK trigger
+  class RM,CM intel
+  class OM,SN,BM creator
+  class W,DX,SC external
+  class SP subproc
+  class WH,PARK state
+  class SI,DB state
+  class BL,FT core
+  class P3 decision

@@ -115,6 +115,7 @@ _TOPUP_BACKOFF_MAX = 3600        # 60 minutes — ceiling for exponential backof
 # Old fixed 2-hour constant removed. Backoff is now exponential:
 # attempt 0 → 5 min, 1 → 10 min, 2 → 20 min, 3 → 40 min, 4+ → 60 min (capped)
 _TOPUP_DRIP_INTERVAL = 90        # 90 seconds between proactive drip checks
+_DRIP_SOURCE_NOTICE_INTERVAL = 1800  # 30 minutes between optional no-source notices
 
 
 class _TopupWalletDegraded(Exception):
@@ -1260,6 +1261,7 @@ class CoinManager:
         self._recent_topup_split_submissions: Dict[str, float] = {}
         self._recent_consolidate_submissions: Dict[str, float] = {}
         self._last_consolidate_not_submitted: bool = False
+        self._last_drip_source_unavailable_log: Dict[str, float] = {}
 
         # Warning throttle
         self._last_low_coin_warning: float = 0
@@ -1366,6 +1368,34 @@ class CoinManager:
             and int(getattr(cfg, "SNIPER_PREP_COUNT", 0) or 0) > 0
             and sniper_size > 0
         )
+
+    def _optional_topup_source_available(self, wallet_type: str, target_size_mojos: int = 0) -> bool:
+        """Return True when a drip-only optional pool has a cheap source to split.
+
+        Optional pools (sniper/fee buffers) are useful, but they should not
+        start a topup worker over and over when the matching wallet has no
+        reserve or useful small coins. Active offer tiers can still trigger
+        normal emergency topup paths.
+        """
+        inventory = self._cat_inventory if wallet_type == "cat" else self._xch_inventory
+        if inventory.get("reserve"):
+            return True
+        small = inventory.get("small") or []
+        if len(small) < 2:
+            return False
+        if target_size_mojos <= 0:
+            return True
+        small_total = sum(_coin_amount(record) for record in small)
+        return small_total >= target_size_mojos * 2
+
+    def _log_drip_source_unavailable(self, key: str, message: str) -> None:
+        """Rate-limit calm no-source notices for optional drip pools."""
+        now = time.time()
+        last = self._last_drip_source_unavailable_log.get(key, 0)
+        if now - last < _DRIP_SOURCE_NOTICE_INTERVAL:
+            return
+        self._last_drip_source_unavailable_log[key] = now
+        log_event("info", "drip_source_unavailable", message)
 
     def _configured_tier_names(self, include_sniper: bool = True) -> List[str]:
         tiers = ["inner", "mid", "outer", "extreme"]
@@ -4469,10 +4499,42 @@ class CoinManager:
                         _sniper_drip_tgt = int(round(_sniper_target * drip_pct))
                         _sniper_xch_sp = self._tier_spares.get("xch", {}).get("sniper", 0)
                         _sniper_cat_sp = self._tier_spares.get("cat", {}).get("sniper", 0)
-                        if _sniper_drip_tgt > 0 and (
-                            (cfg.ENABLE_BUY and _sniper_xch_sp < _sniper_drip_tgt) or
-                            (cfg.ENABLE_SELL and _sniper_cat_sp < _sniper_drip_tgt)
-                        ):
+                        _sniper_xch_low = (
+                            _sniper_drip_tgt > 0
+                            and cfg.ENABLE_BUY
+                            and _sniper_xch_sp < _sniper_drip_tgt
+                        )
+                        _sniper_cat_low = (
+                            _sniper_drip_tgt > 0
+                            and cfg.ENABLE_SELL
+                            and _sniper_cat_sp < _sniper_drip_tgt
+                        )
+                        if _sniper_xch_low:
+                            try:
+                                _sniper_xch_dec = self._configured_tier_sizes_xch().get("sniper", Decimal("0"))
+                                _sniper_xch_mojos = int(_sniper_xch_dec * Decimal("1000000000000"))
+                            except Exception:
+                                _sniper_xch_mojos = 0
+                            if not self._optional_topup_source_available("xch", _sniper_xch_mojos):
+                                _sniper_xch_low = False
+                                self._log_drip_source_unavailable(
+                                    "xch:sniper",
+                                    f"XCH sniper drip waiting: {_sniper_xch_sp}/{_sniper_drip_tgt} spares "
+                                    "but no XCH reserve or useful small coins are available to split",
+                                )
+                        if _sniper_cat_low:
+                            try:
+                                _sniper_cat_mojos = self._get_tier_sizes_mojos(is_cat=True).get("sniper", 0)
+                            except Exception:
+                                _sniper_cat_mojos = 0
+                            if not self._optional_topup_source_available("cat", _sniper_cat_mojos):
+                                _sniper_cat_low = False
+                                self._log_drip_source_unavailable(
+                                    "cat:sniper",
+                                    f"CAT sniper drip waiting: {_sniper_cat_sp}/{_sniper_drip_tgt} spares "
+                                    "but no CAT reserve or useful small coins are available to split",
+                                )
+                        if _sniper_xch_low or _sniper_cat_low:
                             self._last_drip_time = time.time()
                             self._topup_is_drip = True
                             log_event("info", "drip_trigger",
@@ -5361,41 +5423,55 @@ class CoinManager:
 
                     sniper_xch_have = len(xch_inv.get("sniper", []))
                     if sniper_xch_have < sniper_threshold and cfg.ENABLE_BUY and sniper_xch_size_dec > 0:
-                        any_tier_needed = True
                         sniper_xch_size = int(sniper_xch_size_dec * self._get_coin_prep_headroom_multiplier() * xch_scale)
-                        deficit = (sniper_target - sniper_xch_have) + 2
-                        log_event("info", "topup_xch_sniper",
-                                  f"XCH sniper pool low: {sniper_xch_have}/{sniper_threshold} threshold "
-                                  f"(target {sniper_target}) — need {deficit} at {_format_amount_xch(sniper_xch_size)} each")
-                        result = self._smart_topup_wallet(
-                            "XCH-sniper", cfg.WALLET_ID_XCH,
-                            xch_inv, sniper_xch_size, deficit,
-                            is_cat=False
-                        )
-                        if result:
-                            did_anything = True
-                        if not did_anything:
-                            time.sleep(3)
-                            fresh = _get_free_coins_rpc(cfg.WALLET_ID_XCH)
-                            fresh_records = _extract_coin_records(fresh)
-                            xch_inv = self._classify_coins_by_designation(fresh_records, "xch", self._get_tier_sizes_mojos(is_cat=False))
+                        if _is_drip_invocation and not self._optional_topup_source_available("xch", sniper_xch_size):
+                            self._log_drip_source_unavailable(
+                                "xch:sniper",
+                                f"XCH sniper drip waiting: {sniper_xch_have}/{sniper_threshold} threshold "
+                                "but no XCH reserve or useful small coins are available to split",
+                            )
+                        else:
+                            any_tier_needed = True
+                            deficit = (sniper_target - sniper_xch_have) + 2
+                            log_event("info", "topup_xch_sniper",
+                                      f"XCH sniper pool low: {sniper_xch_have}/{sniper_threshold} threshold "
+                                      f"(target {sniper_target}) — need {deficit} at {_format_amount_xch(sniper_xch_size)} each")
+                            result = self._smart_topup_wallet(
+                                "XCH-sniper", cfg.WALLET_ID_XCH,
+                                xch_inv, sniper_xch_size, deficit,
+                                is_cat=False
+                            )
+                            if result:
+                                did_anything = True
+                            if not did_anything:
+                                time.sleep(3)
+                                fresh = _get_free_coins_rpc(cfg.WALLET_ID_XCH)
+                                fresh_records = _extract_coin_records(fresh)
+                                xch_inv = self._classify_coins_by_designation(fresh_records, "xch", self._get_tier_sizes_mojos(is_cat=False))
 
                     if not did_anything:
                         sniper_cat_have = len(cat_inv.get("sniper", []))
                         if sniper_cat_have < sniper_threshold and cfg.ENABLE_SELL and sniper_cat_mojos_val > 0:
-                            any_tier_needed = True
-                            deficit = (sniper_target - sniper_cat_have) + 2
-                            sniper_cat_display = _format_amount_cat(sniper_cat_mojos_val, cfg.CAT_DECIMALS)
-                            log_event("info", "topup_cat_sniper",
-                                      f"CAT sniper pool low: {sniper_cat_have}/{sniper_threshold} threshold "
-                                      f"(target {sniper_target}) — need {deficit} at {sniper_cat_display} each")
-                            result = self._smart_topup_wallet(
-                                "CAT-sniper", cfg.CAT_WALLET_ID,
-                                cat_inv, sniper_cat_mojos_val, deficit,
-                                is_cat=True,
-                            )
-                            if result:
-                                did_anything = True
+                            if _is_drip_invocation and not self._optional_topup_source_available("cat", sniper_cat_mojos_val):
+                                self._log_drip_source_unavailable(
+                                    "cat:sniper",
+                                    f"CAT sniper drip waiting: {sniper_cat_have}/{sniper_threshold} threshold "
+                                    "but no CAT reserve or useful small coins are available to split",
+                                )
+                            else:
+                                any_tier_needed = True
+                                deficit = (sniper_target - sniper_cat_have) + 2
+                                sniper_cat_display = _format_amount_cat(sniper_cat_mojos_val, cfg.CAT_DECIMALS)
+                                log_event("info", "topup_cat_sniper",
+                                          f"CAT sniper pool low: {sniper_cat_have}/{sniper_threshold} threshold "
+                                          f"(target {sniper_target}) — need {deficit} at {sniper_cat_display} each")
+                                result = self._smart_topup_wallet(
+                                    "CAT-sniper", cfg.CAT_WALLET_ID,
+                                    cat_inv, sniper_cat_mojos_val, deficit,
+                                    is_cat=True,
+                                )
+                                if result:
+                                    did_anything = True
 
                 # SINGLE-ACTION: skip fee check if a split already ran.
                 if not did_anything and self._fee_pool_enabled():
@@ -8769,4 +8845,3 @@ class CoinManager:
             "topup_budget_backoff_until": self._topup_budget_backoff_until,
             "inventory": self.get_inventory_summary(),
         }
-

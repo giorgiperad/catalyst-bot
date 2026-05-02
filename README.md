@@ -271,15 +271,15 @@ used for wallet RPC, market data, offer posting, and on-chain verification.
 
 ### App flow
 
-![CATalyst app flow](docs/diagrams/catalyst-app-flow.svg)
+![CATalyst app flow](docs/diagrams/catalyst-app-flow-v2.svg)
 
 ### Offer and fill flow
 
-![CATalyst offer and fill flow](docs/diagrams/catalyst-offer-fill-flow.svg)
+![CATalyst offer and fill flow](docs/diagrams/catalyst-offer-fill-flow-v2.svg)
 
 ### Coin prep and topup flow
 
-![CATalyst coin prep and topup flow](docs/diagrams/catalyst-coin-prep-topup-flow.svg)
+![CATalyst coin prep and topup flow](docs/diagrams/catalyst-coin-prep-topup-flow-v2.svg)
 
 The editable Mermaid source files live in `docs/diagrams/` next to the rendered
 SVG and PNG assets.

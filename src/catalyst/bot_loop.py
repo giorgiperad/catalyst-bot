@@ -9190,7 +9190,7 @@ class BotLoop:
                 self.coin_manager.update_coin_counts()
             if self.coin_manager.needs_coin_prep(active_buy_count, active_sell_count):
                 log_event("info", "coin_prep_trigger_recovery",
-                          "Coins critically low during recovery — forcing coin prep "
+                          "Coins critically low during recovery — forcing runtime top-up "
                           "to break coin-exhaustion deadlock")
                 self.coin_manager.start_topup(active_buy_count, active_sell_count, is_drip=False)
             elif self.coin_manager.needs_topup(active_buy_count, active_sell_count):
@@ -12347,4 +12347,3 @@ class BotLoop:
             "last_quoted_buy": str(self._last_quoted_price.get("buy", "0")),
             "last_quoted_sell": str(self._last_quoted_price.get("sell", "0")),
         }
-

@@ -1,0 +1,177 @@
+---
+title: CATalyst — Application Architecture
+config:
+  theme: base
+  themeVariables:
+    fontFamily: "Inter, system-ui, -apple-system, sans-serif"
+    fontSize: 14px
+    primaryColor: "#0f172a"
+    primaryTextColor: "#e2e8f0"
+    primaryBorderColor: "#475569"
+    lineColor: "#94a3b8"
+    secondaryColor: "#1e293b"
+    tertiaryColor: "#334155"
+---
+flowchart LR
+
+  %% =========================================================
+  %%  EXTERNAL SERVICES — what we read from / write to
+  %% =========================================================
+  subgraph EXT["🌐 &nbsp; External services"]
+    direction TB
+    TS([TibetSwap<br/><i>pool reserves, pairs</i>])
+    DXM([Dexie<br/><i>tickers, orderbook,<br/>offer posting</i>])
+    CS([Coinset.org<br/><i>fast coin lookup,<br/>mempool</i>])
+    SC([Spacescan<br/><i>on-chain fill check</i>])
+    SAGE([Sage RPC<br/><i>localhost mTLS</i>])
+  end
+
+  %% =========================================================
+  %%  LOCAL SUBPROCESSES — managed but external to the bot proc
+  %% =========================================================
+  subgraph SUB["⚙️ &nbsp; Local subprocesses"]
+    SP{{splash.exe<br/>P2P node}}
+    CP{{coin_prep_worker<br/>split executor}}
+  end
+
+  %% =========================================================
+  %%  INTELLIGENCE — turns raw signals into decisions
+  %% =========================================================
+  subgraph INT["🧠 &nbsp; Intelligence layer"]
+    PE[Price Engine]
+    AMM[AMM Monitor]
+    MW[Mempool Watcher]
+    MI[Market Intel]
+    RM[Risk Manager]
+  end
+
+  %% =========================================================
+  %%  TRADING CORE — the bot itself
+  %% =========================================================
+  subgraph CORE["🤖 &nbsp; Trading core"]
+    BL(((Bot Loop)))
+    OM[Offer Manager]
+    SN[Sniper]
+    BM[Boost Manager]
+    CM[Coin Manager]
+    FT[Fill Tracker]
+    DM[Dexie Manager]
+    SM[Splash Manager]
+  end
+
+  %% =========================================================
+  %%  PERSISTENCE — where state lives
+  %% =========================================================
+  subgraph DATA["💾 &nbsp; Persistence"]
+    DB[("SQLite WAL<br/>bot.db")]
+    SF[/coin_prep_status.json/]
+  end
+
+  %% =========================================================
+  %%  USER SURFACE
+  %% =========================================================
+  subgraph SURF["🖥️ &nbsp; User surface"]
+    API[Flask API + AppBridge<br/>loopback only]
+    UI([Desktop window /<br/>browser GUI])
+  end
+
+  %% ---------- External feeds → Intelligence ----------
+  TS  ==> PE
+  TS  ==> AMM
+  TS  --> MW
+  DXM ==> PE
+  DXM --> MI
+  CS  --> MW
+
+  %% ---------- AMM injects fresh reserves into PE ----------
+  AMM -. fresh reserves .-> PE
+
+  %% ---------- Intelligence → Bot Loop ----------
+  PE  ==>|mid + arb gap| BL
+  PE  -->|price risk| RM
+  MI  -->|depth| RM
+  AMM -.->|shock signal| BL
+  MW  -.->|imminent_swap / fill| BL
+  RM  -->|spreads + gates| BL
+
+  %% ---------- Bot Loop drives trading ----------
+  BL --> OM
+  BL --> SN
+  BL --> BM
+  BL --> CM
+  BL --> FT
+
+  %% ---------- Coins + fees ----------
+  CM -->|fee coins| OM
+  CM -->|fee coins| SN
+  CM -->|fee coins| BM
+  CS --> CM
+
+  %% ---------- Outbound to Dexie ----------
+  OM -->|bech32| DM
+  SN -->|bech32| DM
+  BM -->|bech32| DM
+  DM ==> DXM
+
+  %% ---------- Outbound to Splash P2P ----------
+  BL -->|bech32| SM
+  SM ==> SP
+  SP ==> DXM
+
+  %% ---------- Wallet writes (offers, splits, transfers) ----------
+  OM <==> SAGE
+  CM <==> SAGE
+  CP <==> SAGE
+
+  %% ---------- Inbound peer offers (Splash webhook) ----------
+  SP -->|peer offers via<br/>POST /api/splash/incoming| API
+
+  %% ---------- Coin prep handoff (file mediated) ----------
+  CM -->|split plan| CP
+  CS -->|landed checks| CP
+  CP -->|writes| SF
+  SF -->|reads| API
+  CP --> DB
+
+  %% ---------- Fill verification ----------
+  SAGE --> FT
+  DXM  --> FT
+  SC   --> FT
+  FT   -.->|fill event| BL
+  FT   ==> DB
+
+  %% ---------- State persistence ----------
+  BL  <==> DB
+  OM  <--> DB
+  CM  <--> DB
+  RM  <--  DB
+
+  %% ---------- Up to UI ----------
+  DB  --> API
+  BL  -->|live snapshots| API
+  API ==>|JSON + SSE| UI
+  UI  -.->|REST + bridge| API
+
+  %% =========================================================
+  %%  STYLING
+  %% =========================================================
+  classDef external fill:#1e3a8a,stroke:#60a5fa,color:#dbeafe,stroke-width:2px
+  classDef subproc  fill:#7f1d1d,stroke:#f87171,color:#fee2e2,stroke-width:2px,stroke-dasharray:5 5
+  classDef intel    fill:#14532d,stroke:#4ade80,color:#dcfce7,stroke-width:2px
+  classDef trade    fill:#78350f,stroke:#fbbf24,color:#fef3c7,stroke-width:2px
+  classDef core     fill:#7c2d12,stroke:#fb923c,color:#fff7ed,stroke-width:3px
+  classDef state    fill:#334155,stroke:#94a3b8,color:#e2e8f0,stroke-width:2px
+  classDef ui       fill:#581c87,stroke:#c084fc,color:#f3e8ff,stroke-width:2px
+
+  class TS,DXM,CS,SC,SAGE external
+  class SP,CP subproc
+  class PE,AMM,MW,MI,RM intel
+  class OM,SN,BM,CM,FT,DM,SM trade
+  class BL core
+  class DB,SF state
+  class API,UI ui
+
+  %% Highlight the primary "tick" path: Tibet → PE → BL
+  linkStyle 0 stroke:#fbbf24,stroke-width:3px
+  linkStyle 1 stroke:#fbbf24,stroke-width:3px
+  linkStyle 13 stroke:#fbbf24,stroke-width:3px
