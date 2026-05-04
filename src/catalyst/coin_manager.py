@@ -63,6 +63,26 @@ _fast_reconcile_lock: threading.Lock = threading.Lock()
 _TOPUP_PENDING = "pending"
 
 
+def _topup_event_log_level(event_type: str) -> str:
+    """Return the log level for routine top-up progress events."""
+    evt = str(event_type or "")
+    routine_events = {
+        "topup_inventory",
+        "topup_inventory_changed",
+        "topup_waiting",
+    }
+    routine_suffixes = (
+        "_refetch",
+        "_fee_coin_reserved",
+        "_osstep_start",
+        "_osstep_outputs_owned",
+        "_osstep_wait",
+    )
+    if evt in routine_events or evt.endswith(routine_suffixes):
+        return "debug"
+    return "info"
+
+
 def request_fast_reconcile(reason: str = "unspecified") -> None:
     """Request a reconcile on the next bot-loop cycle.
 
@@ -4133,7 +4153,7 @@ class CoinManager:
             # to just the spare buffer. Showing `have/target` (e.g. 1/4) is
             # still a bit terse — so we also print an explicit spare summary
             # that makes the buffer state unambiguous.
-            log_event("info", "coin_readiness",
+            log_event("debug", "coin_readiness",
                       f"  {tier_name.upper():>8}: "
                       f"XCH {xch_have:>3}/{xch_target} [{xch_status}] | "
                       f"CAT {cat_have:>3}/{cat_target} [{cat_status}] | "
@@ -4185,7 +4205,7 @@ class CoinManager:
                 any_critical = True
             elif (cfg.ENABLE_BUY and sniper_xch_status == "LOW") or (cfg.ENABLE_SELL and sniper_cat_status == "LOW"):
                 any_low = True
-            log_event("info", "coin_readiness",
+            log_event("debug", "coin_readiness",
                       f"  {'SNIPER':>8}: "
                       f"XCH {sniper_xch_have:>3}/{sniper_xch_needed} [{sniper_xch_status}] | "
                       f"CAT {sniper_cat_have:>3}/{sniper_cat_needed} [{sniper_cat_status}] | "
@@ -4224,7 +4244,7 @@ class CoinManager:
             elif fee_status == "LOW":
                 any_low = True
             log_event(
-                "info",
+                "debug",
                 "coin_readiness",
                 f"  {'FEES':>8}: XCH {fee_have:>3}/{fee_target} [{fee_status}] | "
                 f"Fee coins at {str(get_fee_coin_size_xch())} XCH each",
@@ -5262,7 +5282,7 @@ class CoinManager:
                     f"{t}={len(xch_inv.get(t, []))}" for t in tier_names)
                 cat_tier_counts = ", ".join(
                     f"{t}={len(cat_inv.get(t, []))}" for t in tier_names)
-                log_event("info", "topup_inventory",
+                log_event(_topup_event_log_level("topup_inventory"), "topup_inventory",
                           f"Topup inventory (tiered) — "
                           f"XCH: {len(xch_inv['reserve'])} reserve, {xch_tier_counts}, "
                           f"{len(xch_inv['small'])} small | "
@@ -5275,7 +5295,7 @@ class CoinManager:
                 xch_inv = _classify_coins(xch_records, xch_trading_mojos)
                 cat_inv = _classify_coins(cat_records, cat_trading_mojos)
 
-                log_event("info", "topup_inventory",
+                log_event(_topup_event_log_level("topup_inventory"), "topup_inventory",
                           f"Topup inventory — "
                           f"XCH: {len(xch_inv['reserve'])} reserve, {len(xch_inv['trading'])} trading, "
                           f"{len(xch_inv['small'])} small | "
@@ -5623,7 +5643,11 @@ class CoinManager:
                         topup_offer_deficits.get("xch", {}).get(tier_name, 0) or 0
                     )
                     xch_needs_spares = xch_spare_target > 0 and xch_have < xch_topup_threshold
-                    if (xch_offer_deficit > 0 or xch_needs_spares) and cfg.ENABLE_BUY:
+                    target_full = max(0, xch_spare_target, xch_offer_deficit)
+                    xch_needs_offer_rebuild = (
+                        xch_offer_deficit > 0 and xch_have < target_full
+                    )
+                    if (xch_needs_offer_rebuild or xch_needs_spares) and cfg.ENABLE_BUY:
                         any_tier_needed = True
                         xch_tier_size = int(xch_tier_mojos.get(tier_name, 0) or 0)
                         if xch_tier_size <= 0:
@@ -5632,15 +5656,23 @@ class CoinManager:
                                 * self._get_coin_prep_headroom_multiplier()
                                 * xch_scale
                             )
-                        target_full = max(0, xch_spare_target, xch_offer_deficit)
                         # Buffer: 25% of spare allocation, min 1, max 2.
                         # Scales with tier depth rather than being flat +2 for all
                         # tiers (flat +2 over-splits small-spare tiers like outer/extreme).
                         _buf_base = max(1, xch_spare_target, xch_offer_deficit)
                         _buf = max(1, min(2, int(_buf_base * 0.25)))
                         deficit = max(0, target_full - xch_have) + _buf
+                        if xch_needs_offer_rebuild:
+                            topup_reason = (
+                                f"missing buy offers: {xch_have}/{target_full} rebuild target "
+                                f"({xch_offer_deficit} missing, threshold {xch_topup_threshold})"
+                            )
+                        else:
+                            topup_reason = (
+                                f"spare buffer low: {xch_have}/{xch_topup_threshold} threshold"
+                            )
                         log_event("info", f"topup_xch_{tier_name}",
-                                  f"XCH {tier_name} tier low: {xch_have}/{xch_topup_threshold} threshold "
+                                  f"XCH {tier_name} {topup_reason} "
                                   f"(target {target_full}) — "
                                   f"need {deficit} at {_format_amount_xch(xch_tier_size)} each")
                         result = self._smart_topup_wallet(
@@ -5689,17 +5721,29 @@ class CoinManager:
                         topup_offer_deficits.get("cat", {}).get(tier_name, 0) or 0
                     )
                     cat_needs_spares = cat_spare_target > 0 and cat_have < cat_topup_threshold
-                    if (cat_offer_deficit > 0 or cat_needs_spares) and cfg.ENABLE_SELL:
+                    target_full = max(0, cat_spare_target, cat_offer_deficit)
+                    cat_needs_offer_rebuild = (
+                        cat_offer_deficit > 0 and cat_have < target_full
+                    )
+                    if (cat_needs_offer_rebuild or cat_needs_spares) and cfg.ENABLE_SELL:
                         any_tier_needed = True
                         cat_tier_mojos_val = self._get_tier_sizes_mojos(is_cat=True).get(tier_name, 0)
                         if cat_tier_mojos_val > 0:
-                            target_full = max(0, cat_spare_target, cat_offer_deficit)
                             _buf_base = max(1, cat_spare_target, cat_offer_deficit)
                             _buf = max(1, min(2, int(_buf_base * 0.25)))
                             deficit = max(0, target_full - cat_have) + _buf
                             cat_size_display = _format_amount_cat(cat_tier_mojos_val, cfg.CAT_DECIMALS)
+                            if cat_needs_offer_rebuild:
+                                topup_reason = (
+                                    f"missing sell offers: {cat_have}/{target_full} rebuild target "
+                                    f"({cat_offer_deficit} missing, threshold {cat_topup_threshold})"
+                                )
+                            else:
+                                topup_reason = (
+                                    f"spare buffer low: {cat_have}/{cat_topup_threshold} threshold"
+                                )
                             log_event("info", f"topup_cat_{tier_name}",
-                                      f"CAT {tier_name} tier low: {cat_have}/{cat_topup_threshold} threshold "
+                                      f"CAT {tier_name} {topup_reason} "
                                       f"(target {target_full}) — "
                                       f"need {deficit} at {cat_size_display} each")
                             result = self._smart_topup_wallet(
@@ -6038,7 +6082,8 @@ class CoinManager:
         # ---- Strategy 1: Use a reserve coin to create trading coins ----
         if reserve_coins:
             # Re-fetch FRESH coins (IDs may be stale after other transactions)
-            log_event("info", f"topup_{name.lower()}_refetch",
+            _refetch_event = f"topup_{name.lower()}_refetch"
+            log_event(_topup_event_log_level(_refetch_event), _refetch_event,
                       f"Re-fetching fresh {name} coins before split...")
 
             fresh_result = _get_free_coins_rpc(wallet_id)
@@ -7181,7 +7226,8 @@ class CoinManager:
         if is_cat and fee_mojos > 0 and self._fee_pool_enabled():
             fee_coin_id = self.fee_pool.reserve()
             if fee_coin_id:
-                log_event("info", f"{tag}_fee_coin_reserved",
+                _fee_event = f"{tag}_fee_coin_reserved"
+                log_event(_topup_event_log_level(_fee_event), _fee_event,
                           f"Reserved XCH fee coin {fee_coin_id[:12]}... "
                           f"for CAT top-up split")
             else:
@@ -7191,7 +7237,8 @@ class CoinManager:
                           "so Sage cannot auto-select a pending fee input")
                 return False
 
-        log_event("info", f"{tag}_osstep_start",
+        _start_event = f"{tag}_osstep_start"
+        log_event(_topup_event_log_level(_start_event), _start_event,
                   f"Sage one-step split: {num_to_create}×{size_str} from "
                   f"topup pool coin {source_coin_id[:12]}... via /create_transaction")
 
@@ -7380,7 +7427,8 @@ class CoinManager:
                     return False
 
             if owned_count >= num_to_create and not owned_logged:
-                log_event("info", f"{tag}_osstep_outputs_owned",
+                _owned_event = f"{tag}_osstep_outputs_owned"
+                log_event(_topup_event_log_level(_owned_event), _owned_event,
                           f"One-step split outputs owned ({owned_count}/{num_to_create})")
                 owned_logged = True
 
@@ -7399,7 +7447,8 @@ class CoinManager:
                 return True
 
             if elapsed % 20 == 0 and elapsed > 0:
-                log_event("info", f"{tag}_osstep_wait",
+                _wait_event = f"{tag}_osstep_wait"
+                log_event(_topup_event_log_level(_wait_event), _wait_event,
                           f"Waiting for one-step split outputs... "
                           f"(tx={'confirmed' if tx_state['confirmed'] else 'pending'}, "
                           f"{owned_count}/{num_to_create} owned, "
@@ -8588,13 +8637,14 @@ class CoinManager:
                 if new_xch != pre_xch or new_cat != pre_cat:
                     self._xch_coins = new_xch
                     self._cat_coins = new_cat
-                    log_event("info", "topup_inventory_changed",
+                    log_event(_topup_event_log_level("topup_inventory_changed"),
+                              "topup_inventory_changed",
                               f"Coin inventory changed in {elapsed}s. "
                               f"XCH: {pre_xch}→{new_xch}, CAT: {pre_cat}→{new_cat}")
                     return
 
                 if elapsed % 15 == 0:
-                    log_event("info", "topup_waiting",
+                    log_event(_topup_event_log_level("topup_waiting"), "topup_waiting",
                               f"Waiting for confirmation... XCH: {new_xch}, "
                               f"CAT: {new_cat} ({elapsed}s / {max_polls * poll_interval}s max)")
 
