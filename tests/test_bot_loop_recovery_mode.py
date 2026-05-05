@@ -2,6 +2,7 @@ import sys
 import types
 import unittest
 from decimal import Decimal
+from unittest.mock import patch
 
 
 class _FakeCfg:
@@ -91,6 +92,7 @@ class _DummyOfferManager:
         self._recently_created = {}
         self._pending_cancel_retries = {}
         self._bot_cancelled_ids = set()
+        self._position_guard_pause = {}
 
     def get_recently_created_count(self, side):
         del side
@@ -138,6 +140,11 @@ class _DummyOfferManager:
 
     def unsuspend_slots_if_coins_available(self, side):
         del side
+
+    def get_position_guard_pause(self, side=None):
+        if side is None:
+            return dict(self._position_guard_pause)
+        return dict(self._position_guard_pause.get(side) or {})
 
 
 class _DummyFillTracker:
@@ -480,6 +487,53 @@ class RecoveryModeTests(unittest.TestCase):
             loop._force_requote["buy"],
             "recovery should refill holes now while preserving a forced requote for later realignment",
         )
+
+    def test_position_guard_pause_reduces_target_instead_of_entering_recovery(self):
+        loop = bot_loop.BotLoop()
+        loop._running = True
+        loop.offer_manager._position_guard_pause = {
+            "sell": {
+                "side": "sell",
+                "opposite_side": "buy",
+                "current_position_xch": "2.22",
+                "projected_position_xch": "3.82",
+                "hard_limit_xch": "3.19",
+            }
+        }
+
+        for _ in range(loop._recovery_under_target_cycles + 1):
+            loop._evaluate_recovery_mode(Decimal("1.0"), 40, 0)
+
+        self.assertFalse(loop._recovery_state["active"])
+        self.assertEqual(loop._recovery_state["sell_deficit"], 0)
+        self.assertFalse(any(evt == "recovery_mode_enter" for _, evt, _, _ in self.logged))
+
+    def test_bot_health_anomaly_log_is_deduped_until_signature_changes(self):
+        loop = bot_loop.BotLoop()
+        check = types.SimpleNamespace(
+            name="funds_advisory",
+            anomaly_count=1,
+            message="CAT extreme topup pool underfunded",
+        )
+        health = types.SimpleNamespace(checks=[check], anomaly_check_names=["funds_advisory"])
+
+        with patch.object(bot_loop.time, "time", side_effect=[1000, 1200, 4700]):
+            self.assertTrue(loop._should_log_bot_health_anomalies(health))
+            self.assertFalse(loop._should_log_bot_health_anomalies(health))
+            self.assertTrue(loop._should_log_bot_health_anomalies(health))
+
+        changed = types.SimpleNamespace(
+            checks=[
+                types.SimpleNamespace(
+                    name="funds_advisory",
+                    anomaly_count=1,
+                    message="XCH operating floor underfunded",
+                )
+            ],
+            anomaly_check_names=["funds_advisory"],
+        )
+        with patch.object(bot_loop.time, "time", return_value=1300):
+            self.assertTrue(loop._should_log_bot_health_anomalies(changed))
 
 
 if __name__ == "__main__":

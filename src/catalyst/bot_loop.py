@@ -384,6 +384,10 @@ class BotLoop:
         # this session so we don't fire the orchestrator repeatedly for the
         # same persistent alert if it somehow reappears mid-flow.
         self._watchdog_auto_healed: set = set()
+        # After a persisted watchdog warning is visible, keep repeated
+        # passes out of the warning feed unless we reach auto-heal or a
+        # long reminder interval. The alert itself is still refreshed.
+        self._watchdog_repeat_warning_interval: int = 12
         self._last_tier_drift_topup_time: float = 0.0
         self._last_topup_source_wait_log: Dict[str, Dict] = {}
 
@@ -678,6 +682,11 @@ class BotLoop:
         self._recovery_exit_healthy_cycles: int = 2
         self._recovery_min_side_deficit: int = 2
         self._recovery_min_total_deficit: int = 2
+        self._last_bot_health_anomaly_log: Dict[str, object] = {
+            "signature": "",
+            "at": 0.0,
+        }
+        self._bot_health_anomaly_log_cooldown: float = 3600.0
         self._last_create_disabled_log: Dict[str, Dict] = {
             "buy": {"at": 0.0, "signature": ""},
             "sell": {"at": 0.0, "signature": ""},
@@ -867,6 +876,46 @@ class BotLoop:
     def _mark_recovery_create_stall(self):
         self._recovery_state["cycle_create_stalled"] = True
 
+    def _bot_health_anomaly_signature(self, health) -> str:
+        parts = []
+        for check in getattr(health, "checks", []) or []:
+            try:
+                count = int(getattr(check, "anomaly_count", 0) or 0)
+            except Exception:
+                count = 0
+            if count <= 0:
+                continue
+            name = str(getattr(check, "name", "") or "?")
+            message = str(getattr(check, "message", "") or "")
+            parts.append(f"{name}:{count}:{message}")
+        if parts:
+            return "|".join(sorted(parts))
+        names = [str(name) for name in getattr(health, "anomaly_check_names", []) or []]
+        return "|".join(sorted(names))
+
+    def _should_log_bot_health_anomalies(self, health) -> bool:
+        signature = self._bot_health_anomaly_signature(health)
+        if not signature:
+            return False
+        now = time.time()
+        try:
+            cooldown = float(
+                getattr(cfg, "BOT_HEALTH_ANOMALY_LOG_COOLDOWN_SECS", 0) or
+                self._bot_health_anomaly_log_cooldown
+            )
+        except Exception:
+            cooldown = self._bot_health_anomaly_log_cooldown
+        last = self._last_bot_health_anomaly_log
+        last_signature = str(last.get("signature", "") or "")
+        try:
+            last_at = float(last.get("at", 0.0) or 0.0)
+        except Exception:
+            last_at = 0.0
+        if signature == last_signature and cooldown > 0 and (now - last_at) < cooldown:
+            return False
+        self._last_bot_health_anomaly_log = {"signature": signature, "at": now}
+        return True
+
     def _get_expected_offer_targets(self, mid_price: Decimal) -> Dict[str, int]:
         """Return the intended live-book targets for the current market state."""
         targets = {"buy": 0, "sell": 0}
@@ -915,6 +964,39 @@ class BotLoop:
         if not known:
             return None
         return sum(max(0, int(spares.get(tier, 0) or 0)) for tier in tier_names)
+
+    def _position_guard_pauses(self) -> Dict[str, Dict]:
+        getter = getattr(self.offer_manager, "get_position_guard_pause", None)
+        if not callable(getter):
+            return {}
+        try:
+            pauses = getter() or {}
+        except Exception:
+            return {}
+        return {
+            str(side).lower(): dict(info or {})
+            for side, info in pauses.items()
+            if str(side).lower() in {"buy", "sell"} and info
+        }
+
+    def _emit_position_guard_pause_alert(self, side: str, pause: Dict) -> None:
+        side_norm = str(side or "").lower()
+        if side_norm not in {"buy", "sell"}:
+            return
+        opposite = str((pause or {}).get("opposite_side") or ("sell" if side_norm == "buy" else "buy"))
+        current = str((pause or {}).get("current_position_xch") or "?")
+        limit = str((pause or {}).get("hard_limit_xch") or "?")
+        self._emit_alert(
+            f"{side_norm}_position_paused",
+            "info",
+            f"{side_norm.capitalize()}s paused by position limit",
+            f"{side_norm.capitalize()} offers are paused because adding more would "
+            f"push position risk above the {limit} XCH hard limit. "
+            f"{opposite.capitalize()} offers remain live to rebalance the wallet "
+            f"(current exposure about {current} XCH).",
+            action="view_position",
+            action_label="View Position",
+        )
 
     def _offer_rebuild_deficits(
         self,
@@ -1149,6 +1231,11 @@ class BotLoop:
                 spare_count=spare_count,
                 backoff_remaining=backoff_remaining,
             )
+
+        for side, pause in self._position_guard_pauses().items():
+            live_count = max(0, int(current.get(side, 0) or 0))
+            if int(targets.get(side, 0) or 0) > live_count:
+                targets[side] = live_count
 
         self._last_adaptive_offer_targets = dict(targets)
         return targets
@@ -2814,11 +2901,20 @@ class BotLoop:
                           data=issue.details)
                 continue
 
-            sev = "error" if issue.severity == Severity.ERROR else "warning"
-            log_event(sev, f"watchdog_{issue.code}",
-                      f"{issue.message} — {issue.suggested_action} "
-                      f"(persisted for {new_streak} watchdog passes)",
-                      data=issue.details)
+            is_error = issue.severity == Severity.ERROR
+            sev = "error" if is_error else "warning"
+            if self._should_log_watchdog_operator_warning(
+                    is_error=is_error,
+                    streak=new_streak):
+                log_event(sev, f"watchdog_{issue.code}",
+                          f"{issue.message} — {issue.suggested_action} "
+                          f"(persisted for {new_streak} watchdog passes)",
+                          data=issue.details)
+            else:
+                log_event("debug", f"watchdog_{issue.code}_persistent",
+                          f"{issue.message} still present "
+                          f"(streak {new_streak}; operator alert already active)",
+                          data=issue.details)
 
             if issue.code in ACTIONABLE and has_event_bus:
                 det = issue.details or {}
@@ -2949,6 +3045,25 @@ class BotLoop:
                       f"Watchdog audit clean "
                       f"(cycle={self._loop_count}, "
                       f"buys={len(offers_buy)}, sells={len(offers_sell)})")
+
+    def _should_log_watchdog_operator_warning(
+        self,
+        *,
+        is_error: bool,
+        streak: int,
+    ) -> bool:
+        """Return true when a persisted watchdog issue should hit WARN/ERROR."""
+        if is_error:
+            return True
+        if streak == self._watchdog_persistence_threshold:
+            return True
+        if streak == self._watchdog_auto_heal_threshold:
+            return True
+        interval = max(1, int(self._watchdog_repeat_warning_interval or 1))
+        return (
+            streak > self._watchdog_auto_heal_threshold
+            and (streak - self._watchdog_auto_heal_threshold) % interval == 0
+        )
 
     def _tier_size_drift_waiting_sides(self, findings: list[dict]) -> set[str]:
         """Return drift sides that cannot be reshaped by a drip topup now."""
@@ -9032,6 +9147,12 @@ class BotLoop:
             current_buy_count=current_buy_count,
             current_sell_count=current_sell_count,
         )
+        position_pauses = self._position_guard_pauses()
+        for _side, _pause in position_pauses.items():
+            self._emit_position_guard_pause_alert(_side, _pause)
+        for _side in ("buy", "sell"):
+            if _side not in position_pauses:
+                self._clear_alert(f"{_side}_position_paused")
         buy_target = int(adaptive_targets.get("buy", 0) or 0)
         sell_target = int(adaptive_targets.get("sell", 0) or 0)
         _buy_under = bool(cfg.ENABLE_BUY and not skip_buy and effective_buy_count < buy_target)
@@ -9458,7 +9579,18 @@ class BotLoop:
 
         # Coin snapshot after creating offers (coins now locked into offers)
         if work_items and not created_any:
-            self._mark_recovery_create_stall()
+            attempted_sides = {side for side, _needed, _spread in work_items}
+            paused_sides = set(self._position_guard_pauses().keys())
+            if attempted_sides and attempted_sides.issubset(paused_sides):
+                log_event(
+                    "info",
+                    "position_guard_create_paused",
+                    "Offer creation paused by position guard; correcting-side "
+                    "offers remain live to rebalance before rebuilding this side",
+                    data={"sides": sorted(attempted_sides)},
+                )
+            else:
+                self._mark_recovery_create_stall()
 
         if created_any:
             self.coin_manager.snapshot_coins("offer_created")
@@ -9905,12 +10037,13 @@ class BotLoop:
                           f"in {_names_txt} ({health.summary})",
                           data={"repaired_checks": _repaired_names})
             elif health.anomalies:
-                _anom_names = health.anomaly_check_names
-                _anom_txt = ", ".join(_anom_names) if _anom_names else "?"
-                log_event("info", "bot_health_anomalies",
-                          f"bot_health found {health.anomalies} anomalies "
-                          f"in {_anom_txt} ({health.summary})",
-                          data={"anomaly_checks": _anom_names})
+                if self._should_log_bot_health_anomalies(health):
+                    _anom_names = health.anomaly_check_names
+                    _anom_txt = ", ".join(_anom_names) if _anom_names else "?"
+                    log_event("info", "bot_health_anomalies",
+                              f"bot_health found {health.anomalies} anomalies "
+                              f"in {_anom_txt} ({health.summary})",
+                              data={"anomaly_checks": _anom_names})
         except Exception as _hc_err:
             log_event("warning", "bot_health_check_failed",
                       f"Runtime health check failed: {_hc_err}")
