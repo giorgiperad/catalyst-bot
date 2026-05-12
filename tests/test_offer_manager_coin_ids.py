@@ -366,6 +366,8 @@ class OfferManagerCoinIdTests(unittest.TestCase):
         self.assertEqual(calls, ["cancel"])
         self.assertEqual(result["offers"], [])
         self.assertEqual(result["replaced_count"], 0)
+        self.assertEqual(result["pending_cancel_count"], 1)
+        self.assertEqual(result["failed_cancel_count"], 0)
         self.assertFalse(result["fully_replaced"])
 
     def test_retry_failed_cancels_exhaustion_does_not_mark_cancelled(self):
@@ -1377,6 +1379,36 @@ class CancelPendingMempoolTests(unittest.TestCase):
         self.assertEqual(len(cancelled_calls), 1,
                          "DB must be flipped to cancelled when Sage confirms "
                          "the cancel via coin unlock")
+
+    def test_cancel_offers_purges_public_post_queues(self):
+        manager = offer_manager.OfferManager()
+        purged = {"dexie": [], "splash": []}
+
+        class QueueStub:
+            def __init__(self, name):
+                self.name = name
+
+            def purge_trade_ids(self, trade_ids):
+                purged[self.name].append(list(trade_ids))
+
+        manager.dexie_manager = QueueStub("dexie")
+        manager.splash_manager = QueueStub("splash")
+
+        with patch.object(offer_manager, "get_open_offers",
+                          return_value=[{"trade_id": "tid-ok",
+                                         "coin_id": "0xc2", "side": "buy"}]), \
+             patch.object(offer_manager, "cancel_offers_batch",
+                          return_value={"tid-ok": {
+                              "success": True,
+                              "method": "confirmed_by_unlock",
+                          }}), \
+             patch.object(offer_manager, "update_offer_status"), \
+             patch.object(offer_manager, "transition_offer"), \
+             patch.object(offer_manager, "cleanup_expired_offers", return_value=0):
+            manager.cancel_offers(["tid-ok"], reason="test")
+
+        self.assertEqual(purged["dexie"], [["tid-ok"]])
+        self.assertEqual(purged["splash"], [["tid-ok"]])
 
 
 if __name__ == "__main__":
