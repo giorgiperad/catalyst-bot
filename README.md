@@ -204,6 +204,14 @@ python desktop_app.py --flask
 
 Then open `http://127.0.0.1:5000/` in a browser on that same machine.
 
+#### macOS Note
+
+On macOS port 5000 might be in use by Control Center. If you see an error about port 5000, choose a different port by setting `CATALYST_FLASK_PORT` before starting. For example:
+
+```bash
+CATALYST_FLASK_PORT=5010 python desktop_app.py --flask
+```
+
 ### First Launch
 
 CATalyst creates a per-user `.env` automatically in the app data directory.
