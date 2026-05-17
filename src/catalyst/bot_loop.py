@@ -375,6 +375,7 @@ class BotLoop:
             offer_manager=self.offer_manager,
             dexie_manager=self.dexie_manager,
             risk_manager=self.risk_manager,
+            splash_manager=self.splash_manager,
         )
         self.runtime_monitor = RuntimeMonitor(self)
         # AMM monitor — live TibetSwap reserve polling and drift detection
@@ -2627,6 +2628,8 @@ class BotLoop:
         """Cancel live offers on sides the toxicity guard has risked off."""
         cancelled_by_side = {"buy": set(), "sell": set()}
         if snapshot is None:
+            return cancelled_by_side
+        if not bool(getattr(cfg, "TOXICITY_CANCEL_ENABLED", False)):
             return cancelled_by_side
         if not bool(getattr(cfg, "MARKET_TOXICITY_CANCEL_LIVE_OFFERS", True)):
             return cancelled_by_side
