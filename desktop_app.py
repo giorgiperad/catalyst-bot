@@ -25,6 +25,7 @@ import threading
 import time
 import argparse
 import subprocess
+import importlib.util
 
 # ---------------------------------------------------------------------------
 # Fix Windows cp1252 terminal encoding so emoji in log messages don't crash.
@@ -777,8 +778,8 @@ def run_desktop_mode(dev_mode: bool = False):
 
         notifier = NotificationManager(app_name=APP_NAME)
         print("  Notifications enabled.")
-    except ImportError:
-        print("  Notifications disabled (plyer not installed).")
+    except ImportError as e:
+        print(f"  Notifications disabled ({e}).")
         notifier = None
     except Exception as e:
         print(f"  Notifications failed: {e}")
@@ -1068,7 +1069,9 @@ def _detect_gui_backend():
     elif sys.platform == "darwin":
         return None  # Default WebKit on macOS
     else:
-        return None  # Default GTK WebKit on Linux
+        if importlib.util.find_spec("qtpy") is not None:
+            return "qt"
+        return None  # Default GTK WebKit on Linux when Qt is not bundled
 
 
 def _show_window(webview_module):
