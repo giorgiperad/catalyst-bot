@@ -400,6 +400,7 @@ class TestAppUpdateApi(unittest.TestCase):
 
     def test_check_update_includes_release_notes_and_installer_readiness(self):
         with (
+            patch.object(self.api_server.sys, "platform", "win32"),
             patch.object(self.api_server, "get_app_version", return_value="1.2.5"),
             patch("app_update.fetch_signed_manifest") as fetch_manifest,
         ):
@@ -435,6 +436,7 @@ class TestAppUpdateApi(unittest.TestCase):
         self.assertTrue(body["manifest_verified"])
         self.assertTrue(body["update_available"])
         self.assertTrue(body["installer_ready"])
+        self.assertTrue(body["automatic_update_supported"])
         self.assertEqual(body["latest"], "1.2.6")
         self.assertIn("Fixed Sage startup", body["release_notes"])
 
@@ -488,6 +490,38 @@ class TestAppUpdateApi(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         body = resp.get_json()
         self.assertEqual(body["platform"], self.api_server.sys.platform)
+
+    def test_check_update_hides_windows_installer_metadata_on_linux(self):
+        update_info = {
+            "success": True,
+            "enabled": True,
+            "current": "1.2.5",
+            "latest": "1.2.6",
+            "latest_tag": "v1.2.6",
+            "update_available": True,
+            "installer_ready": True,
+            "installer_name": "Catalyst-Setup-v1.2.6.exe",
+            "installer_size": 456,
+            "manifest_verified": True,
+            "url": "https://github.com/Lowestofttim/catalyst-releases/releases/tag/v1.2.6",
+            "release_notes": "New release.",
+            "security": "Windows auto-upgrade requires a signed manifest.",
+        }
+        with (
+            patch.object(self.api_server.sys, "platform", "linux"),
+            patch.object(self.api_server, "get_app_version", return_value="1.2.5"),
+            patch("app_update.get_update_info", return_value=update_info),
+        ):
+            resp = self.client.get("/api/check-update", environ_base=self.loopback)
+
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        self.assertEqual(body["platform"], "linux")
+        self.assertFalse(body["installer_ready"])
+        self.assertIsNone(body["installer_name"])
+        self.assertIsNone(body["installer_size"])
+        self.assertFalse(body["automatic_update_supported"])
+        self.assertIn("Windows only", body["security"])
 
 
 class TestAppUpdateBridge(unittest.TestCase):
