@@ -18,6 +18,7 @@ The module imports `pystray` and `PIL` behind try/except so the rest of the
 app still starts in headless or reduced-dependency environments.
 """
 
+import sys
 import threading
 
 # Attempt imports — graceful fail if not installed
@@ -108,7 +109,18 @@ class TrayManager:
             menu=self._build_menu(),
         )
         self.is_running = True
-        self._icon.run()  # Blocks
+        try:
+            self._icon.run()  # Blocks
+        except Exception as exc:
+            try:
+                print(f"System tray unavailable: {exc}", file=sys.stderr, flush=True)
+            except Exception:
+                # Deliberately ignore secondary failures while reporting tray errors
+                # (for example, when stderr is unavailable in headless environments).
+                pass
+        finally:
+            self.is_running = False
+            self._icon = None
 
     def stop(self):
         """Stop and remove the tray icon."""
