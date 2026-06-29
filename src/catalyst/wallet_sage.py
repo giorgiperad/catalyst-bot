@@ -771,12 +771,6 @@ def sage_initialize() -> bool:
 def sage_login(fingerprint: int, force_resync: bool = False) -> bool:
     """Log in to a specific fingerprint via readiness check + resync + login.
 
-    Sage requires:
-    0. Readiness check — verify Sage RPC is responding before attempting login
-    1. initialize — explicit wallet manager initialization
-    2. resync(fingerprint) — loads the wallet data for that key (only if force_resync=True)
-    3. login(fingerprint) — activates the key as the current session
-
     Args:
         fingerprint: Integer fingerprint to connect to.
         force_resync: If True, run resync before login. Default False.
@@ -788,7 +782,7 @@ def sage_login(fingerprint: int, force_resync: bool = False) -> bool:
     fingerprint = int(fingerprint)
     print(f"  [Sage] Bypassing local login for Permuto API Mode... (Fingerprint: {fingerprint})")
 
-    # 🚀 პირდაპირ ვადასტურებთ ავტორიზაციას Permuto-ს API-სთვის
+    # 🚀 პირდაპირ ვადასტურებთ ავტორიზაციას Permuto-ს API-სთვის სინტაქსური შეცდომების გარეშე
     _init_ok = True
     return True
 
