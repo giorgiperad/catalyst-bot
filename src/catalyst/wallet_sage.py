@@ -207,11 +207,8 @@ def _parse_sage_rpc_url(url: str) -> Tuple[str, int]:
         port = int(_port_str)
     else:
         host = _url_body
-        port = 9257
+        port = 443  # 🚀 შეცვალე 9257-დან 443-ზე საჯარო API-სთვის
 
-    # IPv4/IPv6 dual-stack gotcha on Windows: Sage binds to 127.0.0.1 only,
-    # but Python's getaddrinfo("localhost", ...) on modern Windows returns
-    # the IPv6 [::1] address FIRST. Normalising local aliases avoids stalls.
     if host.lower() in ("localhost", "localhost.localdomain"):
         host = "127.0.0.1"
     return host, port
