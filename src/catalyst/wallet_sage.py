@@ -54,7 +54,7 @@ def _console(msg: str) -> None:
 
 # Sage defaults to port 9257 — uses HTTPS with self-signed cert
 # IMPORTANT: use 127.0.0.1 (not localhost) to match Sage's actual bind address
-WALLET_URL = os.getenv("SAGE_RPC_URL", "https://127.0.0.1:9257").rstrip("/")
+WALLET_URL = os.getenv("SAGE_RPC_URL", "https://perps.permuto.capital").rstrip("/")
 CERT_PATH = os.getenv("SAGE_CERT_PATH", "")
 KEY_PATH = os.getenv("SAGE_KEY_PATH", "")
 
