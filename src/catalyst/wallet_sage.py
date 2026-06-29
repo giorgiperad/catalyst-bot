@@ -24,6 +24,16 @@ offer is already gone from the wallet's view.
 import os
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
+import requests  # 🚀 დაამატე ეს
+
+# 🚀 Permuto Capital API კონფიგურაცია
+PERMUTO_HOST = "https://perps.permuto.capital"
+_session_token = None
+_trading_user_id = None
+
+from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import hashlib
 from typing import List, Dict, Optional, Tuple, Any
@@ -330,21 +340,8 @@ def _sage_rpc_port_reachable() -> bool:
 
 
 def ensure_initialized(force_retry: bool = False) -> bool:
-    """Ensure Sage wallet manager has been initialized.
-
-    Returns True if already initialized or initialization succeeds now.
-    Uses a retry cooldown (_INIT_RETRY_SECS) instead of a permanent
-    failure latch — transient errors don't permanently wedge the bot.
-
-    Thread-safe: the actual RPC call happens inside _init_lock to prevent
-    concurrent init attempts.
-
-    Fast-fails when the Sage RPC port is not listening, so startup paths
-    don't pay the full HTTP/TLS timeout on every caller when Sage is down.
-    """
-    global _init_ok, _init_last_attempt
-    
-    # 🚀 Permuto API რეჟიმისთვის ლოკალური ინიციალიზაცია გამოტოვებულია
+    """გამოვტოვოთ ლოკალური ინიციალიზაცია, რადგან საჯარო API-ზე ვართ."""
+    global _init_ok
     _init_ok = True
     return True
 
@@ -691,40 +688,80 @@ def full_node_rpc(endpoint: str, payload: dict, timeout: int = 5):
 
 
 def get_sage_keys() -> list:
-    """Get all available keys/fingerprints from Sage wallet.
-
-    Returns:
-        List of dicts: [{name, fingerprint, public_key, kind, has_secrets, network_id}, ...]
-        Empty list on error.
-    """
-    try:
-        result = rpc("get_keys", {}, timeout=10)
-        if result and isinstance(result, dict):
-            return result.get("keys", [])
-        elif result and isinstance(result, list):
-            return result
-    except Exception as e:
-        print(f"  [Sage] get_sage_keys error: {e}")
-    return []
-
+    """ვაბრუნებთ იმიტირებულ სიას შიდა სტრუქტურისთვის."""
+    return [{
+        "name": "MZ",
+        "fingerprint": 2,
+        "public_key": "mock_pubkey",
+        "kind": "standard",
+        "has_secrets": True,
+        "network_id": "mainnet"
+    }]
 
 def get_current_key() -> dict:
-    """Get the currently active (logged-in) key.
+    """ვაბრუნებთ აქტიურ გასაღებს სერვერზე რექვესტის გარეშე."""
+    return {
+        "name": "MZ",
+        "fingerprint": 2,
+        "public_key": "mock_pubkey",
+        "kind": "standard",
+        "has_secrets": True,
+        "network_id": "mainnet"
+    }
 
-    Returns:
-        Dict with key info {name, fingerprint, ...} or None if not logged in.
-    """
-    if not ensure_initialized():
-        return None
+def sage_login(fingerprint: int, force_resync: bool = False) -> bool:
+    """აქ ხდება ნამდვილი Permuto Market Maker ავტორიზაცია!"""
+    global _session_token, _trading_user_id, _init_ok
+    
+    print("  [Permuto Auth] Initiating Market Maker REST Auth sequence...")
+    
+    wallet_pubkey = os.getenv("WALLET_PUBKEY", "შენი_საჯარო_გასაღები_აქ") 
+    challenge_url = f"{PERMUTO_HOST}/exchange/wallet_link_challenge"
+    
+    payload = {
+        "wallet_pubkey": wallet_pubkey,
+        "wallet_curve": "bls12381",
+        "wallet_signing_key_role": "master"
+    }
+    
     try:
-        result = rpc("get_key", {}, timeout=5)
-        if result and isinstance(result, dict):
-            key = result.get("key")
-            if key and isinstance(key, dict):
-                return key
+        res = requests.post(challenge_url, json=payload, timeout=10)
+        if res.status_code != 200:
+            print(f"  [Permuto Auth] Challenge failed: {res.text}")
+            return False
+            
+        data = res.json()
+        challenge_token = data.get("challenge_token")
+        nonce = data.get("nonce")
+        
+        print(f"  [Permuto Auth] Challenge received. Nonce: {nonce[:10]}...")
+        print(f"  [Permuto Auth] Sign this 32-byte raw nonce with your local bot secret!")
+        
+        # TODO: აქ მოგვიწევს ხელმოწერის ლოგიკის დამატება, როცა გავიგებთ ბოტი სად ინახავს mnemonic-ს.
+        
+        auth_url = f"{PERMUTO_HOST}/exchange/wallet_auth"
+        auth_payload = {
+            "challenge_token": challenge_token,
+            "signature": "შენი_192_სიმბოლოიანი_ხელმოწერის_ჰექსი" 
+        }
+        
+        auth_res = requests.post(auth_url, json=auth_payload, timeout=10)
+        if auth_res.status_code != 200:
+            print(f"  [Permuto Auth] Wallet Auth failed: {auth_res.text}")
+            return False
+            
+        auth_data = auth_res.json()
+        _session_token = auth_data.get("session_token")
+        _trading_user_id = auth_data.get("trading_user_id")
+        
+        print(f"  [Permuto Auth] ✅ SUCCESS! Authenticated as {auth_data.get('trading_user_address')}")
+        
+        _init_ok = True
+        return True
+        
     except Exception as e:
-        print(f"  [Sage] get_current_key error: {e}")
-    return None
+        print(f"  [Permuto Auth] Exception during auth sequence: {e}")
+        return False
 
 
 def _require_signing_capability() -> bool:
@@ -5084,92 +5121,3 @@ def xch_to_mojos(amount: Decimal) -> int:
 
 
 
-import requests
-import os
-
-# 🚀 Permuto Capital API კონფიგურაცია
-PERMUTO_HOST = "https://perps.permuto.capital"
-_session_token = None
-_trading_user_id = None
-
-def ensure_initialized(force_retry: bool = False) -> bool:
-    """გამოვტოვოთ ლოკალური ინიციალიზაცია, რადგან საჯარო API-ზე ვართ."""
-    global _init_ok
-    _init_ok = True
-    return True
-
-def get_sage_keys() -> list:
-    """ვაბრუნებთ იმიტირებულ სიას შიდა სტრუქტურისთვის."""
-    return [{
-        "name": "MZ",
-        "fingerprint": 2,
-        "public_key": "mock_pubkey",
-        "kind": "standard",
-        "has_secrets": True,
-        "network_id": "mainnet"
-    }]
-
-def get_current_key() -> dict:
-    """ვაბრუნებთ აქტიურ გასაღებს სერვერზე რექვესტის გარეშე."""
-    return {
-        "name": "MZ",
-        "fingerprint": 2,
-        "public_key": "mock_pubkey",
-        "kind": "standard",
-        "has_secrets": True,
-        "network_id": "mainnet"
-    }
-
-def sage_login(fingerprint: int, force_resync: bool = False) -> bool:
-    """აქ ხდება ნამდვილი Permuto Market Maker ავტორიზაცია!"""
-    global _session_token, _trading_user_id, _init_ok
-    
-    print("  [Permuto Auth] Initiating Market Maker REST Auth sequence...")
-    
-    wallet_pubkey = os.getenv("WALLET_PUBKEY", "შენი_საჯარო_გასაღები_აქ") 
-    challenge_url = f"{PERMUTO_HOST}/exchange/wallet_link_challenge"
-    
-    payload = {
-        "wallet_pubkey": wallet_pubkey,
-        "wallet_curve": "bls12381",
-        "wallet_signing_key_role": "master"
-    }
-    
-    try:
-        res = requests.post(challenge_url, json=payload, timeout=10)
-        if res.status_code != 200:
-            print(f"  [Permuto Auth] Challenge failed: {res.text}")
-            return False
-            
-        data = res.json()
-        challenge_token = data.get("challenge_token")
-        nonce = data.get("nonce")
-        
-        print(f"  [Permuto Auth] Challenge received. Nonce: {nonce[:10]}...")
-        print(f"  [Permuto Auth] Sign this 32-byte raw nonce with your local bot secret!")
-        
-        # TODO: აქ უნდა ჩაიწეროს მიღებული nonce-ის ხელმოწერა შენი ბოტის ლოკალური გასაღებით
-        
-        auth_url = f"{PERMUTO_HOST}/exchange/wallet_auth"
-        auth_payload = {
-            "challenge_token": challenge_token,
-            "signature": "შენი_192_სიმბოლოიანი_ხელმოწერის_ჰექსი" 
-        }
-        
-        auth_res = requests.post(auth_url, json=auth_payload, timeout=10)
-        if auth_res.status_code != 200:
-            print(f"  [Permuto Auth] Wallet Auth failed: {auth_res.text}")
-            return False
-            
-        auth_data = auth_res.json()
-        _session_token = auth_data.get("session_token")
-        _trading_user_id = auth_data.get("trading_user_id")
-        
-        print(f"  [Permuto Auth] ✅ SUCCESS! Authenticated as {auth_data.get('trading_user_address')}")
-        
-        _init_ok = True
-        return True
-        
-    except Exception as e:
-        print(f"  [Permuto Auth] Exception during auth sequence: {e}")
-        return False
