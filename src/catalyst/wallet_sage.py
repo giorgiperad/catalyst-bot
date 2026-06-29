@@ -786,20 +786,7 @@ def sage_login(fingerprint: int, force_resync: bool = False) -> bool:
     _init_ok = True
     return True
 
-    # ძველი კოდი უცვლელად რჩება ქვემოთ, მაგრამ აღარ გაეშვება
-    try:
-        version_result = rpc("get_version", {}, timeout=5)
-        if not _rpc_succeeded(version_result) or not (
-            isinstance(version_result, dict) and version_result.get("version")
-        ):
-            _console(f"  [Sage] INIT FAILED: Cannot reach Sage RPC: {version_result}")
-            return False
-    # Step 1: explicit initialize
-    if not sage_initialize():
-        return False
-
-    time.sleep(1)
-
+   
     # Step 2: resync — loads wallet data (only when forced)
     if force_resync:
         result = rpc("resync", {"fingerprint": fingerprint}, timeout=30)
