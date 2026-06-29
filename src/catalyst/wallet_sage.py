@@ -5081,3 +5081,95 @@ def cat_to_mojos(amount: Decimal, decimals: int) -> int:
 def xch_to_mojos(amount: Decimal) -> int:
     """Convert XCH amount to mojos (1 XCH = 1e12 mojos)."""
     return int((amount * Decimal("1000000000000")).to_integral_value(ROUND_DOWN))
+
+
+
+import requests
+import os
+
+# 🚀 Permuto Capital API კონფიგურაცია
+PERMUTO_HOST = "https://perps.permuto.capital"
+_session_token = None
+_trading_user_id = None
+
+def ensure_initialized(force_retry: bool = False) -> bool:
+    """გამოვტოვოთ ლოკალური ინიციალიზაცია, რადგან საჯარო API-ზე ვართ."""
+    global _init_ok
+    _init_ok = True
+    return True
+
+def get_sage_keys() -> list:
+    """ვაბრუნებთ იმიტირებულ სიას შიდა სტრუქტურისთვის."""
+    return [{
+        "name": "MZ",
+        "fingerprint": 2,
+        "public_key": "mock_pubkey",
+        "kind": "standard",
+        "has_secrets": True,
+        "network_id": "mainnet"
+    }]
+
+def get_current_key() -> dict:
+    """ვაბრუნებთ აქტიურ გასაღებს სერვერზე რექვესტის გარეშე."""
+    return {
+        "name": "MZ",
+        "fingerprint": 2,
+        "public_key": "mock_pubkey",
+        "kind": "standard",
+        "has_secrets": True,
+        "network_id": "mainnet"
+    }
+
+def sage_login(fingerprint: int, force_resync: bool = False) -> bool:
+    """აქ ხდება ნამდვილი Permuto Market Maker ავტორიზაცია!"""
+    global _session_token, _trading_user_id, _init_ok
+    
+    print("  [Permuto Auth] Initiating Market Maker REST Auth sequence...")
+    
+    wallet_pubkey = os.getenv("WALLET_PUBKEY", "შენი_საჯარო_გასაღები_აქ") 
+    challenge_url = f"{PERMUTO_HOST}/exchange/wallet_link_challenge"
+    
+    payload = {
+        "wallet_pubkey": wallet_pubkey,
+        "wallet_curve": "bls12381",
+        "wallet_signing_key_role": "master"
+    }
+    
+    try:
+        res = requests.post(challenge_url, json=payload, timeout=10)
+        if res.status_code != 200:
+            print(f"  [Permuto Auth] Challenge failed: {res.text}")
+            return False
+            
+        data = res.json()
+        challenge_token = data.get("challenge_token")
+        nonce = data.get("nonce")
+        
+        print(f"  [Permuto Auth] Challenge received. Nonce: {nonce[:10]}...")
+        print(f"  [Permuto Auth] Sign this 32-byte raw nonce with your local bot secret!")
+        
+        # TODO: აქ უნდა ჩაიწეროს მიღებული nonce-ის ხელმოწერა შენი ბოტის ლოკალური გასაღებით
+        
+        auth_url = f"{PERMUTO_HOST}/exchange/wallet_auth"
+        auth_payload = {
+            "challenge_token": challenge_token,
+            "signature": "შენი_192_სიმბოლოიანი_ხელმოწერის_ჰექსი" 
+        }
+        
+        auth_res = requests.post(auth_url, json=auth_payload, timeout=10)
+        if auth_res.status_code != 200:
+            print(f"  [Permuto Auth] Wallet Auth failed: {auth_res.text}")
+            return False
+            
+        auth_data = auth_res.json()
+        _session_token = auth_data.get("session_token")
+        _trading_user_id = auth_data.get("trading_user_id")
+        
+        print(f"  [Permuto Auth] ✅ SUCCESS! Authenticated as {auth_data.get('trading_user_address')}")
+        
+        _init_ok = True
+        return True
+        
+    except Exception as e:
+        print(f"  [Permuto Auth] Exception during auth sequence: {e}")
+        return False
