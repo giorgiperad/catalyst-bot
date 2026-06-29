@@ -869,7 +869,6 @@ def _serve_bootstrapped_html(filename: str):
 
 class _QuietRequestFilter(logging.Filter):
     """Filter out repetitive polling requests from Werkzeug's access log."""
-
     def filter(self, record):
         msg = record.getMessage()
         # Werkzeug log format: '127.0.0.1 - - [date] "GET /api/status HTTP/1.1" 200 -'
@@ -3274,16 +3273,15 @@ if __name__ == "__main__":
     except Exception as _e:
         print(f"  [Secrets] Could not load user secrets: {_e}", flush=True)
 
-    # Wallet preload is NOT auto-started here.
+# Wallet preload is NOT auto-started here.
     # It is triggered explicitly by the GUI after the user accepts the risk
     # disclosure, via POST /api/wallet/begin-startup.  This ensures no wallet
     # RPC calls are made before the user has acknowledged the disclaimer.
 
-    try:
-        _port = int(os.environ.get("CATALYST_FLASK_PORT", "5000"))
-    except (TypeError, ValueError):
-        _port = 5000
+    # Railway-სთვის ვიყენებთ გარემოს "PORT" ცვლადს, ლოკალური "CATALYST_FLASK_PORT"-ის ნაცვლად
+    _port = int(os.environ.get("PORT", 5000))
 
     log_event("info", "server_started", f"API server starting on port {_port}")
 
-    app.run(host="127.0.0.1", port=_port, debug=False, threaded=True)
+    # ვცვლით host-ს "0.0.0.0"-ზე, რათა Railway-მ შეძლოს ტრაფიკის გადამისამართება
+    app.run(host="0.0.0.0", port=_port, debug=False, threaded=True)
