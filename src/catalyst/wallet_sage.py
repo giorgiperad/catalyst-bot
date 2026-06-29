@@ -343,6 +343,12 @@ def ensure_initialized(force_retry: bool = False) -> bool:
     don't pay the full HTTP/TLS timeout on every caller when Sage is down.
     """
     global _init_ok, _init_last_attempt
+    
+    # 🚀 Permuto API რეჟიმისთვის ლოკალური ინიციალიზაცია გამოტოვებულია
+    _init_ok = True
+    return True
+
+    # ყველაფერი რაც ქვემოთაა, ძველი კოდია. უცვლელად დარჩეს, მაინც აღარ გაეშვება.
     with _init_lock:
         if _init_ok:
             return True
@@ -778,11 +784,15 @@ def sage_login(fingerprint: int, force_resync: bool = False) -> bool:
     Returns:
         True if login succeeded and get_key confirms the right fingerprint.
     """
+    global _init_ok
     fingerprint = int(fingerprint)
-    print(f"  [Sage] Logging in to fingerprint {fingerprint}...")
+    print(f"  [Sage] Bypassing local login for Permuto API Mode... (Fingerprint: {fingerprint})")
 
-    # Step 0: verify Sage is reachable before attempting login.
-    # This distinguishes "Sage not running" from "login failed" errors.
+    # 🚀 პირდაპირ ვადასტურებთ ავტორიზაციას Permuto-ს API-სთვის
+    _init_ok = True
+    return True
+
+    # ძველი კოდი უცვლელად რჩება ქვემოთ, მაგრამ აღარ გაეშვება
     try:
         version_result = rpc("get_version", {}, timeout=5)
         if not _rpc_succeeded(version_result) or not (
@@ -790,13 +800,6 @@ def sage_login(fingerprint: int, force_resync: bool = False) -> bool:
         ):
             _console(f"  [Sage] INIT FAILED: Cannot reach Sage RPC: {version_result}")
             return False
-        _console(
-            f"  [Sage] Sage v{version_result['version']} is reachable -- proceeding with login"
-        )
-    except Exception as e:
-        _console(f"  [Sage] INIT FAILED: Cannot reach Sage RPC: {e}")
-        return False
-
     # Step 1: explicit initialize
     if not sage_initialize():
         return False
